@@ -1497,26 +1497,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         }
         break;
     }
-    case 0x59:
-        if (m_privRegs)
-            m_privRegs->dispfb1 = value;
-        break;
-    case 0x5a:
-        if (m_privRegs)
-            m_privRegs->display1 = value;
-        break;
-    case 0x5b:
-        if (m_privRegs)
-            m_privRegs->dispfb2 = value;
-        break;
-    case 0x5c:
-        if (m_privRegs)
-            m_privRegs->display2 = value;
-        break;
-    case 0x5f:
-        if (m_privRegs)
-            m_privRegs->bgcolor = value;
-        break;
+    // A+D addresses 0x55-0x5f are undefined on the GS and writes to them are
+    // ignored (PCSX2: GIFRegHandlerNull). The privileged display registers
+    // (DISPFB1/2, DISPLAY1/2, BGCOLOR) are only reachable through the
+    // 0x12000000 MMIO window, so a stray A+D write here must not alias them.
     default:
         break;
     }
