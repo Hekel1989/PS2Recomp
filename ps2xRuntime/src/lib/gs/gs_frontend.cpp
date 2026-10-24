@@ -1570,26 +1570,12 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         }
         break;
     }
-    case 0x59:
-        if (m_privRegs)
-            m_privRegs->dispfb1 = value;
-        break;
-    case 0x5a:
-        if (m_privRegs)
-            m_privRegs->display1 = value;
-        break;
-    case 0x5b:
-        if (m_privRegs)
-            m_privRegs->dispfb2 = value;
-        break;
-    case 0x5c:
-        if (m_privRegs)
-            m_privRegs->display2 = value;
-        break;
-    case 0x5f:
-        if (m_privRegs)
-            m_privRegs->bgcolor = value;
-        break;
+    // SUIKO(gs-no-pseudo-privregs): A+D addresses 0x55-0x5f are undefined on
+    // the real GS and writes to them are ignored (PCSX2: GIFRegHandlerNull).
+    // Upstream aliased 0x59-0x5f to DISPFB/DISPLAY/BGCOLOR, so a stray game
+    // A+D write (Suikoden Tactics writes 0x5 to 0x5a) clobbered DISPLAY1 and
+    // blanked every frame it landed in. The privileged registers are only
+    // written through the 0x12000000 MMIO window (ps2_memory.cpp).
     default:
         break;
     }
