@@ -38,6 +38,16 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+// SUIKO(profiler): the game frontend's in-game sampler registers every
+// significant host thread itself.  Weak so the runtime and its tests still
+// link when the profiling TU is absent.
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" void suikoProfRegisterThread(const char *name) __attribute__((weak));
+#define SUIKO_HAS_PROF_HOOK 1
+#else
+#define SUIKO_HAS_PROF_HOOK 0
+#endif
+
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
 #define EM_MIPS 8            // MIPS architecture
@@ -2609,6 +2619,10 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+#if SUIKO_HAS_PROF_HOOK
+        if (suikoProfRegisterThread != nullptr)
+            suikoProfRegisterThread("EE/game");
+#endif
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
