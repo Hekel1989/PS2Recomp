@@ -67,6 +67,7 @@ namespace ps2_stubs
         PadInputState g_padOverrideState{};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
+        int g_padPressLogCount = 0;
 
         uint8_t axisToByte(float axis)
         {
@@ -401,7 +402,8 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
-        bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
+        bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr,
+                             int *outStatusLen)
         {
             if (!outData)
             {
@@ -417,6 +419,13 @@ namespace ps2_stubs
                     return false;
                 }
                 portState = *sharedPortState;
+            }
+            // libpad's padRead returns the status byte count (8 bytes: mode,
+            // 2 button bytes, 4 axes; +8 pressure bytes in press mode), and
+            // games treat that return value as the length of the copied status.
+            if (outStatusLen != nullptr)
+            {
+                *outStatusLen = portState.pressureEnabled ? 16 : 8;
             }
 
             PadInputState state;
@@ -787,7 +796,21 @@ namespace ps2_stubs
         }
 
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
-        if (!readPadPortData(port, slot, runtime, data, dataAddr))
+        int statusLen = 0;
+        const bool readOk = readPadPortData(port, slot, runtime, data, dataAddr, &statusLen);
+        // DIAG (temporary): log the first scePadRead results and any pressed read.
+        if (g_padReadLogCount < 8)
+        {
+            std::printf("[padread-diag] port=%d slot=%d ok=%d mode=0x%02x data2=0x%02x data3=0x%02x\n",
+                        port, slot, readOk ? 1 : 0, data[1], data[2], data[3]);
+            ++g_padReadLogCount;
+        }
+        if (readOk && (data[2] != 0xFFu || data[3] != 0xFFu) && g_padPressLogCount < 16)
+        {
+            std::printf("[padread-press] port=%d data2=0x%02x data3=0x%02x\n", port, data[2], data[3]);
+            ++g_padPressLogCount;
+        }
+        if (!readOk)
         {
             setReturnS32(ctx, 0);
             return;
@@ -814,7 +837,8 @@ namespace ps2_stubs
             }
         });
 
-        setReturnS32(ctx, 1);
+        // libpad semantics: return the number of status bytes copied, not 1.
+        setReturnS32(ctx, statusLen);
     }
 
     void scePadReqIntToStr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
