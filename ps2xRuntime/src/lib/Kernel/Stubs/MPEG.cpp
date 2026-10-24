@@ -1966,6 +1966,19 @@ namespace ps2_stubs
         {
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
         }
+        if (mpegTraceEnabled())
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            std::cerr << "[mpeg-trace] AddBs mpeg=0x" << std::hex << mpegAddr
+                      << std::dec << " copied=" << copied
+                      << " sawInput=" << playback.sawInput
+                      << " seqEnd=" << playback.sawSequenceEnd
+                      << " streamEnded=" << playback.streamEnded
+                      << " failed=" << playback.decoderFailed
+                      << " frames=" << playback.decodedFrames.size()
+                      << " served=" << playback.picturesServed << std::endl;
+        }
         setReturnS32(ctx, static_cast<int32_t>(copied));
     }
 
@@ -2496,6 +2509,24 @@ namespace ps2_stubs
                           playback.sawInput &&
                           playbackEnded &&
                           presentationComplete;
+            if (mpegTraceEnabled())
+            {
+                static std::atomic<uint32_t> stateTraceCount{0u};
+                if ((stateTraceCount.fetch_add(1u, std::memory_order_relaxed) % 240u) == 0u)
+                {
+                    std::cerr << "[mpeg-trace] GetPicture state mpeg=0x" << std::hex << mpegAddr
+                              << std::dec << " haveFrame=" << haveFrame
+                              << " sawInput=" << playback.sawInput
+                              << " seqEnd=" << playback.sawSequenceEnd
+                              << " streamEnded=" << playback.streamEnded
+                              << " failed=" << playback.decoderFailed
+                              << " frames=" << playback.decodedFrames.size()
+                              << " served=" << playback.picturesServed
+                              << " presEnd=0x" << std::hex << playback.presentationEndTickQ32
+                              << " now=0x" << (runtime->eeScheduler().currentVSyncTick() << 32u)
+                              << std::dec << " atEnd=" << atStreamEnd << std::endl;
+                }
+            }
             if (atStreamEnd && g_mpeg_stub_state.isEndTraceCount < 16u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
