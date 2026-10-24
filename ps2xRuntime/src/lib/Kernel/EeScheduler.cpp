@@ -2883,6 +2883,20 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+    {
+        // The frame presented below must contain every VIF1/VU1 kick queued
+        // before this VBlank (docs/vu1-thread.md).  With a register-carrying
+        // vsync hook the present is queued behind that work instead of
+        // waiting for it; the game cannot observe the difference.
+        ps2x::Vu1Thread *vu1Thread = m_runtime.memory().vu1Thread();
+        const auto &vblankHooks = Ps2GsHostHooks::hooks();
+        if (vu1Thread)
+        {
+            if (vblankHooks.vsyncRegs)
+                vu1Thread->beforeVblank();
+            else
+                vu1Thread->sync(ps2x::Vu1SyncReason::VBlank);
+        }
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         ps2CoverageSetVSync(m_vsyncTick);
@@ -2896,12 +2910,22 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         // PS2X(gs-phase4): tick the optional external GS backend (no-op unless
         // the host registered hooks; see runtime/ps2_gs_host_hooks.h).
-        if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.vsync)
+        if (vblankHooks.vsyncRegs)
         {
-            gsHooks.vsync(m_vsyncTick);
+            const auto regs = ps2x::Vu1Thread::captureVsyncRegs(m_runtime.memory().gs());
+            if (vu1Thread)
+                vu1Thread->vblankPresent(m_vsyncTick, regs);
+            else
+                vblankHooks.vsyncRegs(m_vsyncTick, regs);
+        }
+        else if (vblankHooks.vsync)
+        {
+            vblankHooks.vsync(m_vsyncTick);
         }
         if (ps2x::diag::gsSyncEnabled())
             ps2x::diag::gsEvent(m_vsyncTick, "present");
+        if (ps2x::Vu1Thread *vu1Thread = m_runtime.memory().vu1Thread())
+            vu1Thread->onVsync(m_vsyncTick);
         writeGuestU32(m_vsyncFlagAddress, 1u);
         if (m_vsyncTickAddress != 0u)
         {
@@ -2927,6 +2951,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         dispatchIrq(false, 2u);
         break;
+    }
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);
         break;

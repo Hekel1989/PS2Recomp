@@ -14,7 +14,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <atomic>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <ps2_log.h>
 
@@ -40,16 +42,19 @@ namespace
         return s_enabled;
     }
 
-    uint64_t s_diffRuns = 0;
-    uint64_t s_diffMismatches = 0;
-    bool s_diffRegistered = false;
-    bool s_diffPrintedMatch = false;
+    // Atomic/locked: the VU1 thread and its verification shadow (game thread)
+    // can both run VU1 programs (runtime/ps2_vu1_thread.h).
+    std::atomic<uint64_t> s_diffRuns{0};
+    std::atomic<uint64_t> s_diffMismatches{0};
+    std::once_flag s_diffRegistered;
+    std::atomic<bool> s_diffPrintedMatch{false};
+    std::mutex s_globalsMutex;
 
     void reportVu1DiffTotals()
     {
         std::fprintf(stderr, "[vu1:diff] total runs=%llu mismatches=%llu\n",
-                     static_cast<unsigned long long>(s_diffRuns),
-                     static_cast<unsigned long long>(s_diffMismatches));
+                     static_cast<unsigned long long>(s_diffRuns.load()),
+                     static_cast<unsigned long long>(s_diffMismatches.load()));
     }
 
     bool vu1DiffAotEnabled()
@@ -86,6 +91,7 @@ namespace
     void logAotHit(uint32_t programHash, uint32_t pc)
     {
         const uint64_t key = (static_cast<uint64_t>(programHash) << 32) | pc;
+        std::lock_guard<std::mutex> lock(s_globalsMutex);
         if (s_aotHits.insert(key).second)
         {
             std::fprintf(stderr, "[vu1-aot] run program=0x%08x pc=0x%x\n",
@@ -95,20 +101,22 @@ namespace
 
     void ensureCompiledProgramsRegistered()
     {
-        if (s_compiledProgramsRegistered)
-            return;
-        s_compiledProgramsRegistered = true;
-        ps2xVu1RegisterGeneratedPrograms();
-        if (s_compiledProgramCount != 0u)
-        {
-            std::fprintf(stderr, "[vu1-aot] registered %u compiled program(s)\n",
-                         s_compiledProgramCount);
-        }
+        static std::once_flag s_once;
+        std::call_once(s_once, []
+                       {
+                           s_compiledProgramsRegistered = true;
+                           ps2xVu1RegisterGeneratedPrograms();
+                           if (s_compiledProgramCount != 0u)
+                           {
+                               std::fprintf(stderr, "[vu1-aot] registered %u compiled program(s)\n",
+                                            s_compiledProgramCount);
+                           } });
     }
 
     void logAotMiss(uint32_t programHash, uint32_t pc)
     {
         const uint64_t key = (static_cast<uint64_t>(programHash) << 32) | pc;
+        std::lock_guard<std::mutex> lock(s_globalsMutex);
         if (s_aotMisses.insert(key).second)
         {
             std::fprintf(stderr, "[vu1-aot] miss program=0x%08x pc=0x%x\n",
@@ -130,6 +138,7 @@ namespace
 
     void addAotStats(bool compiled, uint64_t hostNs, uint32_t pairs)
     {
+        std::lock_guard<std::mutex> lock(s_globalsMutex);
         if (compiled)
         {
             s_statsAotNs += hostNs;
@@ -1887,11 +1896,7 @@ void VU1Interpreter::runDifferentialImpl(uint8_t *vuCode, uint32_t codeSize,
                                          GS &gs, PS2Memory *memory, uint32_t maxCycles,
                                          bool candidateAot)
 {
-    if (!s_diffRegistered)
-    {
-        s_diffRegistered = true;
-        std::atexit(reportVu1DiffTotals);
-    }
+    std::call_once(s_diffRegistered, [] { std::atexit(reportVu1DiffTotals); });
 
     const VU1Interpreter saved = *this;
     const std::vector<uint8_t> initialData(vuData, vuData + dataSize);
@@ -1918,7 +1923,7 @@ void VU1Interpreter::runDifferentialImpl(uint8_t *vuCode, uint32_t codeSize,
     m_xgkickCapture = nullptr;
     m_aotDisabled = saved.m_aotDisabled;
 
-    ++s_diffRuns;
+    const uint64_t diffRuns = ++s_diffRuns;
     bool mismatch = false;
     if (std::memcmp(&referenceState, &m_state, sizeof(VU1State)) != 0)
     {
@@ -1976,18 +1981,15 @@ void VU1Interpreter::runDifferentialImpl(uint8_t *vuCode, uint32_t codeSize,
     {
         ++s_diffMismatches;
     }
-    else if (!s_diffPrintedMatch)
+    else if (!s_diffPrintedMatch.exchange(true))
     {
-        s_diffPrintedMatch = true;
         std::fprintf(stderr, "[vu1:diff] match pc=0x%x\n", startPc);
     }
-    if ((s_diffRuns & 0xFFFu) == 0u)
+    if ((diffRuns & 0xFFFu) == 0u)
     {
         // Also report current totals periodically: the frontend leaves through
         // std::_Exit(), so atexit() never runs on a normal game shutdown.
-        std::fprintf(stderr, "[vu1:diff] total runs=%llu mismatches=%llu\n",
-                     static_cast<unsigned long long>(s_diffRuns),
-                     static_cast<unsigned long long>(s_diffMismatches));
+        reportVu1DiffTotals();
     }
 
     // Keep the game running on the new path's output: submit its packets once.

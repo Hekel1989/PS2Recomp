@@ -1,6 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1_inventory.h"
+#include "runtime/ps2_vu1_thread.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -661,11 +662,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MSKPATH3)
         {
-            // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
-            const bool wasMasked = m_path3Masked;
-            m_path3Masked = (imm & 0x8000u) != 0u;
-            if (wasMasked && !m_path3Masked)
-                flushMaskedPath3Packets();
+            // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.  On the VU1
+            // thread the mask belongs to the game thread's GIF front, so the
+            // change is recorded and replayed there in order.
+            const bool masked = (imm & 0x8000u) != 0u;
+            if (!(m_vu1Thread && m_vu1Thread->routePath3Mask(masked)))
+                setPath3MaskDirect(masked);
             continue;
         }
         else if (opcode == VIF_MARK)

@@ -583,6 +583,12 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        if (m_vu1Thread)
+        {
+            m_vu1Thread->sync(ps2x::Vu1SyncReason::Shutdown);
+            m_memory.setVu1Thread(nullptr);
+            m_vu1Thread.reset();
+        }
         ps2CoverageFlush();
         m_iopSubsystem.reset();
         m_iopHost.reset();
@@ -733,6 +739,8 @@ bool PS2Runtime::syncCoreSubsystems()
     // Path2 and GIF DMA as Path3, swapped relative to the hardware paths.
     m_gifArbiter.setProcessPacketFn([this](GifPathId pathId, const uint8_t *data, uint32_t size, bool continuation)
                                     {
+                                        if (m_vu1Thread)
+                                            m_vu1Thread->checkPacket(pathId, data, size, continuation);
                                         const uint32_t gsPath = pathId == GifPathId::Path1
                                                                       ? 1u
                                                                       : pathId == GifPathId::Path2
@@ -761,22 +769,30 @@ bool PS2Runtime::syncCoreSubsystems()
                                          shareCapture ? m_memory.gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
                                      if (shareCapture)
                                          ps2x::diag::vu1KickBegin(shareVsync);
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     // On the VU1 thread the kick's FBRST was captured
+                                     // when the game thread queued the DMA, and VPU-STAT
+                                     // is left alone: DE1/TE1 are clear (or the kick
+                                     // would have run serially), so VU1 cannot stop on
+                                     // D/T and the update below is a no-op.
+                                     const bool onVu1Thread = ps2x::Vu1Thread::onWorker();
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!onVu1Thread)
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = onVu1Thread ? m_vu1Thread->workerFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u);
                                      if (shareCapture)
                                          ps2x::diag::vu1KickEnd(shareVsync); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
@@ -786,27 +802,53 @@ bool PS2Runtime::syncCoreSubsystems()
                                          shareCapture ? m_memory.gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
                                      if (shareCapture)
                                          ps2x::diag::vu1KickBegin(shareVsync);
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     // On the VU1 thread the kick's FBRST was captured
+                                     // when the game thread queued the DMA, and VPU-STAT
+                                     // is left alone: DE1/TE1 are clear (or the kick
+                                     // would have run serially), so VU1 cannot stop on
+                                     // D/T and the update below is a no-op.
+                                     const bool onVu1Thread = ps2x::Vu1Thread::onWorker();
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!onVu1Thread)
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = onVu1Thread ? m_vu1Thread->workerFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u);
                                      if (shareCapture)
                                          ps2x::diag::vu1KickEnd(shareVsync); });
     resetIop();
     m_vu0.reset();
+    if (m_vu1Thread)
+    {
+        m_vu1Thread->sync(ps2x::Vu1SyncReason::Shutdown);
+        m_memory.setVu1Thread(nullptr);
+        m_vu1Thread.reset();
+    }
     m_vu1.reset();
+    if (const ps2x::Vu1Thread::Mode vu1Mode = ps2x::Vu1Thread::modeFromEnvironment();
+        vu1Mode != ps2x::Vu1Thread::Mode::Serial)
+    {
+        m_vu1Thread = std::make_unique<ps2x::Vu1Thread>(
+            m_memory, m_vu1, m_gs, vu1Mode,
+            [this]() -> uint32_t
+            {
+                const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                return (ctx ? ctx : &m_cpuContext)->vu0_fbrst;
+            });
+        m_memory.setVu1Thread(m_vu1Thread.get());
+    }
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
@@ -2427,6 +2469,9 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
+    // The native fast paths write the GS directly, outside the ordered GIF
+    // sink, and test the arbiter/PATH3-mask state the VU1 thread's replay owns.
+    m_memory.vu1Sync(ps2x::Vu1SyncReason::GifFastPath);
     if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);

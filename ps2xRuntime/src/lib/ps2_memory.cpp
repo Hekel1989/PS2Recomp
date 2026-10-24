@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "runtime/ps2_vu1_thread.h"
+
 namespace
 {
     inline uint64_t shareVsync(const GSRegisters &regs)
@@ -552,6 +554,26 @@ bool PS2Memory::initialize(size_t ramSize)
     }
 }
 
+bool PS2Memory::initializeVif1Shadow(const PS2Memory &real)
+{
+    delete[] m_vu1Code;
+    delete[] m_vu1Data;
+    m_vu1Code = new uint8_t[PS2_VU1_CODE_SIZE];
+    m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
+    std::memcpy(m_vu1Code, real.m_vu1Code, PS2_VU1_CODE_SIZE);
+    std::memcpy(m_vu1Data, real.m_vu1Data, PS2_VU1_DATA_SIZE);
+    markVU1CodeModified();
+    gs_regs.vsyncTick.store(0u);
+    gs_regs.csr.store(0u);
+    vif1_regs = real.vif1_regs;
+    m_path3Masked = real.m_path3Masked;
+    m_path3MaskedFifo = real.m_path3MaskedFifo;
+    m_vif1PendingPath2ImageQwc = real.m_vif1PendingPath2ImageQwc;
+    m_vif1PendingPath2DirectHl = real.m_vif1PendingPath2DirectHl;
+    m_vif1PendingPath2FromNextDirect = real.m_vif1PendingPath2FromNextDirect;
+    return true;
+}
+
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
@@ -841,6 +863,7 @@ uint8_t PS2Memory::read8(uint32_t address)
     {
         (void)vuLimit;
         shareVu1Observe(gs_regs, "vu1mem");
+        syncBeforeVuAccess(vuMem);
         return vuMem[vuOffset];
     }
     else if (isIoRegister(physAddr))
@@ -877,6 +900,7 @@ uint16_t PS2Memory::read16(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
     {
         shareVu1Observe(gs_regs, "vu1mem");
+        syncBeforeVuAccess(vuMem);
         return loadScalar<uint16_t>(vuMem, vuOffset, vuLimit, "read16 vu", address);
     }
     else if (isIoRegister(physAddr))
@@ -901,6 +925,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncBeforeGsPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             shareGsEvent(gs_regs, "csr");
@@ -930,6 +955,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
     {
         shareVu1Observe(gs_regs, "vu1mem");
+        syncBeforeVuAccess(vuMem);
         return loadScalar<uint32_t>(vuMem, vuOffset, vuLimit, "read32 vu", address);
     }
     else if (isIoRegister(physAddr))
@@ -950,6 +976,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncBeforeGsPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             shareGsEvent(gs_regs, "csr");
@@ -975,6 +1002,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
     {
         shareVu1Observe(gs_regs, "vu1mem");
+        syncBeforeVuAccess(vuMem);
         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
     }
 
@@ -982,6 +1010,8 @@ uint64_t PS2Memory::read64(uint32_t address)
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
     {
+        if (m_vu1Thread && address >= 0x10003C00u && address < 0x10003E00u)
+            m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register);
         uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
@@ -1014,6 +1044,7 @@ __m128i PS2Memory::read128(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
     {
         shareVu1Observe(gs_regs, "vu1mem");
+        syncBeforeVuAccess(vuMem);
         inRange(vuOffset, sizeof(__m128i), vuLimit, "read128 vu", address);
         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
     }
@@ -1044,7 +1075,10 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         {
             (void)vuLimit;
             shareVu1Observe(gs_regs, "vu1memw");
+            syncBeforeVuAccess(vuMem);
             vuMem[vuOffset] = value;
+            if (m_vu1Thread)
+                m_vu1Thread->mirrorVuWrite(vuMem, vuOffset, &value, sizeof(value));
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1088,7 +1122,10 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
             shareVu1Observe(gs_regs, "vu1memw");
+            syncBeforeVuAccess(vuMem);
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
+            if (m_vu1Thread)
+                m_vu1Thread->mirrorVuWrite(vuMem, vuOffset, &value, sizeof(value));
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1117,19 +1154,20 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncBeforeGsPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
             // Done as a single atomic RMW -- see writeCsrHalf's comment.
             writeCsrHalf(gs_regs.csr, off, value);
-            notifyGsPrivRegWrite(regOff, gs_regs.csr.load());
+            notifyGsPrivRegWriteRouted(regOff, gs_regs.csr.load());
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
-            notifyGsPrivRegWrite(regOff, newVal);
+            notifyGsPrivRegWriteRouted(regOff, newVal);
         }
         return;
     }
@@ -1155,7 +1193,10 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
             shareVu1Observe(gs_regs, "vu1memw");
+            syncBeforeVuAccess(vuMem);
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
+            if (m_vu1Thread)
+                m_vu1Thread->mirrorVuWrite(vuMem, vuOffset, &value, sizeof(value));
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1192,17 +1233,18 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncBeforeGsPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
             // atomic RMW -- see writeCsrFull's comment.
             writeCsrFull(gs_regs.csr, value);
-            notifyGsPrivRegWrite(regOff, gs_regs.csr.load());
+            notifyGsPrivRegWriteRouted(regOff, gs_regs.csr.load());
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
-            notifyGsPrivRegWrite(regOff, value);
+            notifyGsPrivRegWriteRouted(regOff, value);
         }
         return;
     }
@@ -1226,7 +1268,10 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
             shareVu1Observe(gs_regs, "vu1memw");
+            syncBeforeVuAccess(vuMem);
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
+            if (m_vu1Thread)
+                m_vu1Thread->mirrorVuWrite(vuMem, vuOffset, &value, sizeof(value));
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1262,6 +1307,12 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        if (m_vu1Thread && m_vu1Thread->beginKick())
+        {
+            m_vu1Thread->addChunk(fifoData, sizeof(fifoData), 0u, 0u);
+            m_vu1Thread->endKick();
+            return;
+        }
         processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
@@ -1284,8 +1335,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
         {
             shareVu1Observe(gs_regs, "vu1memw");
+            syncBeforeVuAccess(vuMem);
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
+            if (m_vu1Thread)
+                m_vu1Thread->mirrorVuWrite(vuMem, vuOffset, &value, sizeof(value));
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1355,16 +1409,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         m_ioRegisters[address] = value;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncBeforeGsPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
-            notifyGsPrivRegWrite(regOff, gs_regs.csr.load());
+            notifyGsPrivRegWriteRouted(regOff, gs_regs.csr.load());
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
             *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
-            notifyGsPrivRegWrite(regOff, *reg);
+            notifyGsPrivRegWriteRouted(regOff, *reg);
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1412,6 +1467,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                          (current >> 16) & 0x3FFu, mask);
         }
         return true;
+    }
+
+    // VIF1 registers belong to the VU1 thread while it runs; the shadow takes
+    // the write first so FBRST's PATH3 flush reaches both GIF fronts in order.
+    if (m_vu1Thread && address >= 0x10003C00u && address < 0x10003E00u)
+    {
+        m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register);
+        m_vu1Thread->mirrorVif1Register(address, value);
     }
 
     m_ioRegisters[address] = value;
@@ -2147,17 +2210,30 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    // With a VU1 thread the chunks are copied (boundaries kept: the VIF1
+    // interpreter's behaviour at a chunk end is part of its semantics) and
+    // processed there; the DMA still completes below, at the same guest point.
+    const bool vif1Threaded = hadVif1 && m_vu1Thread && m_vu1Thread->beginKick();
+    auto feedVif1 = [&](const uint8_t *chunkData, uint32_t chunkSize, uint32_t srcAddr, uint32_t srcKind)
+    {
+        if (vif1Threaded)
+        {
+            m_vu1Thread->addChunk(chunkData, chunkSize, srcAddr, srcKind);
+            return;
+        }
+        const uint32_t previousSrcAddr = m_vif1ChunkSrcAddr;
+        const uint32_t previousSrcKind = m_vif1ChunkSrcKind;
+        m_vif1ChunkSrcAddr = srcAddr;
+        m_vif1ChunkSrcKind = srcKind;
+        processVIF1Data(chunkData, chunkSize);
+        m_vif1ChunkSrcAddr = previousSrcAddr;
+        m_vif1ChunkSrcKind = previousSrcKind;
+    };
     for (auto &p : m_pendingVif1Transfers)
     {
         if (!p.chainData.empty())
         {
-            const uint32_t previousSrcAddr = m_vif1ChunkSrcAddr;
-            const uint32_t previousSrcKind = m_vif1ChunkSrcKind;
-            m_vif1ChunkSrcAddr = p.srcAddr;
-            m_vif1ChunkSrcKind = 2u;
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
-            m_vif1ChunkSrcAddr = previousSrcAddr;
-            m_vif1ChunkSrcKind = previousSrcKind;
+            feedVif1(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), p.srcAddr, 2u);
         }
         else if (p.qwc > 0)
         {
@@ -2184,7 +2260,7 @@ void PS2Memory::processPendingTransfers()
                         chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+                    feedVif1(m_scratchpad + srcPhys, chunk, m_vif1ChunkSrcAddr, m_vif1ChunkSrcKind);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -2201,7 +2277,7 @@ void PS2Memory::processPendingTransfers()
                         chunk = PS2_RAM_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
-                    processVIF1Data(srcPhys, chunk);
+                    feedVif1(m_rdram + srcPhys, chunk, srcPhys, 1u);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -2209,8 +2285,10 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingVif1Transfers.clear();
+    if (vif1Threaded)
+        m_vu1Thread->endKick();
 
-    if (m_gifArbiter)
+    if (m_gifArbiter && !(m_vu1Thread && m_vu1Thread->routeDrain()))
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -2298,6 +2376,60 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+    if (m_vu1Thread && m_vu1Thread->routeSubmit(pathId, data, sizeBytes, drainImmediately, path2DirectHl,
+                                                directContinuation))
+        return;
+    submitGifPacketDirect(pathId, data, sizeBytes, drainImmediately, path2DirectHl, directContinuation);
+}
+
+void PS2Memory::drainGifArbiterDirect()
+{
+    if (m_gifArbiter)
+        m_gifArbiter->drain();
+}
+
+void PS2Memory::setPath3MaskDirect(bool masked)
+{
+    const bool wasMasked = m_path3Masked;
+    m_path3Masked = masked;
+    if (wasMasked && !m_path3Masked)
+        flushMaskedPath3Packets();
+}
+
+void PS2Memory::notifyGsPrivRegWriteRouted(uint32_t regOff, uint64_t value)
+{
+    if (m_vu1Thread && m_vu1Thread->routePrivReg(regOff, value))
+        return;
+    notifyGsPrivRegWriteDirect(regOff, value);
+}
+
+void PS2Memory::notifyGsPrivRegWriteDirect(uint32_t regOff, uint64_t value)
+{
+    if (m_vu1Thread)
+        m_vu1Thread->checkPrivReg(regOff, value);
+    notifyGsPrivRegWrite(regOff, value);
+}
+
+void PS2Memory::syncBeforeGsPrivReg(uint32_t regOff)
+{
+    if (m_vu1Thread && (regOff == kGsCsrRegOffset || regOff == 0x1080u))
+        m_vu1Thread->sync(ps2x::Vu1SyncReason::GsRegister);
+}
+
+void PS2Memory::syncBeforeVuAccess(const uint8_t *vuMem)
+{
+    if (m_vu1Thread && (vuMem == m_vu1Code || vuMem == m_vu1Data))
+        m_vu1Thread->sync(ps2x::Vu1SyncReason::VuMemory);
+}
+
+void PS2Memory::vu1Sync(ps2x::Vu1SyncReason reason)
+{
+    if (m_vu1Thread)
+        m_vu1Thread->sync(reason);
+}
+
+void PS2Memory::submitGifPacketDirect(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl, bool directContinuation)
+{
 
     // A PATH2/PATH3 packet submitted while a VU1 program is outstanding is an
     // ordering point for a VU1 thread: PATH1 XGKICK output must stay in front
@@ -2752,6 +2884,13 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (ps2x::diag::vu1OverlapEnabled() && address == 0x10003C00u)
         ps2x::diag::vu1Observe(shareVsync(gs_regs), "vif1stat");
+    if (m_vu1Thread)
+    {
+        if (address >= 0x10003C00u && address < 0x10003E00u)
+            m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register);
+        else if (address == 0x10003020u) // GIF_STAT.M3P mirrors the PATH3 mask
+            m_vu1Thread->beforeGifStatusRead();
+    }
 
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
@@ -2779,6 +2918,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncBeforeGsPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             shareGsEvent(gs_regs, "csr");

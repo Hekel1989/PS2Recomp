@@ -1905,6 +1905,8 @@ namespace
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
+        // Direct GS writes bypass the ordered GIF sink (docs/vu1-thread.md).
+        runtime->memory().vu1Sync(ps2x::Vu1SyncReason::GsDirect);
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);

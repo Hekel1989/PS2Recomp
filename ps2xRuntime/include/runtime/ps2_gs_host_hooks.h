@@ -64,6 +64,24 @@ namespace Ps2GsHostHooks
         // rasterizer is redundant for display; it is only needed for guest
         // readbacks, so this hook makes those reads authoritative.
         std::function<void()> syncLocalMemory;
+
+        // Called instead of `vsync` when set, with the GS privileged registers
+        // that belong to this VBlank.  With a VU1 thread (runtime/
+        // ps2_vu1_thread.h) the present is an operation in the ordered GIF
+        // log and may run after the game thread has moved on: the display
+        // registers are the ones the game had written by the VBlank, and
+        // CSR/SIGLBLID are the values after every earlier GIF packet was
+        // processed, exactly as the serial runtime presents them.  A host that
+        // reads the runtime's live register block at vsync must use this hook
+        // instead, or the VU1 thread fences at every VBlank.
+        struct VsyncRegs
+        {
+            uint64_t pmode, smode1, smode2, srfsh, synch1, synch2, syncv;
+            uint64_t dispfb1, display1, dispfb2, display2;
+            uint64_t extbuf, extdata, extwrite, bgcolor;
+            uint64_t csr, imr, busdir, siglblid;
+        };
+        std::function<void(uint64_t tick, const VsyncRegs &regs)> vsyncRegs;
     };
 
     // PS2X(gs-single-raster): an embedding frontend that renders every packet
