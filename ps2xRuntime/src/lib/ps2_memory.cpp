@@ -1021,8 +1021,6 @@ uint64_t PS2Memory::read64(uint32_t address)
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
     {
-        if (m_vu1Thread && address >= 0x10003C00u && address < 0x10003E00u)
-            m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register);
         uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
@@ -2895,11 +2893,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (ps2x::diag::vu1OverlapEnabled() && address == 0x10003C00u)
         ps2x::diag::vu1Observe(shareVsync(gs_regs), "vif1stat");
-    if (m_vu1Thread)
-    {
-        if (address >= 0x10003C00u && address < 0x10003E00u)
-            m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register);
-    }
+    // No VU1-thread fence for VIF1 register reads: they return the last value
+    // the game wrote (m_ioRegisters), never the interpreter's vif1_regs, so
+    // they cannot observe the worker.  Reading live VIF1 state here would need
+    // m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register) first.
 
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
