@@ -1569,6 +1569,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " a1=0x" << getRegU32(ctx, 5)
                   << " a2=0x" << getRegU32(ctx, 6)
                   << " a3=0x" << getRegU32(ctx, 7)
+                  << " t0=0x" << getRegU32(ctx, 8)
+                  << " t1=0x" << getRegU32(ctx, 9)
+                  << " s0=0x" << getRegU32(ctx, 16)
+                  << " s2=0x" << getRegU32(ctx, 18)
                   << " trace=" << formatDispatchHistory()
                   << std::dec << std::endl;
     }
