@@ -940,6 +940,15 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
         return;
 
+    // XGKICK stalls while the previous PATH1 transfer is still running (the
+    // one-cycle check in calculatePairReadyCycle() is not enough for a
+    // multi-qword packet).  Without this, two XGKICKs in a row -- a program
+    // that kicks a small A+D header (e.g. TEX0) and then its strip -- dropped
+    // the first packet.  PCSX2's interpreter flushes the
+    // previous transfer first and microVU sends both.
+    while (m_xgkick.active)
+        advanceOneCycle();
+
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
     if (vu1TraceEnabled())
     {
