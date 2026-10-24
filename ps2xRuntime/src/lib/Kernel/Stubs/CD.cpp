@@ -185,6 +185,19 @@ namespace ps2_stubs
             static const bool enabled = std::getenv("PS2X_CD_TRACE") != nullptr;
             return enabled;
         }
+
+        // Diagnostics: log every status-ish CDVD call with its return value so
+        // the game's polling loop can be followed. Enabled via PS2X_CD_CALLTRACE.
+        void cdCallTrace(const char *name, int32_t ret, uint32_t pc)
+        {
+            static const bool enabled = std::getenv("PS2X_CD_CALLTRACE") != nullptr;
+            if (enabled)
+            {
+                std::cerr << "[cd-call] " << name << " -> " << std::dec << ret
+                          << " (0x" << std::hex << ret << ") pc=0x" << std::hex << pc << std::dec
+                          << std::endl;
+            }
+        }
     }
 
     bool cdReadTraceEnabled()
@@ -389,11 +402,13 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        cdCallTrace("sceCdSync", 0, ctx->pc);
         setReturnS32(ctx, 0); // 0 = completed/not busy
     }
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        cdCallTrace("sceCdGetError", g_lastCdError, ctx->pc);
         setReturnS32(ctx, g_lastCdError);
     }
 
@@ -414,6 +429,7 @@ namespace ps2_stubs
 
     void sceCdBreak(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        cdCallTrace("sceCdBreak", 1, ctx->pc);
         setReturnS32(ctx, 1);
     }
 
@@ -434,12 +450,14 @@ namespace ps2_stubs
 
     void sceCdDiskReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        cdCallTrace("sceCdDiskReady", 2, ctx->pc);
         setReturnS32(ctx, 2);
     }
 
     void sceCdGetDiskType(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // SCECdPS2DVD
+        cdCallTrace("sceCdGetDiskType", 0x14, ctx->pc);
         setReturnS32(ctx, 0x14);
     }
 
@@ -466,6 +484,7 @@ namespace ps2_stubs
         // Real hardware spins the disc up once the library is initialised;
         // SCECdEXIT (5) stops it. Games poll sceCdStatus for this transition.
         g_cdDriveState = getRegU32(ctx, 4) == 5u ? 0u : 2u;
+        cdCallTrace("sceCdInit", 1, ctx->pc);
         setReturnS32(ctx, 1);
     }
 
@@ -514,6 +533,7 @@ namespace ps2_stubs
         // The pause completes asynchronously on real hardware; the drive state
         // becomes SCECdStatPause and games poll sceCdStatus for it.
         g_cdDriveState = 0x0au;
+        cdCallTrace("sceCdPause", 1, ctx->pc);
         setReturnS32(ctx, 1);
     }
 
@@ -727,11 +747,13 @@ namespace ps2_stubs
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdDriveState = 2u; // SCECdStatSpin
+        cdCallTrace("sceCdStandby", 1, ctx->pc);
         setReturnS32(ctx, 1);
     }
 
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        cdCallTrace("sceCdStatus", static_cast<int32_t>(g_cdDriveState), ctx->pc);
         setReturnS32(ctx, g_cdDriveState);
     }
 
@@ -760,6 +782,7 @@ namespace ps2_stubs
     void sceCdStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdDriveState = 0u; // SCECdStatStop
+        cdCallTrace("sceCdStop", 1, ctx->pc);
         setReturnS32(ctx, 1);
     }
 
