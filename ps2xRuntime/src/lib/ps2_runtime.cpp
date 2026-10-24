@@ -6,6 +6,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_gs_host_hooks.h"
+#include "runtime/ps2_present_hooks.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -795,19 +796,30 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
-#if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
-#endif
-        SetTargetFPS(60);
-        if (m_debugUiInitCallback)
+        // SUIKO(gs-phase6): when the host presents through its own window (the
+        // PCSX2 GS Vulkan swapchain, see runtime/ps2_present_hooks.h) no raylib
+        // window is opened; the debug UI (raylib+imgui based) stays off too.
+        m_headlessPresentation = []
         {
-            m_debugUiInitCallback(*this, m_debugUiUserData);
-            m_debugUiInitialized = true;
+            const auto &hooks = Ps2PresentHooks::hooks();
+            return hooks.presentationDisabled && hooks.presentationDisabled();
+        }();
+        if (!m_headlessPresentation)
+        {
+#if defined(PLATFORM_VITA)
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+#else
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            InitAudioDevice();
+            m_audioBackend.setAudioReady(IsAudioDeviceReady());
+#endif
+            SetTargetFPS(60);
+            if (m_debugUiInitCallback)
+            {
+                m_debugUiInitCallback(*this, m_debugUiUserData);
+                m_debugUiInitialized = true;
+            }
         }
 
         return true;
@@ -2568,10 +2580,15 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    // A blank image to use as a framebuffer (skipped when the host presents;
+    // there is no raylib GL context to upload it to, SUIKO gs-phase6).
+    Texture2D frameTex{};
+    if (!m_headlessPresentation)
+    {
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2599,6 +2616,23 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (m_headlessPresentation)
+        {
+            // SUIKO(gs-phase6): the host owns presentation (PCSX2 GS swapchain
+            // window). Pump its events via mainTick; a true return means the
+            // window closed. The game thread paces itself through the VBlank
+            // scheduler, so a short sleep here is all the pacing this loop needs.
+            const auto &hooks = Ps2PresentHooks::hooks();
+            const bool hostShutdown = hooks.mainTick && hooks.mainTick();
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            if (hostShutdown)
+            {
+                RUNTIME_LOG("[run] host presentation requested shutdown, breaking out of loop");
+                requestStop();
+                break;
+            }
+            continue;
+        }
         // Diagnostic: one-shot guest RAM dump for offline disassembly.
         // PS2X_DIAG_EE_DUMP=<hexaddr>:<hexlen>[:<frame>] (default frame 600).
         {
@@ -2872,8 +2906,11 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    if (!m_headlessPresentation) // SUIKO(gs-phase6): no raylib window in host-presented mode
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
 }

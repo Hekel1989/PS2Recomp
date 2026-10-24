@@ -572,6 +572,9 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    // SUIKO(gs-phase6): true when Ps2PresentHooks::presentationDisabled() was
+    // set at initialize() time: no raylib window, run() uses the host-tick loop.
+    bool m_headlessPresentation = false;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};
