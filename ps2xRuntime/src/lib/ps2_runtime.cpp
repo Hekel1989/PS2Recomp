@@ -2579,6 +2579,117 @@ void PS2Runtime::run()
                 }
             }
         }
+        // Diagnostic: PS2X_DUMP_AT=<vsync>[,<vsync>...] writes a full state snapshot into the
+        // run cwd once the EE vsync counter reaches each listed vsync:
+        //   ee_<v>.bin      32 MB EE RAM (physical addresses)
+        //   gsvram_<v>.bin  4 MB GS VRAM in the GS's physical block/page swizzled layout, i.e.
+        //                   the same layout PCSX2 stores in GS.bin (GSLocalMemory::m_vm8), so
+        //                   the two dumps are directly comparable byte-for-byte
+        //   gsregs_<v>.txt  current GS context registers (TEX0/TEX1/CLAMP/FRAME/ZBUF/... both
+        //                   contexts) plus the display registers, as text
+        {
+            static const struct StateDumpConfig
+            {
+                std::array<uint64_t, 8> at{};
+                size_t count{0};
+            } stateDump = [] {
+                StateDumpConfig config;
+                const char *env = std::getenv("PS2X_DUMP_AT");
+                if (env != nullptr)
+                {
+                    const char *p = env;
+                    while (*p != '\0' && config.count < config.at.size())
+                    {
+                        char *end = nullptr;
+                        const unsigned long long v = std::strtoull(p, &end, 10);
+                        if (end == p)
+                        {
+                            ++p;
+                            continue;
+                        }
+                        config.at[config.count++] = v;
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                    std::sort(config.at.begin(), config.at.begin() + config.count);
+                }
+                return config;
+            }();
+            static size_t stateDumpNext = 0;
+            const uint64_t vsyncNow = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            while (stateDumpNext < stateDump.count && vsyncNow >= stateDump.at[stateDumpNext])
+            {
+                const uint64_t at = stateDump.at[stateDumpNext];
+                ++stateDumpNext;
+                const std::string tag = std::to_string(at);
+                const uint8_t *ram = m_memory.getRDRAM();
+                const uint8_t *vram = m_memory.getGSVRAM();
+                if (ram != nullptr)
+                {
+                    const std::string name = "ee_" + tag + ".bin";
+                    std::ofstream out(name, std::ios::binary);
+                    out.write(reinterpret_cast<const char *>(ram), PS2_RAM_SIZE);
+                    RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
+                }
+                if (vram != nullptr)
+                {
+                    const std::string name = "gsvram_" + tag + ".bin";
+                    std::ofstream out(name, std::ios::binary);
+                    out.write(reinterpret_cast<const char *>(vram), static_cast<std::streamsize>(PS2_GS_VRAM_SIZE));
+                    RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
+                }
+                {
+                    const GSDebugSnapshot snap = m_gs.getDebugSnapshot();
+                    const GSRegisters &gs = m_memory.gs();
+                    std::ostringstream txt;
+                    txt << "vsync=" << vsyncNow << "\n";
+                    txt << std::hex;
+                    txt << "PMODE=0x" << gs.pmode << " SMODE2=0x" << gs.smode2
+                        << " CSR=0x" << gs.csr.load(std::memory_order_relaxed) << "\n";
+                    txt << "DISPFB1=0x" << gs.dispfb1 << " DISPLAY1=0x" << gs.display1 << "\n";
+                    txt << "DISPFB2=0x" << gs.dispfb2 << " DISPLAY2=0x" << gs.display2 << "\n";
+                    txt << "BGCOLOR=0x" << gs.bgcolor << " IMR=0x" << gs.imr << "\n";
+                    txt << "PRIM type=" << static_cast<int>(snap.prim.type)
+                        << " IIP=" << snap.prim.iip << " TME=" << snap.prim.tme
+                        << " ABE=" << snap.prim.abe << " FST=" << snap.prim.fst << "\n";
+                    txt << "TEXCLUT cbw=0x" << std::hex << static_cast<int>(snap.texclut.cbw)
+                        << " cou=" << static_cast<int>(snap.texclut.cou)
+                        << " cov=0x" << static_cast<int>(snap.texclut.cov) << "\n";
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        const GSContext &c = snap.ctx[i];
+                        const std::string s = std::to_string(i + 1);
+                        txt << "CTX" << s << " TEX0 TBP0=0x" << std::hex << c.tex0.tbp0
+                            << " TBW=0x" << static_cast<int>(c.tex0.tbw)
+                            << " PSM=0x" << static_cast<int>(c.tex0.psm)
+                            << " TW=" << static_cast<int>(c.tex0.tw)
+                            << " TH=" << static_cast<int>(c.tex0.th)
+                            << " TCC=" << static_cast<int>(c.tex0.tcc)
+                            << " TFX=" << static_cast<int>(c.tex0.tfx)
+                            << " CBP=0x" << c.tex0.cbp
+                            << " CPSM=0x" << static_cast<int>(c.tex0.cpsm)
+                            << " CSM=" << static_cast<int>(c.tex0.csm)
+                            << " CSA=0x" << static_cast<int>(c.tex0.csa)
+                            << " CLD=0x" << static_cast<int>(c.tex0.cld) << "\n";
+                        txt << "CTX" << s << " TEX1=0x" << c.tex1 << " CLAMP=0x" << c.clamp
+                            << " MIPTBP1=0x" << c.miptbp1 << " MIPTBP2=0x" << c.miptbp2 << "\n";
+                        txt << "CTX" << s << " FRAME FBP=0x" << c.frame.fbp
+                            << " FBW=0x" << c.frame.fbw
+                            << " PSM=0x" << static_cast<int>(c.frame.psm) << "\n";
+                        txt << "CTX" << s << " ZBUF ZBP=0x" << c.zbuf.zbp
+                            << " PSM=0x" << static_cast<int>(c.zbuf.psm) << "\n";
+                        txt << "CTX" << s << " SCISSOR (" << c.scissor.x0 << "," << c.scissor.y0
+                            << ")-(" << c.scissor.x1 << "," << c.scissor.y1 << ")"
+                            << " XYOFFSET (0x" << c.xyoffset.ofx << ",0x" << c.xyoffset.ofy << ")\n";
+                        txt << "CTX" << s << " ALPHA=0x" << c.alpha << " TEST=0x" << c.test
+                            << " FBA=0x" << c.fba << "\n";
+                    }
+                    const std::string name = "gsregs_" + tag + ".txt";
+                    std::ofstream out(name);
+                    out << txt.str();
+                    RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
+                }
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
