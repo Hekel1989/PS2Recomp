@@ -276,6 +276,14 @@ void ps2x::time::noteHostStall(std::chrono::nanoseconds duration) noexcept
     }
 }
 
+void ps2x::time::noteEmulatedWait(std::chrono::nanoseconds duration) noexcept
+{
+    if (duration.count() > 0)
+    {
+        t_guestWaitNs += static_cast<uint64_t>(duration.count());
+    }
+}
+
 bool ps2x::time::descheduleRepayEnabled() noexcept
 {
     return ::descheduleRepayEnabled();

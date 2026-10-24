@@ -78,6 +78,9 @@ namespace ps2x
         Vu1Thread &operator=(const Vu1Thread &) = delete;
 
         Mode mode() const { return m_mode; }
+        // Told how long each fence blocked the game thread (ns), so the
+        // runtime can count it as emulated time (ps2x::time::noteEmulatedWait).
+        void setWaitObserver(std::function<void(uint64_t)> observer) { m_waitObserver = std::move(observer); }
         bool threaded() const { return !m_serialForGood; }
         static bool onWorker();
 
@@ -105,9 +108,11 @@ namespace ps2x
         void sync(Vu1SyncReason reason);
         // Replays the completed prefix of the log without waiting.
         void pump();
-        // GIF_STAT read: its only worker-dependent bit is M3P (the PATH3 mask).
-        // Fences only when a queued VIF1 stream may contain MSKPATH3.
-        void beforeGifStatusRead();
+        // GIF_STAT.M3P without a fence: the PATH3 mask depends only on the
+        // VIF1 command stream, not on VU1, so a parse-only copy of the VIF1
+        // state (no VU memory, no VU1, no GIF output) walks every kick on the
+        // game thread and knows the serial mask at once.
+        bool path3MaskForRead();
 
         // --- Verification hooks (no-ops unless Mode::Verify) ----------------
         void checkPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool directContinuation);
@@ -168,7 +173,6 @@ namespace ps2x
             std::vector<Chunk> chunks;
             uint32_t fbrst = 0u;
             uint64_t sequence = 0u;
-            bool mayChangeMask = false;
             std::vector<Op> ops;
             size_t opCount = 0u; // ops[0..opCount) are live; the rest are reusable
             std::atomic<bool> done{false};
@@ -214,6 +218,7 @@ namespace ps2x
         GS &m_gs;
         const Mode m_mode;
         FbrstProvider m_fbrst;
+        std::function<void(uint64_t)> m_waitObserver;
         bool m_serialForGood = false;
 
         // Game-thread state.
@@ -221,7 +226,9 @@ namespace ps2x
         Work *m_building = nullptr;
         bool m_replaying = false;
         uint32_t m_pendingVsyncs = 0u;
-        uint32_t m_outstandingMaskWork = 0u;
+        std::unique_ptr<PS2Memory> m_predictor;
+        bool m_predictorDriftLogged = false;
+        void checkPredictor(Vu1SyncReason reason);
         uint64_t m_replayed = 0u;
         uint64_t m_nextSequence = 1u;
         std::vector<Work *> m_freeWork;
@@ -232,6 +239,8 @@ namespace ps2x
         std::deque<Work *> m_queue;
         bool m_stop = false;
         std::atomic<bool> m_workerSleeping{false};
+        std::atomic<uint64_t> m_pushed{0u};
+        uint64_t m_taken = 0u; // worker only
         std::atomic<uint64_t> m_completed{0u};
         std::mutex m_doneMutex;
         std::condition_variable m_doneCv;

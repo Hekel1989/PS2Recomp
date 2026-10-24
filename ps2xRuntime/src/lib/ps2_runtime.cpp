@@ -9,6 +9,7 @@
 #include "runtime/ps2_present_hooks.h"
 #include "runtime/ps2_vu1_inventory.h"
 #include "runtime/ps2_diag_shares.h"
+#include "runtime/ee_time.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -847,6 +848,8 @@ bool PS2Runtime::syncCoreSubsystems()
                 const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                 return (ctx ? ctx : &m_cpuContext)->vu0_fbrst;
             });
+        m_vu1Thread->setWaitObserver([](uint64_t ns)
+                                     { ps2x::time::noteEmulatedWait(std::chrono::nanoseconds(ns)); });
         m_memory.setVu1Thread(m_vu1Thread.get());
     }
 
