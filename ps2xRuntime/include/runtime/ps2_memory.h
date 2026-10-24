@@ -22,6 +22,11 @@
 #endif
 
 class GS;
+namespace ps2x
+{
+    class Vu1Thread;
+    enum class Vu1SyncReason : uint8_t;
+}
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
@@ -335,6 +340,22 @@ public:
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false, bool directContinuation = false);
+
+    // VU1 thread (runtime/ps2_vu1_thread.h).  While one is attached, VIF1
+    // kicks run on it and the GIF front is routed through its ordered log;
+    // vu1Sync() is the fence every observation point calls.
+    void setVu1Thread(ps2x::Vu1Thread *thread) { m_vu1Thread = thread; }
+    ps2x::Vu1Thread *vu1Thread() const { return m_vu1Thread; }
+    void vu1Sync(ps2x::Vu1SyncReason reason);
+    // The GIF-front operations themselves, without routing.  The VU1 thread
+    // replays its log through these.
+    void submitGifPacketDirect(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl, bool directContinuation);
+    void drainGifArbiterDirect();
+    void setPath3MaskDirect(bool masked);
+    void notifyGsPrivRegWriteDirect(uint32_t regOff, uint64_t value);
+    // The VU1 thread's verification shadow: VU1 code/data only, copied from
+    // `real` along with the VIF1/PATH3 state.
+    bool initializeVif1Shadow(const PS2Memory &real);
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);
@@ -399,6 +420,11 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    ps2x::Vu1Thread *m_vu1Thread = nullptr;
+    void notifyGsPrivRegWriteRouted(uint32_t regOff, uint64_t value);
+    // GS CSR/SIGLBLID: replayed SIGNAL/FINISH/LABEL packets update them.
+    void syncBeforeGsPrivReg(uint32_t regOff);
+    void syncBeforeVuAccess(const uint8_t *vuMem);
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
