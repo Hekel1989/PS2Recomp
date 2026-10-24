@@ -2,10 +2,42 @@
 #include "LibC.h"
 #include "ps2_log.h"
 
+#include <sstream>
+
 namespace ps2_stubs
 {
     namespace
     {
+        bool moviePcmTrace()
+        {
+            static const bool enabled = std::getenv("PS2X_MOVIE_PCM_TRACE") != nullptr;
+            return enabled;
+        }
+
+        uint64_t traceFnv1a(const uint8_t *data, size_t size)
+        {
+            uint64_t hash = 0xCBF29CE484222325ull;
+            for (size_t i = 0; i < size; ++i)
+            {
+                hash ^= data[i];
+                hash *= 0x100000001B3ull;
+            }
+            return hash;
+        }
+
+        std::string traceHex(const uint8_t *data, size_t size)
+        {
+            static const char digits[] = "0123456789abcdef";
+            std::string out;
+            out.reserve(size * 2u);
+            for (size_t i = 0; i < size; ++i)
+            {
+                out.push_back(digits[data[i] >> 4u]);
+                out.push_back(digits[data[i] & 0x0Fu]);
+            }
+            return out;
+        }
+
         uint32_t sanitizeMemTransferSize(uint32_t size, const char *op)
         {
             constexpr uint32_t kMaxTransfer = PS2_RAM_SIZE;
@@ -93,6 +125,32 @@ namespace ps2_stubs
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
         size = sanitizeMemTransferSize(size, "memcpy");
+
+        const uint32_t callerRa = getRegU32(ctx, 31);
+        const bool tracePcm = moviePcmTrace() && callerRa >= 0x3BAE80u && callerRa < 0x3BB200u;
+        uint64_t traceHash = 0u;
+        std::string traceHead;
+        if (tracePcm)
+        {
+            std::vector<uint8_t> source(size);
+            bool readable = size != 0u;
+            for (uint32_t i = 0u; i < size; ++i)
+            {
+                const uint8_t *byte = getConstMemPtr(rdram, srcAddr + i);
+                if (!byte)
+                {
+                    readable = false;
+                    break;
+                }
+                source[i] = *byte;
+            }
+            traceHash = traceFnv1a(source.data(), source.size());
+            traceHead = traceHex(source.data(), std::min<size_t>(16u, source.size()));
+            std::printf("[movie-ee] cyc=%llu ra=0x%x dst=0x%x src=0x%x size=%u readable=%u fnv=%016llx head=%s\n",
+                        runtime ? static_cast<unsigned long long>(runtime->iopDebugSnapshot().emulatorCycles) : 0ull,
+                        callerRa, destAddr, srcAddr, size, readable ? 1u : 0u,
+                        static_cast<unsigned long long>(traceHash), traceHead.c_str());
+        }
 
         uint32_t copied = 0u;
         uint32_t curDst = destAddr;

@@ -515,6 +515,8 @@ namespace ps2_stubs
             }
 
             fillPadStatus(outData, state, portState);
+            if (runtime != nullptr)
+                runtime->setLastPadButtons(state.buttons);
 
             {
                 std::lock_guard<std::mutex> lock(g_padStateMutex);

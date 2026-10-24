@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace ps2_stubs
@@ -195,6 +196,36 @@ namespace ps2_stubs
                 }
             }
             return true;
+        }
+
+        bool moviePcmTrace()
+        {
+            static const bool enabled = std::getenv("PS2X_MOVIE_PCM_TRACE") != nullptr;
+            return enabled;
+        }
+
+        uint64_t traceFnv1a(const uint8_t *data, size_t size)
+        {
+            uint64_t hash = 0xCBF29CE484222325ull;
+            for (size_t i = 0; i < size; ++i)
+            {
+                hash ^= data[i];
+                hash *= 0x100000001B3ull;
+            }
+            return hash;
+        }
+
+        std::string traceHex(const uint8_t *data, size_t size)
+        {
+            static const char digits[] = "0123456789abcdef";
+            std::string out;
+            out.reserve(size * 2u);
+            for (size_t i = 0; i < size; ++i)
+            {
+                out.push_back(digits[data[i] >> 4u]);
+                out.push_back(digits[data[i] & 0x0Fu]);
+            }
+            return out;
         }
 
         bool readEeRange(const uint8_t *rdram, uint32_t address, void *destination, uint32_t sizeBytes)
@@ -725,6 +756,30 @@ namespace ps2_stubs
                 }
                 const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
                 std::vector<uint8_t> payload(sizeBytes);
+                const bool tracePcm = moviePcmTrace() && sizeBytes >= 0x200u;
+                if (tracePcm)
+                {
+                    const bool readable = readEeRange(rdram, xfer.src, payload.data(), sizeBytes);
+                    static uint64_t traceSeq = 0;
+                    uint32_t st[40] = {};
+                    for (uint32_t si = 0u; si < 40u; ++si)
+                    {
+                        const uint32_t *word = reinterpret_cast<const uint32_t *>(
+                            getConstMemPtr(rdram, 0x10ECD30u + si * 4u));
+                        st[si] = word ? *word : 0u;
+                    }
+                    std::printf("[movie-sif] seq=%llu cyc=%llu pc=0x%x ra=0x%x src=0x%x dst=0x%x size=%u attr=0x%x readable=%u fnv=%016llx head=%s"
+                                " st00=0x%x st04=0x%x st58=0x%x st5c=0x%x st60=0x%x st64=0x%x st68=0x%x st6c=0x%x st70=0x%x st74=0x%x st78=0x%x st80=0x%x\n",
+                                static_cast<unsigned long long>(traceSeq++),
+                                static_cast<unsigned long long>(runtime->iopDebugSnapshot().emulatorCycles),
+                                ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u,
+                                xfer.src, xfer.dest,
+                                sizeBytes, static_cast<uint32_t>(xfer.attr), readable ? 1u : 0u,
+                                static_cast<unsigned long long>(traceFnv1a(payload.data(), payload.size())),
+                                traceHex(payload.data(), std::min<size_t>(16u, payload.size())).c_str(),
+                                st[0], st[1], st[0x58u/4u], st[0x5Cu/4u], st[0x60u/4u], st[0x64u/4u],
+                                st[0x68u/4u], st[0x6Cu/4u], st[0x70u/4u], st[0x74u/4u], st[0x78u/4u], st[0x80u/4u]);
+                }
                 if (!readEeRange(rdram, xfer.src, payload.data(), sizeBytes) || !runtime->writeIopMemory(xfer.dest, payload.data(), payload.size()))
                 {
                     ok = false;
