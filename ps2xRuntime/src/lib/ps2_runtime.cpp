@@ -94,6 +94,12 @@ namespace
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
 
+    // The main guest thread's stack grows downward from PS2_RAM_SIZE - 0x10
+    // (set in run()). The async (invocation) callback stacks must be allocated
+    // below this reservation, otherwise an RPC completion callback running as
+    // an invocation overwrites the live frames of the thread it preempts.
+    constexpr uint32_t kEeMainStackReserve = 0x10000u;
+
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
@@ -506,7 +512,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackTop = PS2_RAM_SIZE - kEeMainStackReserve;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -975,7 +981,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackTop = PS2_RAM_SIZE - kEeMainStackReserve;
     }
 
     LoadedModule module;
