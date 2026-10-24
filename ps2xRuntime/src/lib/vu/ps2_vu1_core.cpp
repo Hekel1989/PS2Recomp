@@ -1669,6 +1669,21 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    // SUIKO(diag-vu1-start-vi): show the VI state the VIF1 hand-off gave
+    // the title render entries; the 0x140/0x150 loops read their pointers
+    // from VI, so a stale value here shows up as a non-terminating loop.
+    if (vu1TraceEnabled() && (m_state.pc == 0x140u || m_state.pc == 0x150u))
+    {
+        static int s_startViBudget = 120;
+        if (s_startViBudget-- > 0)
+        {
+            std::fprintf(stderr, "[vu1:start] pc=0x%x top=0x%x itop=0x%x vi:", m_state.pc,
+                         m_state.top, m_state.itop);
+            for (uint32_t i = 1; i < 16u; ++i)
+                std::fprintf(stderr, " %u=0x%x", i, static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[i])));
+            std::fprintf(stderr, "\n");
+        }
+    }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
