@@ -1401,17 +1401,33 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     // Diagnostic: log every dispatch whose target matches PS2X_EE_JMPWATCH=<hex>,
     // so the caller of a mistrusted indirect target can be identified.
-    static const uint32_t jmpWatch = [] {
+    // Accepts a comma-separated list of up to 8 targets.
+    static const auto jmpWatch = [] {
+        std::vector<uint32_t> list;
         const char *env = std::getenv("PS2X_EE_JMPWATCH");
-        return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0xFFFFFFFFu;
+        if (env != nullptr)
+        {
+            while (*env != '\0' && list.size() < 8u)
+            {
+                char *end = nullptr;
+                list.push_back(static_cast<uint32_t>(std::strtoul(env, &end, 16)));
+                if (end == nullptr || end == env)
+                    break;
+                env = (*end == ',') ? end + 1 : end;
+            }
+        }
+        return list;
     }();
-    if (jmpWatch != 0xFFFFFFFFu && targetPc == jmpWatch)
+    for (const uint32_t watched : jmpWatch)
     {
+        if (targetPc != watched)
+            continue;
         std::cerr << "[ee-jmpwatch] kind=" << describeGuestBranchKind(kind)
                   << " op=" << (debugName ? debugName : "<unknown>")
                   << " source=0x" << std::hex << sourcePc
                   << " target=0x" << targetPc
                   << " ra=0x" << getRegU32(ctx, 31)
+                  << " v0=0x" << getRegU32(ctx, 2)
                   << " sp=0x" << getRegU32(ctx, 29)
                   << " a0=0x" << getRegU32(ctx, 4)
                   << " a1=0x" << getRegU32(ctx, 5)
