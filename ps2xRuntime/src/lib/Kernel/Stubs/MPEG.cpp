@@ -2288,6 +2288,7 @@ namespace ps2_stubs
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        bool atStreamEnd = false;
         MpegDecodedFrame frame;
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
@@ -2387,6 +2388,34 @@ namespace ps2_stubs
                 height = playback.height;
                 frameCount = playback.picturesServed;
             }
+
+            // The game can call the real libmpeg sceMpegIsEnd (a recompiled
+            // guest function, not our HLE stub): it returns the first word of
+            // the work area at [mpeg + 0x40]. Real libmpeg raises that flag
+            // when the bitstream reaches sequence_end and every decoded
+            // picture has been served. Our HLE owns the work area, so it has
+            // to maintain the flag itself or the guest polls it forever.
+            const bool playbackEnded = playback.sawSequenceEnd || playback.streamEnded;
+            const uint64_t presentationEnd = playback.presentationEndTickQ32;
+            const uint64_t nowTickQ32 = runtime->eeScheduler().currentVSyncTick() << 32u;
+            const bool presentationComplete =
+                presentationEnd == std::numeric_limits<uint64_t>::max() ||
+                nowTickQ32 >= presentationEnd;
+            atStreamEnd = !haveFrame &&
+                          playback.decodedFrames.empty() &&
+                          playback.sawInput &&
+                          playbackEnded &&
+                          presentationComplete;
+            if (atStreamEnd && g_mpeg_stub_state.isEndTraceCount < 16u)
+            {
+                PS2_IF_AGRESSIVE_LOGS({
+                    std::cerr << "[MPEG:GetPicture:EOS] mpeg=0x" << std::hex << mpegAddr << std::dec
+                              << " seqEnd=" << playback.sawSequenceEnd
+                              << " streamEnded=" << playback.streamEnded
+                              << " picturesServed=" << playback.picturesServed << std::endl;
+                });
+                ++g_mpeg_stub_state.isEndTraceCount;
+            }
         }
 
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
@@ -2403,6 +2432,10 @@ namespace ps2_stubs
                 *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
                 *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
                 *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
+                if (atStreamEnd)
+                {
+                    *reinterpret_cast<uint32_t *>(inner + 0x00u) = 1u;
+                }
             }
         }
 
