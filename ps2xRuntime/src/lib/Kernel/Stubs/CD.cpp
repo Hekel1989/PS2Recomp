@@ -377,6 +377,9 @@ namespace ps2_stubs
             }
 
             g_cdStreamingLbn = selected.lbn + selected.sectors;
+            // Reads complete synchronously here, so the drive is back to
+            // spinning (not SCECdStatRead) by the time the caller returns.
+            g_cdDriveState = 2u;
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -460,6 +463,9 @@ namespace ps2_stubs
         g_cdInitialized = true;
         g_lastCdError = 0;
         g_cdStreamTiming = {};
+        // Real hardware spins the disc up once the library is initialised;
+        // SCECdEXIT (5) stops it. Games poll sceCdStatus for this transition.
+        g_cdDriveState = getRegU32(ctx, 4) == 5u ? 0u : 2u;
         setReturnS32(ctx, 1);
     }
 
@@ -505,6 +511,9 @@ namespace ps2_stubs
 
     void sceCdPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // The pause completes asynchronously on real hardware; the drive state
+        // becomes SCECdStatPause and games poll sceCdStatus for it.
+        g_cdDriveState = 0x0au;
         setReturnS32(ctx, 1);
     }
 
@@ -717,12 +726,13 @@ namespace ps2_stubs
 
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_cdDriveState = 2u; // SCECdStatSpin
         setReturnS32(ctx, 1);
     }
 
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_cdInitialized ? 6 : 0);
+        setReturnS32(ctx, g_cdDriveState);
     }
 
     void sceCdStInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -749,6 +759,7 @@ namespace ps2_stubs
 
     void sceCdStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_cdDriveState = 0u; // SCECdStatStop
         setReturnS32(ctx, 1);
     }
 

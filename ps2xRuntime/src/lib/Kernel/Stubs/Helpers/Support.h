@@ -28,6 +28,11 @@ namespace
     uint32_t g_cdStreamingLbn = 0;
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
+    // Drive state reported by sceCdStatus (SCECdvdDriveState): 0x00 stop,
+    // 0x01 shell open, 0x02 spin, 0x06 read, 0x0a pause, 0x12 seek, 0x20 error.
+    // Games poll this to learn that an asynchronous command (spin-up after
+    // sceCdInit, sceCdPause, ...) has completed.
+    uint32_t g_cdDriveState = 0u;
 
     std::string toLowerAscii(std::string value)
     {
