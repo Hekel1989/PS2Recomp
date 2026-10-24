@@ -24,6 +24,15 @@ namespace
         return enabled;
     }
 
+    // Diagnostic: PS2X_EE_SEMA_TRACE=1 logs semaphore create/delete and every
+    // successful signal or blocking wait. Used to diagnose frame-handshake
+    // deadlocks (main thread waiting for the display worker and vice versa).
+    bool semaTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_SEMA_TRACE") != nullptr;
+        return enabled;
+    }
+
     // Diagnostic: PS2X_EE_THREAD_DUMP_AT=<vsync>[,<vsync>...] prints every
     // thread's PC and wait state when the vsync counter reaches each value.
     // Runs on the scheduler thread, so it works with host presentation too.
@@ -1011,6 +1020,11 @@ int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uin
         std::cerr << "[ee-sched] createSema id=" << id << " init=" << initCount
                   << " max=" << maxCount << std::endl;
     }
+    if (semaTraceEnabled())
+    {
+        std::cerr << "[ee-sema] create id=" << id << " init=" << initCount
+                  << " max=" << maxCount << std::endl;
+    }
     EeSemaphore semaphore{};
     semaphore.id = id;
     semaphore.count = initCount;
@@ -1033,6 +1047,10 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
     }
     std::deque<int> waiters = std::move(it->second.waiters);
     m_semaphores.erase(it);
+    if (semaTraceEnabled())
+    {
+        std::cerr << "[ee-sema] delete id=" << id << " waiters=" << waiters.size() << std::endl;
+    }
     for (const int threadId : waiters)
     {
         if (GuestThread *waiter = thread(threadId))
@@ -1058,6 +1076,10 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
         object->waiters.pop_front();
         GuestThread *waiter = thread(waiterId);
         assert(waiter != nullptr);
+        if (semaTraceEnabled())
+        {
+            std::cerr << "[ee-sema] signal id=" << id << " wake=" << waiterId << std::endl;
+        }
         makeReady(*waiter, id, interruptSafe);
         publishSnapshot();
         return id;
@@ -1069,6 +1091,10 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
     if (schedTraceEnabled())
     {
         std::cerr << "[ee-sched] signalSema id=" << id << " count=" << object->count + 1 << std::endl;
+    }
+    if (semaTraceEnabled())
+    {
+        std::cerr << "[ee-sema] signal id=" << id << " count=" << object->count + 1 << std::endl;
     }
     ++object->count;
     publishSnapshot();
@@ -1114,6 +1140,10 @@ void EeScheduler::waitSemaphore(int id)
         {
             std::cerr << "[ee-sched] waitSema-ok id=" << id << " count=" << object->count << std::endl;
         }
+        if (semaTraceEnabled())
+        {
+            std::cerr << "[ee-sema] wait-ok id=" << id << " count=" << object->count << std::endl;
+        }
         GuestThread *self = currentThread();
         assert(self != nullptr);
         setReturnS32(&self->activeContext(), id);
@@ -1122,6 +1152,10 @@ void EeScheduler::waitSemaphore(int id)
     }
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    if (semaTraceEnabled())
+    {
+        std::cerr << "[ee-sema] wait-block id=" << id << " tid=" << self->id << std::endl;
+    }
     object->waiters.push_back(self->id);
     blockCurrent(EeWaitState{EeWaitReason::Semaphore, EeSemaphoreWait{id}});
 }
