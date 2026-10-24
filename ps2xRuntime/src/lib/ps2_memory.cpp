@@ -421,12 +421,14 @@ PS2Memory::~PS2Memory()
 
     if (m_vu1Code)
     {
-        delete[] m_vu1Code;
+        if (m_vu1Code != m_vu1ExternalCode)
+            delete[] m_vu1Code;
         m_vu1Code = nullptr;
     }
     if (m_vu1Data)
     {
-        delete[] m_vu1Data;
+        if (m_vu1Data != m_vu1ExternalData)
+            delete[] m_vu1Data;
         m_vu1Data = nullptr;
     }
     if (m_vu0Code)
@@ -457,8 +459,10 @@ bool PS2Memory::initialize(size_t ramSize)
         delete[] m_gsVRAM;
         delete[] m_vu0Code;
         delete[] m_vu0Data;
-        delete[] m_vu1Code;
-        delete[] m_vu1Data;
+        if (m_vu1Code != m_vu1ExternalCode)
+            delete[] m_vu1Code;
+        if (m_vu1Data != m_vu1ExternalData)
+            delete[] m_vu1Data;
         m_rdram = nullptr;
         m_scratchpad = nullptr;
         ps2SetScratchpadHostPtr(nullptr);
@@ -530,8 +534,8 @@ bool PS2Memory::initialize(size_t ramSize)
         std::memset(m_vu0Code, 0, PS2_VU0_CODE_SIZE);
         std::memset(m_vu0Data, 0, PS2_VU0_DATA_SIZE);
 
-        m_vu1Code = new uint8_t[PS2_VU1_CODE_SIZE];
-        m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
+        m_vu1Code = m_vu1ExternalCode ? m_vu1ExternalCode : new uint8_t[PS2_VU1_CODE_SIZE];
+        m_vu1Data = m_vu1ExternalData ? m_vu1ExternalData : new uint8_t[PS2_VU1_DATA_SIZE];
         std::memset(m_vu1Code, 0, PS2_VU1_CODE_SIZE);
         std::memset(m_vu1Data, 0, PS2_VU1_DATA_SIZE);
         markVU0CodeModified();
@@ -552,6 +556,27 @@ bool PS2Memory::initialize(size_t ramSize)
         cleanup();
         return false;
     }
+}
+
+void PS2Memory::useVu1Storage(uint8_t *code, uint8_t *data)
+{
+    if (code == m_vu1Code && data == m_vu1Data)
+        return;
+    if (m_vu1Code)
+        std::memcpy(code, m_vu1Code, PS2_VU1_CODE_SIZE);
+    else
+        std::memset(code, 0, PS2_VU1_CODE_SIZE);
+    if (m_vu1Data)
+        std::memcpy(data, m_vu1Data, PS2_VU1_DATA_SIZE);
+    else
+        std::memset(data, 0, PS2_VU1_DATA_SIZE);
+    if (m_vu1Code != m_vu1ExternalCode)
+        delete[] m_vu1Code;
+    if (m_vu1Data != m_vu1ExternalData)
+        delete[] m_vu1Data;
+    m_vu1ExternalCode = m_vu1Code = code;
+    m_vu1ExternalData = m_vu1Data = data;
+    markVU1CodeModified();
 }
 
 bool PS2Memory::initializeVif1Shadow(const PS2Memory &real)

@@ -327,6 +327,10 @@ public:
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
 
+    // Moves VU1 micro/data memory into caller-owned buffers (a VU1 backend's,
+    // runtime/ps2_vu1_backend.h), keeping the contents.  The buffers must
+    // outlive this object; initialize() keeps using them.
+    void useVu1Storage(uint8_t *code, uint8_t *data);
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
     uint8_t *getVU1Data() { return m_vu1Data; }
@@ -435,6 +439,9 @@ public:
     uint8_t *m_vu0Data = nullptr;
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
+    // useVu1Storage(): m_vu1Code/m_vu1Data are not ours to delete.
+    uint8_t *m_vu1ExternalCode = nullptr;
+    uint8_t *m_vu1ExternalData = nullptr;
     bool m_path3Masked = false;
     // PS2X(vu1-inventory): where the chunk being parsed came from, for MPG
     // source reporting.  kind 1 = contiguous physical buffer, 2 = DMA chain.
