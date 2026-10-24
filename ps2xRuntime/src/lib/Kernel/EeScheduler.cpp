@@ -28,6 +28,8 @@ namespace
 {
     // PS2X(dmac-dstat-mask): DMAC channels 0..9 and their D_STAT register.
     constexpr uint32_t kDmacChannelCount = 10u;
+    constexpr uint32_t kDmacChannelMask = (1u << kDmacChannelCount) - 1u;
+    constexpr uint32_t kDmacMaskShift = 16u;
     constexpr uint32_t kDStatAddress = 0x1000E010u;
 
     // Emulated-time pacing (see EeScheduler::sampleHostPacing): sample the
@@ -359,6 +361,13 @@ EeScheduler::~EeScheduler()
 
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
+    // Clear a stop request left over from an earlier run at the start of the
+    // reset, not at the end: a requestStop() that arrives while the reset is
+    // in progress must stay pending.  Tests that time out a wedged guest call
+    // requestStop() from another thread while the scheduler thread is still
+    // initialising; clearing the flag afterwards lost the stop and the join
+    // never returned.
+    m_stopRequested.store(false, std::memory_order_release);
     m_executorThread = std::this_thread::get_id();
     m_rdram = rdram;
     m_readyQueues = {};
@@ -381,6 +390,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_dmacTailOrder = 1000;
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
+    m_dmacEnableCache = 0u;
     m_currentThreadId = 0;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
@@ -419,7 +429,6 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_traceReason = kTraceStart;
     m_traceCount = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
-    m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
     m_debugPublishCountdown = 0u;
     {
@@ -2123,7 +2132,7 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
             // D_STAT said on, VIF1 completions were never delivered, and the
             // game's DMA queue never drained (no title screen).
             PS2Memory &memory = m_runtime.memory();
-            const uint32_t maskBit = 1u << (16u + cause);
+            const uint32_t maskBit = 1u << (kDmacMaskShift + cause);
             const bool wasOn = (memory.readIORegister(kDStatAddress) & maskBit) != 0u;
             if (enabled != wasOn)
             {
@@ -2177,9 +2186,21 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (dmac && cause < kDmacChannelCount)
     {
-        // PS2X(dmac-dstat-mask): channel interrupts are gated by D_STAT CIM.
-        const uint32_t cim = (m_runtime.memory().readIORegister(kDStatAddress) >> 16u) & 0x3FFu;
-        mask = (mask & ~0x3FFu) | cim;
+        // PS2X(dmac-dstat-mask): D_STAT CIM is authoritative once a guest (or
+        // EnableDmac/DisableDmac) has programmed a channel mask bit.  A fresh
+        // memory image has CIM zero, which on hardware means every channel is
+        // masked, but the scheduler has always started with all channels
+        // enabled; keep that default until the masks are actually programmed.
+        // Without the fallback, a DMAC dispatch after reset was dropped: the
+        // handler never ran, the waiting semaphore was never signalled, and a
+        // synchronous scheduler run had no stop request to end it.
+        PS2Memory &memory = m_runtime.memory();
+        if (memory.dmacChannelMasksProgrammed())
+        {
+            const uint32_t cim =
+                (memory.readIORegister(kDStatAddress) >> kDmacMaskShift) & kDmacChannelMask;
+            mask = (mask & ~kDmacChannelMask) | cim;
+        }
     }
     if (schedTraceEnabled())
     {

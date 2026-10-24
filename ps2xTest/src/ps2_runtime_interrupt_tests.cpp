@@ -379,6 +379,44 @@ void register_ps2_runtime_interrupt_tests()
 {
     MiniTest::Case("PS2RuntimeInterrupt", [](TestCase &tc)
     {
+        tc.Run("DMAC channel masks become D_STAT authority once programmed", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            constexpr uint32_t kDStatAddress = 0x1000E010u;
+            constexpr uint32_t kChannelMask = (1u << 10u) - 1u;
+            constexpr uint32_t kChannel = 5u;
+            const uint32_t channelBit = 1u << (16u + kChannel);
+
+            R5900Context mainContext{};
+            mainContext.pc = 0u;
+            EeScheduler &scheduler = env.runtime.eeScheduler();
+            scheduler.reset(env.rdram.data(), mainContext);
+
+            const uint32_t initialMasks =
+                (env.runtime.memory().readIORegister(kDStatAddress) >> 16u) & kChannelMask;
+            t.Equals(initialMasks, 0u,
+                     "fresh memory should keep the hardware reset value until masks are programmed");
+            t.IsFalse(env.runtime.memory().dmacChannelMasksProgrammed(),
+                      "a fresh memory image must not claim the DMAC masks were programmed");
+
+            t.Equals(scheduler.setIrqCauseEnabled(true, kChannel, false), 0,
+                     "DisableDmac should report the kernel's own enable cache, not a default");
+            t.IsTrue((env.runtime.memory().readIORegister(kDStatAddress) & channelBit) == 0u,
+                     "DisableDmac on a channel the kernel never enabled should leave D_STAT alone");
+            t.Equals(scheduler.setIrqCauseEnabled(true, kChannel, true), 0,
+                     "EnableDmac should succeed for a channel disabled by the kernel");
+            t.IsTrue((env.runtime.memory().readIORegister(kDStatAddress) & channelBit) != 0u,
+                     "EnableDmac should set the channel's D_STAT mask bit");
+            t.IsTrue(env.runtime.memory().dmacChannelMasksProgrammed(),
+                     "writing a mask bit should make D_STAT the authority");
+            t.Equals(scheduler.setIrqCauseEnabled(true, kChannel, false), 1,
+                     "DisableDmac should report that the kernel had enabled the channel");
+            t.IsTrue((env.runtime.memory().readIORegister(kDStatAddress) & channelBit) == 0u,
+                     "DisableDmac should clear the channel's D_STAT mask bit");
+        });
+
         tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
         {
             TestEnv env;
