@@ -146,11 +146,14 @@ namespace ps2_syscalls
     {
         (void)runtime;
         const uint32_t paramAddr = getRegU32(ctx, 4); // $a0 - Config2Param*
-        const uint32_t size = getRegU32(ctx, 5);      // $a1 - sizeof(Config2Param), normally 4
+        const uint32_t size = getRegU32(ctx, 5);      // $a1 - byte count
+        const uint32_t offset = getRegU32(ctx, 6);    // $a2 - byte offset into the config2 block
 
         ensureOsdConfigInitialized();
 
-        if (size == 0u)
+        // ps2sdk: SetOsdConfigParam2(void *config, s32 size, s32 offset) writes `size` bytes
+        // of the 4-byte config2 block starting at `offset` (games use e.g. (src, 1, 1)).
+        if (size == 0u || offset >= 4u)
         {
             setReturnS32(ctx, 0);
             return;
@@ -162,10 +165,9 @@ namespace ps2_syscalls
             raw = makeReadableOsdConfig2RawLocked();
         }
 
-        // Guest Config2Param is {flags, version, language} = internal raw >> 8; see
-        // GetOsdConfigParam2. Guest byte i maps to internal byte i+1.
-        const uint32_t copyBytes = std::min<uint32_t>(size, 3u);
-        uint8_t paramBytes[3] = {
+        const uint32_t copyBytes = std::min<uint32_t>(size, 4u - offset);
+        uint8_t blockBytes[4] = {
+            static_cast<uint8_t>(raw & 0xFFu),
             static_cast<uint8_t>((raw >> 8) & 0xFFu),
             static_cast<uint8_t>((raw >> 16) & 0xFFu),
             static_cast<uint8_t>((raw >> 24) & 0xFFu),
@@ -181,13 +183,13 @@ namespace ps2_syscalls
                 setReturnS32(ctx, -1);
                 return;
             }
-            paramBytes[i] = *src;
+            blockBytes[offset + i] = *src;
         }
 
-        raw = (raw & 0xFFu) |
-              static_cast<uint32_t>(paramBytes[0]) << 8 |
-              (static_cast<uint32_t>(paramBytes[1]) << 16) |
-              (static_cast<uint32_t>(paramBytes[2]) << 24);
+        raw = static_cast<uint32_t>(blockBytes[0]) |
+              (static_cast<uint32_t>(blockBytes[1]) << 8) |
+              (static_cast<uint32_t>(blockBytes[2]) << 16) |
+              (static_cast<uint32_t>(blockBytes[3]) << 24);
         raw = sanitizeOsdConfig2Raw(raw);
 
         {
@@ -196,9 +198,10 @@ namespace ps2_syscalls
 
             uint32_t version = (g_osd_config_raw >> 13) & 0x7u;
             uint32_t language = (g_osd_config_raw >> 16) & 0x1Fu;
-            if (copyBytes >= 2u)
+            const uint32_t end = offset + copyBytes;
+            if (offset <= 2u && end > 2u)
                 version = (raw >> 16) & 0xFFu;
-            if (copyBytes >= 3u)
+            if (offset <= 3u && end > 3u)
                 language = (raw >> 24) & 0xFFu;
             g_osd_config_raw = syncOsdConfigRawVersionLanguage(g_osd_config_raw, version, language);
             g_osd_config_initialized = true;
@@ -211,11 +214,16 @@ namespace ps2_syscalls
     {
         (void)runtime;
         const uint32_t paramAddr = getRegU32(ctx, 4); // $a0 - Config2Param*
-        const uint32_t size = getRegU32(ctx, 5);      // $a1 - sizeof(Config2Param), normally 4
+        const uint32_t size = getRegU32(ctx, 5);      // $a1 - byte count
+        const uint32_t offset = getRegU32(ctx, 6);    // $a2 - byte offset into the config2 block
 
         ensureOsdConfigInitialized();
 
-        if (size == 0u)
+        // ps2sdk: GetOsdConfigParam2(void *config, s32 size, s32 offset) copies `size` bytes
+        // of the 4-byte config2 block starting at `offset`. Suikoden Tactics' libscf calls
+        // (dst, 1, 1) and reads the flags byte: bit 4 daylight, bit 5 time format, bits 6-7
+        // date notation.
+        if (size == 0u || offset >= 4u)
         {
             setReturnS32(ctx, 0);
             return;
@@ -227,17 +235,13 @@ namespace ps2_syscalls
             raw = makeReadableOsdConfig2RawLocked();
         }
 
-        // Guest Config2Param is the 3-byte struct {flags, version, language} = internal
-        // raw >> 8 (the game's libscf calls GetOsdConfig2(dst, 1, 1) and reads the flags
-        // byte first: bit 4 daylight, bit 5 time format, bits 6-7 date notation).
-        const uint32_t param = raw >> 8;
-        const uint8_t rawBytes[4] = {
-            static_cast<uint8_t>(param & 0xFFu),
-            static_cast<uint8_t>((param >> 8) & 0xFFu),
-            static_cast<uint8_t>((param >> 16) & 0xFFu),
-            0u,
+        const uint8_t blockBytes[4] = {
+            static_cast<uint8_t>(raw & 0xFFu),
+            static_cast<uint8_t>((raw >> 8) & 0xFFu),
+            static_cast<uint8_t>((raw >> 16) & 0xFFu),
+            static_cast<uint8_t>((raw >> 24) & 0xFFu),
         };
-        const uint32_t copyBytes = std::min<uint32_t>(size, 4u);
+        const uint32_t copyBytes = std::min<uint32_t>(size, 4u - offset);
 
         for (uint32_t i = 0; i < copyBytes; ++i)
         {
@@ -249,7 +253,7 @@ namespace ps2_syscalls
                 setReturnS32(ctx, -1);
                 return;
             }
-            *dst = rawBytes[i];
+            *dst = blockBytes[offset + i];
         }
 
         setReturnS32(ctx, 0);
