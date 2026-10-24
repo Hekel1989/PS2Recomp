@@ -503,6 +503,7 @@ namespace ps2_stubs
             bool decoderFailed = false;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
+            bool audioHeaderSkipped = false;
             std::vector<uint8_t> videoSequenceSyncBuffer;
             std::vector<uint8_t> pssBuffer;
             std::vector<uint32_t> pssGuestAddrs;
@@ -1364,21 +1365,57 @@ namespace ps2_stubs
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
                     const size_t payloadStart = pes.payloadOffset;
-                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                    // The audio payload is `ff a0 00 00` followed by PCM; the
+                    // first payload also carries the SShd/SSbd stream header.
+                    // The decoder's private-stream callback delivers samples,
+                    // not the container header, and the game's callback skips
+                    // exactly the 4-byte prefix. Keep that contract: point the
+                    // event 4 bytes before the first PCM sample and skip
+                    // SShd/SSbd on the first packet. Otherwise those 40 bytes
+                    // are played as audio and every 512-byte L/R block after
+                    // them is misaligned.
+                    size_t pcmStart = payloadStart;
+                    if (pcmStart + 4u <= packetEnd &&
+                        buffer[pcmStart] == 0xFFu && buffer[pcmStart + 1u] == 0xA0u &&
+                        buffer[pcmStart + 2u] == 0x00u && buffer[pcmStart + 3u] == 0x00u)
                     {
+                        pcmStart += 4u;
+                    }
+                    if (!playback.audioHeaderSkipped && pcmStart < packetEnd)
+                    {
+                        const uint8_t *payload = buffer.data() + pcmStart;
+                        const size_t available = packetEnd - pcmStart;
+                        if (available >= 8u && std::memcmp(payload, "SShd", 4u) == 0)
+                        {
+                            uint32_t headerSize = 0u;
+                            std::memcpy(&headerSize, payload + 4u, sizeof(headerSize));
+                            const size_t skip = 8u + headerSize + 8u;
+                            if (headerSize <= available && skip <= available &&
+                                std::memcmp(payload + 8u + headerSize, "SSbd", 4u) == 0)
+                            {
+                                pcmStart += skip;
+                            }
+                        }
+                        playback.audioHeaderSkipped = true;
+                    }
+                    if (pcmStart > payloadStart && pcmStart <= packetEnd &&
+                        pcmStart - 4u < playback.pssGuestAddrs.size())
+                    {
+                        const size_t eventStart = pcmStart - 4u;
+                        const uint32_t eventLen = static_cast<uint32_t>(packetEnd - pcmStart + 4u);
                         queueStreamCallbackEvent(
                             mpegAddr,
                             kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
+                            playback.pssGuestAddrs[eventStart],
+                            eventLen,
                             callbackEvents,
                             pes.pts90k,
                             pes.dts90k);
                         queueStreamCallbackEvent(
                             mpegAddr,
                             kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
+                            playback.pssGuestAddrs[eventStart],
+                            eventLen,
                             callbackEvents,
                             pes.pts90k,
                             pes.dts90k);
