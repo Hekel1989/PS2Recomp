@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ee_scheduler.h"
 
 namespace ps2_stubs
 {
@@ -192,6 +193,140 @@ namespace ps2_stubs
             }
         }
 
+        // --- Scripted input (PS2X_PAD_SCRIPT) ---------------------------------
+        // Syntax: "<vsync>:<button>[+<button>]@<hold_vsyncs>[,...]"
+        //   e.g. "1500:start@6,1800:cross@6" presses Start on port 0 for 6
+        //   vsyncs starting at vsync 1500, then Cross at vsync 1800.
+        //   "@<hold_vsyncs>" is optional and defaults to 1. Button names are
+        //   case-insensitive: select l3 r3 start up right down left l2 r2 l1 r1
+        //   triangle circle cross square. The script drives port 0 only and
+        //   overrides live devices, so automated runs stay deterministic.
+        struct PadScriptEvent
+        {
+            uint64_t startVsync = 0;
+            uint16_t buttonMask = 0; // kPadBtn* bits to press
+            uint64_t holdVsyncs = 1;
+        };
+
+        uint16_t padScriptButtonBit(const std::string &name)
+        {
+            if (name == "select")
+                return kPadBtnSelect;
+            if (name == "l3")
+                return kPadBtnL3;
+            if (name == "r3")
+                return kPadBtnR3;
+            if (name == "start")
+                return kPadBtnStart;
+            if (name == "up")
+                return kPadBtnUp;
+            if (name == "right")
+                return kPadBtnRight;
+            if (name == "down")
+                return kPadBtnDown;
+            if (name == "left")
+                return kPadBtnLeft;
+            if (name == "l2")
+                return kPadBtnL2;
+            if (name == "r2")
+                return kPadBtnR2;
+            if (name == "l1")
+                return kPadBtnL1;
+            if (name == "r1")
+                return kPadBtnR1;
+            if (name == "triangle")
+                return kPadBtnTriangle;
+            if (name == "circle")
+                return kPadBtnCircle;
+            if (name == "cross")
+                return kPadBtnCross;
+            if (name == "square")
+                return kPadBtnSquare;
+            return 0;
+        }
+
+        const std::vector<PadScriptEvent> &padScriptEvents()
+        {
+            static const std::vector<PadScriptEvent> events = [] {
+                std::vector<PadScriptEvent> parsed;
+                const char *env = std::getenv("PS2X_PAD_SCRIPT");
+                if (env == nullptr)
+                {
+                    return parsed;
+                }
+                std::stringstream list(env);
+                std::string item;
+                while (std::getline(list, item, ','))
+                {
+                    const size_t colon = item.find(':');
+                    if (colon == std::string::npos)
+                    {
+                        std::printf("[pad-script] ignored malformed event \"%s\"\n", item.c_str());
+                        continue;
+                    }
+                    PadScriptEvent event;
+                    event.startVsync = std::strtoull(item.c_str(), nullptr, 10);
+                    std::string rest = item.substr(colon + 1);
+                    const size_t at = rest.find('@');
+                    if (at != std::string::npos)
+                    {
+                        event.holdVsyncs = std::strtoull(rest.c_str() + at + 1, nullptr, 10);
+                        if (event.holdVsyncs == 0u)
+                        {
+                            event.holdVsyncs = 1u;
+                        }
+                        rest = rest.substr(0, at);
+                    }
+                    std::stringstream buttons(rest);
+                    std::string name;
+                    bool valid = true;
+                    while (std::getline(buttons, name, '+'))
+                    {
+                        std::transform(name.begin(), name.end(), name.begin(),
+                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        const uint16_t bit = padScriptButtonBit(name);
+                        if (bit == 0u)
+                        {
+                            std::printf("[pad-script] ignored unknown button \"%s\" in \"%s\"\n",
+                                        name.c_str(), item.c_str());
+                            valid = false;
+                            break;
+                        }
+                        event.buttonMask = static_cast<uint16_t>(event.buttonMask | bit);
+                    }
+                    if (valid && event.buttonMask != 0u)
+                    {
+                        parsed.push_back(event);
+                    }
+                }
+                std::printf("[pad-script] PS2X_PAD_SCRIPT active, %zu event(s)\n", parsed.size());
+                std::fflush(stdout);
+                return parsed;
+            }();
+            return events;
+        }
+
+        // True when a script is active; fills buttons with the active-low mask
+        // (pressed bits cleared) for the given vsync.
+        bool padScriptButtonsAt(uint64_t vsync, uint16_t &buttons)
+        {
+            const std::vector<PadScriptEvent> &events = padScriptEvents();
+            if (events.empty())
+            {
+                return false;
+            }
+            uint16_t pressed = 0u;
+            for (const PadScriptEvent &event : events)
+            {
+                if (vsync >= event.startVsync && vsync < event.startVsync + event.holdVsyncs)
+                {
+                    pressed = static_cast<uint16_t>(pressed | event.buttonMask);
+                }
+            }
+            buttons = static_cast<uint16_t>(0xFFFFu & ~pressed);
+            return true;
+        }
+
         void resetPadStateLocked()
         {
             for (PadPortState &portState : g_padPorts)
@@ -312,6 +447,21 @@ namespace ps2_stubs
                 {
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
+                }
+            }
+
+            // Scripted input drives port 0 and overrides live devices so
+            // automated runs are deterministic (see PS2X_PAD_SCRIPT above).
+            if (port == 0 && runtime != nullptr)
+            {
+                uint16_t scriptedButtons = 0xFFFFu;
+                if (padScriptButtonsAt(runtime->eeScheduler().currentVSyncTick(), scriptedButtons))
+                {
+                    state.buttons = scriptedButtons;
+                    state.rx = kPadAnalogCenter;
+                    state.ry = kPadAnalogCenter;
+                    state.lx = kPadAnalogCenter;
+                    state.ly = kPadAnalogCenter;
                 }
             }
 
