@@ -11,6 +11,39 @@ namespace ps2_syscalls
             return true;
         }
 
+        // SUIKO(diag-dmac-trace): PS2X_DMAC_TRACE=1 logs the DMAC/INTC handler
+        // and enable/disable syscalls with their arguments and caller.
+        {
+            static const bool s_dmacTrace = std::getenv("PS2X_DMAC_TRACE") != nullptr;
+            if (s_dmacTrace)
+            {
+                const char *name = nullptr;
+                switch (syscallNumber)
+                {
+                case 0x10: name = "AddIntcHandler"; break;
+                case 0x11: name = "RemoveIntcHandler"; break;
+                case 0x12: name = "AddDmacHandler"; break;
+                case 0x13: name = "RemoveDmacHandler"; break;
+                case 0x14: name = "EnableIntc"; break;
+                case 0x15: name = "DisableIntc"; break;
+                case 0x16: name = "EnableDmac"; break;
+                case 0x17: name = "DisableDmac"; break;
+                case static_cast<uint32_t>(-0x1A): name = "iEnableIntc"; break;
+                case static_cast<uint32_t>(-0x1B): name = "iDisableIntc"; break;
+                case static_cast<uint32_t>(-0x1C): name = "iEnableDmac"; break;
+                case static_cast<uint32_t>(-0x1D): name = "iDisableDmac"; break;
+                case 0x5E: case static_cast<uint32_t>(-0x5E): name = "EnableDmacHandler"; break;
+                case 0x5F: case static_cast<uint32_t>(-0x5F): name = "DisableDmacHandler"; break;
+                default: break;
+                }
+                if (name)
+                {
+                    std::fprintf(stderr, "[dmac-trace] %s a0=0x%x a1=0x%x a2=0x%x ra=0x%x\n", name,
+                                 getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 31));
+                }
+            }
+        }
+
         switch (syscallNumber)
         {
         case 0x01:

@@ -15,6 +15,10 @@
 
 namespace
 {
+    // SUIKO(dmac-dstat-mask): DMAC channels 0..9 and their D_STAT register.
+    constexpr uint32_t kDmacChannelCount = 10u;
+    constexpr uint32_t kDStatAddress = 0x1000E010u;
+
     // Diagnostic: PS2X_EE_SCHED=1 logs scheduler thread dispatches and guest
     // invocation push/pop with pc/sp/ra, enough to spot stack aliasing between
     // invocation stacks and thread stacks.
@@ -1488,6 +1492,28 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
     assertExecutor();
     if (cause < 32u)
     {
+        if (dmac && cause < kDmacChannelCount)
+        {
+            // SUIKO(dmac-dstat-mask): the channel masks live in the hardware
+            // D_STAT register (CIM, bits 16..25), which is also what games
+            // read and toggle directly. Enable/DisableDmac flip the bit only
+            // when it differs from the request (D_STAT mask bits toggle on
+            // write-one), and DisableDmac returns the previous state. Keeping
+            // a private mask instead let the two views drift apart: Suikoden
+            // Tactics re-enables VIF1/GIF only when it *reads* the D_STAT
+            // mask as off (0x11bce8), so after its movie player's
+            // EnableDmac/DisableDmac pair the private mask stayed off while
+            // D_STAT said on, VIF1 completions were never delivered, and the
+            // game's DMA queue never drained (no title screen).
+            PS2Memory &memory = m_runtime.memory();
+            const uint32_t maskBit = 1u << (16u + cause);
+            const bool wasOn = (memory.readIORegister(kDStatAddress) & maskBit) != 0u;
+            if (enabled != wasOn)
+            {
+                memory.writeIORegister(kDStatAddress, maskBit);
+            }
+            return (!enabled && wasOn) ? 1 : 0;
+        }
         if (dmac)
         {
             // The Sony kernel guards EnableDmac/DisableDmac with a software
@@ -1531,7 +1557,13 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
-    const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    if (dmac && cause < kDmacChannelCount)
+    {
+        // SUIKO(dmac-dstat-mask): channel interrupts are gated by D_STAT CIM.
+        const uint32_t cim = (m_runtime.memory().readIORegister(kDStatAddress) >> 16u) & 0x3FFu;
+        mask = (mask & ~0x3FFu) | cim;
+    }
     if (schedTraceEnabled())
     {
         std::cerr << "[ee-sched] irq-fire dmac=" << (dmac ? 1 : 0) << " cause=" << cause

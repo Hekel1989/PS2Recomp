@@ -1374,6 +1374,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if ((status & mask) != 0u)
             next |= (1u << 31);
         m_ioRegisters[address] = next;
+        // SUIKO(diag-dmac-trace): direct D_STAT writes that touch the masks.
+        static const bool s_dmacTrace = std::getenv("PS2X_DMAC_TRACE") != nullptr;
+        if (s_dmacTrace && (value >> 16) != 0u)
+        {
+            std::fprintf(stderr, "[dmac-trace] D_STAT write value=0x%08x mask 0x%03x -> 0x%03x\n", value,
+                         (current >> 16) & 0x3FFu, mask);
+        }
         return true;
     }
 
