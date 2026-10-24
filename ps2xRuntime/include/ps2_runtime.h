@@ -278,7 +278,19 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     if (watch.enabled)
     {
         const uint32_t writeSize = size != 0u ? size : 4u;
-        if (guestAddr < watch.high && watch.low < guestAddr + writeSize)
+        // SUIKO(ee-watch-alias): fold the RAM mirrors (kseg0/kseg1 and the
+        // 0x20000000/0x30000000 uncached views) onto the physical address so
+        // a watch on 0x004c7400 also sees writes through 0x304c7400 etc.
+        uint32_t matchAddr = guestAddr;
+        switch (guestAddr >> 28)
+        {
+        case 0x0u: case 0x2u: case 0x3u: case 0x8u: case 0xAu:
+            matchAddr = guestAddr & 0x01FFFFFFu;
+            break;
+        default:
+            break;
+        }
+        if (matchAddr < watch.high && watch.low < matchAddr + writeSize)
         {
             std::cerr << "[ee-watch] " << op << " addr=0x" << std::hex << guestAddr
                       << " size=" << std::dec << writeSize

@@ -1524,6 +1524,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
 
+                // SUIKO(vif1-kick-trace): PS2X_VIF1_KICK_TRACE=1 logs every VIF1
+                // channel start (mode, MADR/QWC/TADR) and, in chain mode, each tag.
+                static const bool s_vif1KickTrace = std::getenv("PS2X_VIF1_KICK_TRACE") != nullptr;
+                const bool vif1KickTrace = s_vif1KickTrace && channelBase == 0x10009000u;
+                if (vif1KickTrace)
+                {
+                    std::fprintf(stderr, "[vif1-kick] chcr=0x%08x mode=%u madr=0x%08x qwc=%u tadr=0x%08x\n",
+                                 chcr, mode, madr, qwc, m_ioRegisters[channelBase + 0x30]);
+                }
+
                 if (mode == 0 && qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
@@ -1644,6 +1654,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 
+                        if (vif1KickTrace)
+                        {
+                            std::fprintf(stderr, "[vif1-kick]   tag @0x%08x id=%u qwc=%u addr=0x%08x irq=%d\n",
+                                         currentTagAddr, id, tagQwc, addr, irq ? 1 : 0);
+                        }
                         if (chainTrace)
                         {
                             char line[128];
