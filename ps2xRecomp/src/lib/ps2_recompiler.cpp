@@ -2120,12 +2120,26 @@ namespace ps2recomp
         uint32_t start = function.start;
         uint32_t end = function.end;
 
-        for (uint32_t address = start; address < end; address += 4)
+        // A function can end on a branch whose delay slot is the first
+        // instruction of the next function (the scanner starts a function
+        // there because something else calls or points at it).  Decode that
+        // word too, so the branch emits its real delay slot instead of a NOP.
+        // function.end is unchanged; the extra instruction is only the
+        // branch's delay slot.
+        bool decodeTrailingDelaySlot = false;
+
+        for (uint32_t address = start; address < end || decodeTrailingDelaySlot; address += 4)
         {
+            const bool isTrailingDelaySlot = address >= end;
+            decodeTrailingDelaySlot = false;
             try
             {
                 if (!m_elfParser->isValidAddress(address))
                 {
+                    if (isTrailingDelaySlot)
+                    {
+                        break;
+                    }
                     {
                         std::ostringstream msg;
                         msg << "Invalid address 0x" << std::hex << address << " (truncating decode)";
@@ -2175,10 +2189,15 @@ namespace ps2recomp
                     inst.mmioAddress = mmioIt->second;
                 }
 
+                decodeTrailingDelaySlot = !isTrailingDelaySlot && address + 4u == end && inst.hasDelaySlot;
                 instructions.push_back(inst);
             }
             catch (const std::exception &e)
             {
+                if (isTrailingDelaySlot)
+                {
+                    break;
+                }
                 {
                     std::ostringstream msg;
                     msg << "Error decoding instruction: " << e.what() << " (truncating decode)";
