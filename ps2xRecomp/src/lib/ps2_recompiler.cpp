@@ -1083,6 +1083,43 @@ namespace ps2recomp
                 }
             }
 
+            // A configured "handler@0xADDRESS" stub binding is an explicit
+            // statement that the guest function at that address is replaced by
+            // a runtime handler. Discovery can miss such an address entirely
+            // (e.g. the function is only reached through tail `j` thunks, which
+            // the fallback scanner does not follow), and then guest branches to
+            // it would hit an unregistered function table slot at runtime.
+            // Synthesize the stub entry so the wrapper is generated and
+            // registered regardless of discovery.
+            for (const auto &[stubStart, handlerName] : m_stubHandlerBindingsByStart)
+            {
+                if (resolveStubTarget(handlerName) == StubTarget::Unknown)
+                {
+                    // No runtime handler; guest-fallback discovery handles it.
+                    continue;
+                }
+
+                const auto functionIt = std::find_if(
+                    m_functions.begin(), m_functions.end(),
+                    [stubStart](const Function &function)
+                    { return function.start == stubStart; });
+                if (functionIt != m_functions.end())
+                {
+                    continue;
+                }
+
+                Function synthesizedStub{};
+                synthesizedStub.name = handlerName;
+                synthesizedStub.start = stubStart;
+                synthesizedStub.end = stubStart + 4u;
+                m_functions.push_back(std::move(synthesizedStub));
+
+                std::ostringstream msg;
+                msg << "Synthesized stub entry for resolved handler '" << handlerName
+                    << "' at 0x" << std::hex << stubStart;
+                m_reporter.info("stub", msg.str());
+            }
+
             for (auto &function : m_functions)
             {
                 m_reporter.recordFunctionProcessed();
