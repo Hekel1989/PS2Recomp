@@ -2906,6 +2906,29 @@ void EeScheduler::processEvent(const EeEvent &event)
                 vu1Thread->sync(ps2x::Vu1SyncReason::VBlank);
         }
         ++m_vsyncTick;
+        {
+            // PS2X_EE_BURN=<us>@<vsync>: from that vsync on, spend <us> of extra
+            // game-thread CPU at every VBlank, a stand-in for a slower host.
+            // The largest burn that still holds 60 vsync/s is the frame-time
+            // headroom (dev measurement only).
+            static const std::pair<uint64_t, uint64_t> s_burn = []
+            {
+                const char *value = std::getenv("PS2X_EE_BURN");
+                if (value == nullptr)
+                    return std::pair<uint64_t, uint64_t>{0u, 0u};
+                char *end = nullptr;
+                const uint64_t us = std::strtoull(value, &end, 10);
+                const uint64_t from = (end != nullptr && *end == '@') ? std::strtoull(end + 1, nullptr, 10) : 0u;
+                return std::pair<uint64_t, uint64_t>{us, from};
+            }();
+            if (s_burn.first != 0u && m_vsyncTick >= s_burn.second)
+            {
+                const uint64_t until = threadCpuNowNs() + s_burn.first * 1000u;
+                volatile uint64_t sink = 0u;
+                while (threadCpuNowNs() < until)
+                    sink = sink + 1u;
+            }
+        }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         ps2CoverageSetVSync(m_vsyncTick);
         if ((m_vsyncTick & 1u) != 0u)

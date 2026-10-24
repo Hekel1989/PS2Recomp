@@ -83,7 +83,7 @@ log.  It runs before:
 | observation | why |
 |---|---|
 | VBlank, only while the previous present is still queued | keeps the worker at most one frame behind |
-| VIF1 register read/write (`0x10003C00-0x10003DFF`) | VIF1 state is worker-owned; `FBRST` also resets the PATH3 mask |
+| VIF1 register write (`0x10003C00-0x10003DFF`) | VIF1 state is worker-owned; `FBRST` also resets the PATH3 mask |
 | VU1 code/data access (`0x11008000-0x1100FFFF`) | VU1 memory is worker-owned |
 | GS `CSR` / `SIGLBLID` read or write | SIGNAL/FINISH/LABEL in replayed packets update them |
 | GIF fast paths and HLE stubs that call the GS directly | they bypass the ordered sink |
@@ -93,6 +93,11 @@ log.  It runs before:
 `PS2X_DUMP_AT` state dumps run on the main thread, which already reads guest
 memory without synchronisation; their VU1 memory is a snapshot of a moving
 target with the thread on, as their EE RAM always was.
+
+VIF1 register *reads* need no fence: this runtime returns the last value the
+game wrote, never the interpreter's state (a runtime that reads live VIF1
+state there must fence first).  Fencing them anyway cost 4 ms a frame on the
+heavy title scene.
 
 `GIF_STAT` needs no fence either.  Its only worker-dependent bit, M3P, mirrors
 the PATH3 mask, and the mask depends only on the VIF1 command stream, never on
