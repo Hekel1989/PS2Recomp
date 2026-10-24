@@ -10,6 +10,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -24,6 +25,46 @@ namespace
     {
         static std::vector<ps2_game_overrides::Descriptor> registry;
         return registry;
+    }
+
+    // Generated stub wrappers set ctx->pc to the return address ($ra) before
+    // entering a syscall/stub handler; the handlers rely on that convention.
+    // bindAddressHandler() installs handlers straight into the function table,
+    // where the dispatcher leaves pc on the bound address, so a thunk that
+    // restores the convention sits between the table and the real handler.
+    // Without it the handler is re-dispatched at the bound address forever.
+    std::mutex &addressHandlerMutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> &addressHandlerRegistry()
+    {
+        static std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> registry;
+        return registry;
+    }
+
+    void dispatchBoundAddressHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        PS2Runtime::RecompiledFunction handler = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(addressHandlerMutex());
+            const auto it = addressHandlerRegistry().find(ctx->pc);
+            if (it != addressHandlerRegistry().end())
+            {
+                handler = it->second;
+            }
+        }
+        if (!handler)
+        {
+            std::cerr << "[game_overrides] bound address handler missing for 0x"
+                      << std::hex << ctx->pc << std::dec << std::endl;
+            return;
+        }
+
+        ctx->pc = getRegU32(ctx, 31);
+        handler(rdram, ctx, runtime);
     }
 
     bool equalsIgnoreCaseAscii(std::string_view lhs, std::string_view rhs)
@@ -116,7 +157,12 @@ namespace ps2_game_overrides
             return false;
         }
 
-        return runtime.replaceFunction(address, resolved.value());
+        {
+            std::lock_guard<std::mutex> lock(addressHandlerMutex());
+            addressHandlerRegistry()[address] = resolved.value();
+        }
+
+        return runtime.replaceFunction(address, &dispatchBoundAddressHandler);
     }
 
     void applyMatching(PS2Runtime &runtime,
