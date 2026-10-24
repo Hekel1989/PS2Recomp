@@ -2,6 +2,19 @@
 #include "Thread.h"
 #include "runtime/ee_scheduler.h"
 
+#include <cstdlib>
+#include <iostream>
+
+namespace
+{
+    // Diagnostic: PS2X_EE_THREADTRACE=1 logs EE CreateThread/StartThread calls and results.
+    bool eeThreadTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_THREADTRACE") != nullptr;
+        return enabled;
+    }
+}
+
 namespace ps2_syscalls
 {
     namespace
@@ -230,7 +243,17 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        const int createdId = scheduler(rdram, ctx, runtime).createThread(decoded);
+        if (eeThreadTraceEnabled())
+        {
+            std::cerr << "[ee-thread] CreateThread func=0x" << std::hex << param->func
+                      << " stack=0x" << param->stack << " size=0x" << param->stack_size
+                      << " prio=" << std::dec << param->initial_priority
+                      << " attr=0x" << std::hex << param->attr
+                      << " -> id=" << std::dec << createdId
+                      << " caller ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
+        setReturnS32(ctx, createdId);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -258,16 +281,19 @@ namespace ps2_syscalls
         GuestThread *target = ee.thread(id);
         if (!target)
         {
+            if (eeThreadTraceEnabled()) std::cerr << "[ee-thread] StartThread id=" << id << " FAIL unknown-thid" << std::endl;
             setReturnS32(ctx, KE_UNKNOWN_THID);
             return;
         }
         if (target->status != EeThreadStatus::Dormant)
         {
+            if (eeThreadTraceEnabled()) std::cerr << "[ee-thread] StartThread id=" << id << " FAIL not-dormant" << std::endl;
             setReturnS32(ctx, KE_NOT_DORMANT);
             return;
         }
         if (!runtime->hasFunction(target->entry))
         {
+            if (eeThreadTraceEnabled()) std::cerr << "[ee-thread] StartThread id=" << id << " FAIL no-function" << std::endl;
             setReturnS32(ctx, KE_ERROR);
             return;
         }
@@ -282,6 +308,12 @@ namespace ps2_syscalls
             target->ownsStack = true;
         }
         const int result = ee.startThread(id, arg, *ctx, false);
+        if (eeThreadTraceEnabled())
+        {
+            std::cerr << "[ee-thread] StartThread id=" << id << " entry=0x" << std::hex << target->entry
+                      << " arg=0x" << arg << " -> " << std::dec << result
+                      << " caller ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
