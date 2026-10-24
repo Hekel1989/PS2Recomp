@@ -913,6 +913,29 @@ void VU1Interpreter::progressXgkick()
                               << " tagBytes=" << std::dec << static_cast<unsigned long long>(tagBytes)
                               << " nloop=" << nloop << " flg=" << format
                               << " nreg=" << nreg << " (GIF kick aborted)\n");
+                // SUIKO(diag-vu1-xgkick-dump): at the failing tag, show the
+                // VIF1 TOP/ITOP the program saw, every VI register, and the
+                // qwords around the tag. The packet source is often a pointer
+                // loaded from the data buffer, so both matter.
+                if (vu1TraceEnabled())
+                {
+                    std::fprintf(stderr, "[vu1:xgkick] dump top=0x%x itop=0x%x pc=0x%x vi:",
+                                 m_state.top, m_state.itop, m_state.pc);
+                    for (uint32_t i = 1; i < 16u; ++i)
+                        std::fprintf(stderr, " %u=0x%x", i, static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[i])));
+                    std::fprintf(stderr, "\n");
+                    const uint32_t tagByte = (m_xgkick.sourceAddress + qwordOffset) % m_activeVuDataSize;
+                    for (uint32_t q = 0; q < 8u; ++q)
+                    {
+                        const uint32_t at = (tagByte + q * 16u) % m_activeVuDataSize;
+                        uint64_t lo = 0, hi = 0;
+                        std::memcpy(&lo, m_activeVuData + at, 8u);
+                        std::memcpy(&hi, m_activeVuData + at + 8u, 8u);
+                        std::fprintf(stderr, "[vu1:xgkick]   +%02u @0x%04x = %016llx %016llx\n",
+                                     q, at, static_cast<unsigned long long>(lo),
+                                     static_cast<unsigned long long>(hi));
+                    }
+                }
                 m_stopRequested = true;
                 m_xgkick.active = false;
                 return;
@@ -970,8 +993,8 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
     if (vu1TraceEnabled())
     {
-        std::fprintf(stderr, "[vu1:xgkick] start qword=0x%x byte=0x%x pc=0x%x\n",
-                     qwordAddress, sourceAddress, m_state.pc);
+        std::fprintf(stderr, "[vu1:xgkick] start qword=0x%x byte=0x%x pc=0x%x top=0x%x itop=0x%x\n",
+                     qwordAddress, sourceAddress, m_state.pc, m_state.top, m_state.itop);
     }
     m_xgkick = {};
     m_xgkick.active = true;
