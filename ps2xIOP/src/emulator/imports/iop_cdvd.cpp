@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <filesystem>
 #include <limits>
 #include <string>
@@ -600,7 +602,13 @@ namespace ps2x::iop::detail
                 return false;
 
             const std::string guestPath = memory.readString(nameAddress, 1024u);
+            static const bool s_trace = std::getenv("PS2X_IOP_CDVD_TRACE") != nullptr;
             IsoNode *node = findVirtualIsoNode(guestPath);
+            if (s_trace)
+            {
+                std::cerr << "[iop-cdvd] searchFile path=\"" << guestPath
+                          << "\" -> " << (node ? "found" : "MISS") << std::endl;
+            }
             if (!node)
                 return false;
 
@@ -741,7 +749,24 @@ namespace ps2x::iop::detail
 
     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
     {
-        return m_impl->dispatchImport(ordinal, cpu);
+        static const bool s_trace = std::getenv("PS2X_IOP_CDVD_TRACE") != nullptr;
+        if (s_trace)
+        {
+            static const std::unordered_map<uint16_t, const char *> kNames = {
+                {4, "CdInit"}, {5, "CdStandby"}, {6, "CdRead"}, {7, "CdSeek"},
+                {8, "CdGetError"}, {10, "CdSearchFile"}, {11, "CdSync"},
+                {12, "CdGetDiskType"}, {13, "CdDiskReady"}, {28, "CdStatus"},
+                {37, "CdCallback"}, {50, "CdSC"}, {75, "CdMmode"},
+            };
+            auto it = kNames.find(ordinal);
+            std::cerr << "[iop-cdvd] " << (it != kNames.end() ? it->second : "Unknown")
+                      << "(" << std::dec << ordinal << ") a0=0x" << std::hex << cpu.gpr[4]
+                      << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6] << std::endl;
+        }
+        const bool handled = m_impl->dispatchImport(ordinal, cpu);
+        if (s_trace)
+            std::cerr << "[iop-cdvd]  -> v0=0x" << std::hex << cpu.gpr[2] << std::dec << std::endl;
+        return handled;
     }
 
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
