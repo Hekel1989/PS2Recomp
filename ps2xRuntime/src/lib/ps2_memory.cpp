@@ -1916,6 +1916,46 @@ void PS2Memory::processPendingTransfers()
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
+        // SUIKO(diag): PS2X_DIAG_GIF_IMAGE=1 logs every PATH3 IMAGE-mode GIF
+        // submission with its guest source address and first bytes, so font
+        // texture uploads can be matched against their EE source buffers.
+        {
+            static const bool s_gifImageDiag = std::getenv("PS2X_DIAG_GIF_IMAGE") != nullptr;
+            static std::atomic<unsigned> s_gifImageBudget{400u};
+            if (s_gifImageDiag && s_gifImageBudget.load(std::memory_order_relaxed) > 0u)
+            {
+                auto le64 = [](const uint8_t *p)
+                {
+                    uint64_t v = 0u;
+                    std::memcpy(&v, p, sizeof(v));
+                    return v;
+                };
+                const uint8_t *tag = !p.chainData.empty()
+                                         ? p.chainData.data()
+                                         : (m_rdram ? m_rdram + (p.fromScratchpad ? 0u : (p.srcAddr & 0x1FFFFFFFu)) : nullptr);
+                if (tag != nullptr)
+                {
+                    const uint64_t tagLo = le64(tag);
+                    const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+                    if (flg == 2u || std::getenv("PS2X_DIAG_GIF_IMAGE")[1] == '2')
+                    {
+                        s_gifImageBudget.fetch_sub(1, std::memory_order_relaxed);
+                        const uint8_t *d = !p.chainData.empty() ? p.chainData.data() : m_rdram + (p.srcAddr & 0x1FFFFFFFu);
+                        std::cerr << "[gif-img] flg=" << (unsigned)flg
+                                  << " src=0x" << std::hex << p.srcAddr
+                                  << " qw=0x" << (!p.chainData.empty() ? p.chainData.size() / 16u : p.qwc)
+                                  << " chain=" << (p.chainData.empty() ? 0u : 1u)
+                                  << " nloop=0x" << (tagLo & 0x7FFFu)
+                                  << " taghi=0x" << le64(tag + 8)
+                                  << " d0=0x" << le64(d + 16)
+                                  << " d1=0x" << le64(d + 24)
+                                  << " d2=0x" << le64(d + 32)
+                                  << " d3=0x" << le64(d + 40)
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
+        }
         if (!p.chainData.empty())
         {
             m_seenGifCopy = true;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -644,6 +645,24 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
+    // SUIKO(diag): PS2X_DIAG_GIF_IMAGE=1 logs every arbiter GIF packet header.
+    {
+        static const bool s_diag = std::getenv("PS2X_DIAG_GIF_IMAGE") != nullptr;
+        static std::atomic<unsigned> s_budget{600u};
+        if (s_diag && s_budget.load(std::memory_order_relaxed) > 0u)
+        {
+            s_budget.fetch_sub(1, std::memory_order_relaxed);
+            const uint64_t tagLo = loadLE64(data);
+            const uint64_t tagHi = loadLE64(data + 8);
+            RUNTIME_LOG("[gs-pkt] size=0x" << std::hex << sizeBytes
+                                           << " nloop=0x" << (tagLo & 0x7FFFu)
+                                           << " flg=" << ((tagLo >> 58) & 0x3u)
+                                           << " nreg=0x" << ((tagLo >> 60) & 0xFu)
+                                           << " taghi=0x" << tagHi
+                                           << std::dec << std::endl);
+        }
+    }
+
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
@@ -802,6 +821,32 @@ void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
     writeRegisterUnlocked(GS_REG_TRXPOS, trxpos);
     writeRegisterUnlocked(GS_REG_TRXREG, trxreg);
     writeRegisterUnlocked(GS_REG_TRXDIR, trxdir);
+    // SUIKO(diag): PS2X_DIAG_GIF_IMAGE=1 logs every native IMAGE upload with
+    // its GS destination (PSM/FBP/FBW), size and first data bytes.
+    {
+        static const bool s_diag = std::getenv("PS2X_DIAG_GIF_IMAGE") != nullptr;
+        static std::atomic<unsigned> s_budget{400u};
+        if (s_diag && s_budget.load(std::memory_order_relaxed) > 0u)
+        {
+            s_budget.fetch_sub(1, std::memory_order_relaxed);
+            const uint32_t psm = static_cast<uint32_t>((bitbltbuf >> 24) & 0x3Fu);
+            const uint32_t fbp = static_cast<uint32_t>(bitbltbuf & 0x3FFFu);
+            const uint32_t fbw = static_cast<uint32_t>((bitbltbuf >> 16) & 0xFFu);
+            char hex[65] = {};
+            const uint32_t dumpBytes = sizeBytes < 32u ? sizeBytes : 32u;
+            for (uint32_t i = 0; i < dumpBytes; ++i)
+                std::snprintf(hex + i * 2, 3, "%02x", data[i]);
+            RUNTIME_LOG("[gs-img] psm=" << psm << " fbp=0x" << std::hex << fbp
+                                        << " fbw=0x" << fbw
+                                        << " dx=0x" << (trxpos & 0xFFFFu)
+                                        << " dy=0x" << ((trxpos >> 16) & 0xFFFFu)
+                                        << " w=0x" << (trxreg & 0xFFFu)
+                                        << " h=0x" << ((trxreg >> 32) & 0xFFFu)
+                                        << " bytes=0x" << sizeBytes
+                                        << " data=" << hex
+                                        << std::dec << std::endl);
+        }
+    }
     processImageData(data, sizeBytes);
     ++m_nativeImageUploadCount;
 }
