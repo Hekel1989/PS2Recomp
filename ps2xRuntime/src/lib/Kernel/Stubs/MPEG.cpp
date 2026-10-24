@@ -1053,20 +1053,23 @@ namespace ps2_stubs
                     data,
                     data + size);
 
-                constexpr size_t kMaxVideoSequenceSyncBytes = 2u * 1024u * 1024u;
-                if (playback.videoSequenceSyncBuffer.size() > kMaxVideoSequenceSyncBytes)
-                {
-                    const size_t keepFrom = playback.videoSequenceSyncBuffer.size() - 3u;
-                    playback.videoSequenceSyncBuffer.erase(
-                        playback.videoSequenceSyncBuffer.begin(),
-                        playback.videoSequenceSyncBuffer.begin() + static_cast<std::ptrdiff_t>(keepFrom));
-                }
-
                 const size_t sequenceHeader = findMpegSequenceHeader(
                     playback.videoSequenceSyncBuffer.data(),
                     playback.videoSequenceSyncBuffer.size());
                 if (sequenceHeader == kStartCodeNotFound)
                 {
+                    // Cap the resync buffer only while the header is missing.
+                    // A single sceMpegAddBs can legitimately carry a whole
+                    // short movie (2.3 MB here); trimming before the search
+                    // threw away the header at offset 0 and decoded nothing.
+                    constexpr size_t kMaxVideoSequenceSyncBytes = 2u * 1024u * 1024u;
+                    if (playback.videoSequenceSyncBuffer.size() > kMaxVideoSequenceSyncBytes)
+                    {
+                        const size_t keepFrom = playback.videoSequenceSyncBuffer.size() - 3u;
+                        playback.videoSequenceSyncBuffer.erase(
+                            playback.videoSequenceSyncBuffer.begin(),
+                            playback.videoSequenceSyncBuffer.begin() + static_cast<std::ptrdiff_t>(keepFrom));
+                    }
                     return;
                 }
 
