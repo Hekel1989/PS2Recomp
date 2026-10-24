@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Pad.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_pad_host_hooks.h"
 
 namespace ps2_stubs
 {
@@ -41,6 +42,12 @@ namespace ps2_stubs
             uint8_t ry = kPadAnalogCenter;
             uint8_t lx = kPadAnalogCenter;
             uint8_t ly = kPadAnalogCenter;
+            // SUIKO(pad-host-hooks): optional explicit pressure bytes (order of
+            // report bytes 8..19: right left up down triangle circle cross
+            // square l1 l2 r1 r2). When set, pressure mode reports these
+            // instead of the digital 0xFF/0x00 derived from buttons.
+            bool hasPressure = false;
+            std::array<uint8_t, 12> pressure{};
         };
 
         struct PadPortState
@@ -365,7 +372,8 @@ namespace ps2_stubs
             portState.transientState = static_cast<uint32_t>(kPadStateExecCmd);
         }
 
-        uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask)
+        uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask,
+                              size_t pressureIndex)
         {
             if (!portState.pressureEnabled)
             {
@@ -374,6 +382,12 @@ namespace ps2_stubs
             if ((portState.buttonMask & mask) == 0u)
             {
                 return 0u;
+            }
+            // SUIKO(pad-host-hooks): explicit host pressure wins over the
+            // digital derivation.
+            if (state.hasPressure)
+            {
+                return state.pressure[pressureIndex];
             }
             return ((state.buttons & mask) == 0u) ? 0xFFu : 0u;
         }
@@ -388,18 +402,18 @@ namespace ps2_stubs
             data[5] = state.ry;
             data[6] = state.lx;
             data[7] = state.ly;
-            data[8] = pressureValue(state, portState, kPadBtnRight);
-            data[9] = pressureValue(state, portState, kPadBtnLeft);
-            data[10] = pressureValue(state, portState, kPadBtnUp);
-            data[11] = pressureValue(state, portState, kPadBtnDown);
-            data[12] = pressureValue(state, portState, kPadBtnTriangle);
-            data[13] = pressureValue(state, portState, kPadBtnCircle);
-            data[14] = pressureValue(state, portState, kPadBtnCross);
-            data[15] = pressureValue(state, portState, kPadBtnSquare);
-            data[16] = pressureValue(state, portState, kPadBtnL1);
-            data[17] = pressureValue(state, portState, kPadBtnL2);
-            data[18] = pressureValue(state, portState, kPadBtnR1);
-            data[19] = pressureValue(state, portState, kPadBtnR2);
+            data[8] = pressureValue(state, portState, kPadBtnRight, 0);
+            data[9] = pressureValue(state, portState, kPadBtnLeft, 1);
+            data[10] = pressureValue(state, portState, kPadBtnUp, 2);
+            data[11] = pressureValue(state, portState, kPadBtnDown, 3);
+            data[12] = pressureValue(state, portState, kPadBtnTriangle, 4);
+            data[13] = pressureValue(state, portState, kPadBtnCircle, 5);
+            data[14] = pressureValue(state, portState, kPadBtnCross, 6);
+            data[15] = pressureValue(state, portState, kPadBtnSquare, 7);
+            data[16] = pressureValue(state, portState, kPadBtnL1, 8);
+            data[17] = pressureValue(state, portState, kPadBtnL2, 9);
+            data[18] = pressureValue(state, portState, kPadBtnR1, 10);
+            data[19] = pressureValue(state, portState, kPadBtnR2, 11);
         }
 
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr,
@@ -439,8 +453,32 @@ namespace ps2_stubs
                 }
             }
 
+            // SUIKO(pad-host-hooks): the embedding app may supply the pad state
+            // (suikoden's src/input: SDL3 gamepad/keyboard -> DualShock report,
+            // handed over thread-safely). The script below still overrides
+            // port 0, so scripted runs stay deterministic.
+            bool usedHostProvider = false;
+            if (!useOverride && Ps2PadHostHooks::provider())
+            {
+                Ps2PadHostHooks::Report report;
+                if (Ps2PadHostHooks::provider()(port, report))
+                {
+                    state.buttons = report.buttons;
+                    state.lx = report.lx;
+                    state.ly = report.ly;
+                    state.rx = report.rx;
+                    state.ry = report.ry;
+                    if (report.hasPressure)
+                    {
+                        state.hasPressure = true;
+                        state.pressure = report.pressure;
+                    }
+                    usedHostProvider = true;
+                }
+            }
+
             bool usedBackend = false;
-            if (!useOverride)
+            if (!useOverride && !usedHostProvider)
             {
                 uint8_t backendData[32]{};
                 if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
@@ -471,6 +509,8 @@ namespace ps2_stubs
                     state.ry = kPadAnalogCenter;
                     state.lx = kPadAnalogCenter;
                     state.ly = kPadAnalogCenter;
+                    // Pressure follows the scripted buttons, not the host device.
+                    state.hasPressure = false;
                 }
             }
 
