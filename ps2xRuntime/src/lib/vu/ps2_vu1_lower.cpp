@@ -294,7 +294,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x24: // JR
     {
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        // JR/JALR read the current VI. Only the conditional IB* branches see
+        // the value from before an integer write in the previous pair
+        // (PCSX2 _vuJR/_vuJALR; microVU's mVUanalyzeJump has no VI backup).
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
@@ -304,7 +307,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        // JR/JALR read the current VI. Only the conditional IB* branches see
+        // the value from before an integer write in the previous pair
+        // (PCSX2 _vuJR/_vuJALR; microVU's mVUanalyzeJump has no VI backup).
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
         if (it != 0)
             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
         m_state.branchPending = true;
