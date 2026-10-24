@@ -5,6 +5,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/ee_time.h"
 #include "runtime/ps2_gs_host_hooks.h"
+#include "runtime/ps2_diag_shares.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2518,6 +2519,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         {
             gsHooks.vsync(m_vsyncTick);
         }
+        if (suiko::diag::gsSyncEnabled())
+            suiko::diag::gsEvent(m_vsyncTick, "present");
         writeGuestU32(m_vsyncFlagAddress, 1u);
         if (m_vsyncTickAddress != 0u)
         {

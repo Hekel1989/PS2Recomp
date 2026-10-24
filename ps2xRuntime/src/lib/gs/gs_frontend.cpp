@@ -1,6 +1,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/ps2_gs_host_hooks.h"
+#include "runtime/ps2_diag_shares.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -15,6 +16,12 @@
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    inline void shareGsEvent(const GSRegisters *regs, const char *reason)
+    {
+        if (suiko::diag::gsSyncEnabled() && regs != nullptr)
+            suiko::diag::gsEvent(regs->vsyncTick.load(std::memory_order_relaxed), reason);
+    }
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -199,6 +206,7 @@ GSContext &GS::activeContext()
 
 void GS::snapshotVRAM()
 {
+    shareGsEvent(m_privRegs, "readvram");
     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
     // feeding the GS while a backend performs host-side conversion. Keep the
     // selected backend alive and unswappable for the duration of the call.
@@ -1458,6 +1466,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
 
+        if (m_trxdir == 2u)
+            shareGsEvent(m_privRegs, "localtohost");
         if (m_backend)
         {
             // A local-to-host transfer reads VRAM now; refresh the CPU-side
@@ -1541,6 +1551,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
+        shareGsEvent(m_privRegs, "signal");
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1554,6 +1565,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_FINISH:
     {
+        shareGsEvent(m_privRegs, "finish");
         if (m_backend)
         {
             m_backend->Flush();
@@ -1730,6 +1742,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    shareGsEvent(m_privRegs, "download");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
@@ -1765,6 +1778,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
+    shareGsEvent(m_privRegs, "readvram");
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (Ps2GsHostHooks::hooks().syncLocalMemory)
         Ps2GsHostHooks::hooks().syncLocalMemory();

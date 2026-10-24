@@ -1,5 +1,6 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
+#include "runtime/ps2_diag_shares.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_gs_host_hooks.h"
 #include "ps2_log.h"
@@ -15,6 +16,23 @@
 
 namespace
 {
+    inline uint64_t shareVsync(const GSRegisters &regs)
+    {
+        return regs.vsyncTick.load(std::memory_order_relaxed);
+    }
+
+    inline void shareVu1Observe(const GSRegisters &regs, const char *reason)
+    {
+        if (suiko::diag::vu1OverlapEnabled())
+            suiko::diag::vu1Observe(shareVsync(regs), reason);
+    }
+
+    inline void shareGsEvent(const GSRegisters &regs, const char *reason)
+    {
+        if (suiko::diag::gsSyncEnabled())
+            suiko::diag::gsEvent(shareVsync(regs), reason);
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -822,6 +840,7 @@ uint8_t PS2Memory::read8(uint32_t address)
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
     {
         (void)vuLimit;
+        shareVu1Observe(gs_regs, "vu1mem");
         return vuMem[vuOffset];
     }
     else if (isIoRegister(physAddr))
@@ -857,6 +876,7 @@ uint16_t PS2Memory::read16(uint32_t address)
     uint32_t vuLimit = 0;
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
     {
+        shareVu1Observe(gs_regs, "vu1mem");
         return loadScalar<uint16_t>(vuMem, vuOffset, vuLimit, "read16 vu", address);
     }
     else if (isIoRegister(physAddr))
@@ -883,6 +903,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            shareGsEvent(gs_regs, "csr");
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
@@ -908,6 +929,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     uint32_t vuLimit = 0;
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
     {
+        shareVu1Observe(gs_regs, "vu1mem");
         return loadScalar<uint32_t>(vuMem, vuOffset, vuLimit, "read32 vu", address);
     }
     else if (isIoRegister(physAddr))
@@ -930,6 +952,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            shareGsEvent(gs_regs, "csr");
             return gs_regs.csr.load();
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -951,6 +974,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     uint32_t vuLimit = 0;
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
     {
+        shareVu1Observe(gs_regs, "vu1mem");
         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
     }
 
@@ -989,6 +1013,7 @@ __m128i PS2Memory::read128(uint32_t address)
     uint32_t vuLimit = 0;
     if (const uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
     {
+        shareVu1Observe(gs_regs, "vu1mem");
         inRange(vuOffset, sizeof(__m128i), vuLimit, "read128 vu", address);
         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
     }
@@ -1018,6 +1043,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
         {
             (void)vuLimit;
+            shareVu1Observe(gs_regs, "vu1memw");
             vuMem[vuOffset] = value;
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
@@ -1061,6 +1087,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
+            shareVu1Observe(gs_regs, "vu1memw");
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
@@ -1127,6 +1154,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
+            shareVu1Observe(gs_regs, "vu1memw");
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
@@ -1197,6 +1225,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
+            shareVu1Observe(gs_regs, "vu1memw");
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
@@ -1254,6 +1283,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
         {
+            shareVu1Observe(gs_regs, "vu1memw");
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
             if (vuMem == m_vu0Code)
@@ -1389,6 +1419,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        shareVu1Observe(gs_regs, "vif1reg");
 
         switch (address)
         {
@@ -1474,6 +1505,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            if (channelBase == 0x10009000u)
+                shareVu1Observe(gs_regs, "vif1dma");
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -2266,6 +2299,20 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     if (!data || sizeBytes < 16)
         return;
 
+    // A PATH2/PATH3 packet submitted while a VU1 program is outstanding is an
+    // ordering point for a VU1 thread: PATH1 XGKICK output must stay in front
+    // of it (see docs/multicore-plan.md).  PS2X_VU1_OVERLAP=2 ignores it, to
+    // measure the overlap available if the GS queue keeps that order itself.
+    if (pathId != GifPathId::Path1 && suiko::diag::vu1OverlapEnabled() &&
+        !suiko::diag::vu1OverlapIgnoreGif())
+    {
+        uint64_t tagLo = 0u;
+        std::memcpy(&tagLo, data, sizeof(tagLo));
+        const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 0x3u);
+        suiko::diag::vu1Observe(shareVsync(gs_regs),
+                                (flg == 2u || flg == 3u) ? "gifimg" : "gifpath");
+    }
+
     // SUIKO(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every tagged packet as it
     // enters the GIF arbiter, with the submitting path (p2 = VIF1
     // DIRECT/DIRECTHL, p3 = GIF DMA) and the leading GIFtag header, so each
@@ -2703,6 +2750,9 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (suiko::diag::vu1OverlapEnabled() && address == 0x10003C00u)
+        suiko::diag::vu1Observe(shareVsync(gs_regs), "vif1stat");
+
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -2731,6 +2781,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            shareGsEvent(gs_regs, "csr");
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))

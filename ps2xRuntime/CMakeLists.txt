@@ -381,6 +381,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
     src/lib/ps2_coverage.cpp
+    src/lib/ps2_diag_shares.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp

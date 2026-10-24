@@ -8,6 +8,7 @@
 #include "runtime/ps2_gs_host_hooks.h"
 #include "runtime/ps2_present_hooks.h"
 #include "runtime/ps2_vu1_inventory.h"
+#include "runtime/ps2_diag_shares.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -755,6 +756,11 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
+                                     const bool shareCapture = suiko::diag::vu1OverlapEnabled();
+                                     const uint64_t shareVsync =
+                                         shareCapture ? m_memory.gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
+                                     if (shareCapture)
+                                         suiko::diag::vu1KickBegin(shareVsync);
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -770,9 +776,16 @@ bool PS2Runtime::syncCoreSubsystems()
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     if (shareCapture)
+                                         suiko::diag::vu1KickEnd(shareVsync); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
+                                     const bool shareCapture = suiko::diag::vu1OverlapEnabled();
+                                     const uint64_t shareVsync =
+                                         shareCapture ? m_memory.gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
+                                     if (shareCapture)
+                                         suiko::diag::vu1KickBegin(shareVsync);
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -788,7 +801,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     if (shareCapture)
+                                         suiko::diag::vu1KickEnd(shareVsync); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
