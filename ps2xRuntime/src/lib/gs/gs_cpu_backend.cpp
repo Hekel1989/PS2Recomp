@@ -5,6 +5,7 @@
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/ps2_gs_host_hooks.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
@@ -296,7 +297,10 @@ namespace
     {
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        // The operands are 0..255 and the weights are in [0,1], so the result
+        // is non-negative: floor(x + 0.5) is lround(x) for this range without
+        // the libm call paid per channel per bilinear sample.
+        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
     }
 }
 
@@ -541,6 +545,8 @@ void GSCpuBackend::ResetUnlocked()
     m_transferState.direction = 3u;
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0u;
+    m_clutTableValid = false;
+    ++m_clutGeneration;
 }
 
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
@@ -634,6 +640,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
     }
+    m_clutTableValid = false;
+    ++m_clutGeneration;
 }
 
 void GSCpuBackend::Flush()
@@ -710,6 +718,8 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
 
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
+    if (!Ps2GsHostHooks::cpuRasterEnabled())
+        return;
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
     PS2_IF_AGRESSIVE_LOGS({
@@ -1055,6 +1065,27 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     return 0xFFFF00FFu;
 }
 
+void GSCpuBackend::EnsureClutTable(const GSDrawState &state)
+{
+    const auto &tex = state.context.tex0;
+    const uint64_t key = static_cast<uint64_t>(tex.psm) |
+                         (static_cast<uint64_t>(tex.cpsm) << 8) |
+                         (static_cast<uint64_t>(tex.csm) << 16) |
+                         (static_cast<uint64_t>(tex.csa) << 24) |
+                         (static_cast<uint64_t>(state.texa.ta0) << 32) |
+                         (static_cast<uint64_t>(state.texa.ta1) << 40) |
+                         (static_cast<uint64_t>(state.texa.aem) << 48);
+    if (m_clutTableValid && m_clutTableKey == key)
+        return;
+
+    const uint32_t count = isFourBitIndexedPsm(tex.psm) ? 16u : 256u;
+    for (uint32_t index = 0; index < count; ++index)
+        m_clutTable[index] = LookupCLUT(state, static_cast<uint8_t>(index),
+                                        tex.cpsm, tex.csm, tex.csa, tex.psm);
+    m_clutTableKey = key;
+    m_clutTableValid = true;
+}
+
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
 {
     const auto &ctx = state.context;
@@ -1083,6 +1114,12 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         texVf = t * invQ * static_cast<float>(texH);
     }
 
+    const bool indexed = tex.psm == GS_PSM_T8 || tex.psm == GS_PSM_T8H ||
+                         tex.psm == GS_PSM_T4 || tex.psm == GS_PSM_T4HL ||
+                         tex.psm == GS_PSM_T4HH;
+    if (indexed)
+        EnsureClutTable(state);
+
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
@@ -1107,7 +1144,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         case GS_PSM_T4:
         case GS_PSM_T4HL:
         case GS_PSM_T4HH:
-            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
+            return m_clutTable[static_cast<u8>(out)];
         }
 
         return 0xFFFF00FFu;

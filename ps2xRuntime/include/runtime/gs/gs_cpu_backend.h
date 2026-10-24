@@ -47,6 +47,7 @@ private:
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+    void EnsureClutTable(const GSDrawState &state);
 
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
@@ -72,6 +73,12 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
+    // Palette-expanded CLUT, rebuilt only when the palette or TEXA state
+    // changes.  Indexed textures otherwise pay LookupCLUT per sampled texel.
+    std::array<uint32_t, 256> m_clutTable{};
+    uint64_t m_clutTableKey = 0;
+    uint64_t m_clutGeneration = 0;
+    bool m_clutTableValid = false;
     GSMem::TexturePageCache m_texturePageCache;
 
     GSTransferCommand m_transfer{};

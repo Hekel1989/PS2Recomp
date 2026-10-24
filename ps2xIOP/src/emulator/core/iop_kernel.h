@@ -111,6 +111,13 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         uint32_t m_lastScheduledId = 0;
+        // Earliest wake cycle among Delay threads.  A lower bound that is only
+        // refreshed when it comes due, so the per-slice scheduler does not
+        // rescan every thread to find that no delay expired.
+        uint64_t m_nextDelayWakeCycle = UINT64_MAX;
+        // Number of threads in the Dead state; cleanupDeadThreads() is a full
+        // scan and runs after every time slice, so skip it when nothing died.
+        uint32_t m_deadThreadCount = 0;
         IopThread *m_currentThread = nullptr;
     };
 }

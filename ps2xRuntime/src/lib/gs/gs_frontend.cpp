@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/ps2_gs_host_hooks.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -1459,6 +1460,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 
         if (m_backend)
         {
+            // A local-to-host transfer reads VRAM now; refresh the CPU-side
+            // copy from the external GS first (see syncLocalMemory).
+            if (m_trxdir == 2u && Ps2GsHostHooks::hooks().syncLocalMemory)
+                Ps2GsHostHooks::hooks().syncLocalMemory();
             GSTransferCommand command{};
             command.bitbltbuf = m_bitbltbuf;
             command.trxpos = m_trxpos;
@@ -1761,6 +1766,8 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (Ps2GsHostHooks::hooks().syncLocalMemory)
+        Ps2GsHostHooks::hooks().syncLocalMemory();
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 

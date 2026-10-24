@@ -57,7 +57,35 @@ namespace Ps2GsHostHooks
         // without its synthesized GIFtag). Lets a host cross-check that
         // everything the runtime frontend saw also reached its external GS.
         std::function<void(uint32_t path, uint32_t qwords)> gifConsume;
+
+        // SUIKO(gs-single-raster): Bring the runtime's CPU-side VRAM copy up to
+        // date from the external GS before the guest reads it (local-to-host
+        // IMAGE transfer or GS::ReadVram).  With a hardware GS attached the CPU
+        // rasterizer is redundant for display; it is only needed for guest
+        // readbacks, so this hook makes those reads authoritative.
+        std::function<void()> syncLocalMemory;
     };
+
+    // SUIKO(gs-single-raster): an embedding frontend that renders every packet
+    // itself can switch off the redundant CPU rasterizer.  Drawing is still
+    // parsed (register/transfer state stays correct); only pixel generation is
+    // skipped.  Enabled by default so standalone PS2Recomp behaviour is
+    // unchanged.
+    inline bool &cpuRasterEnabledStorage()
+    {
+        static bool enabled = true;
+        return enabled;
+    }
+
+    inline void setCpuRasterEnabled(bool enabled)
+    {
+        cpuRasterEnabledStorage() = enabled;
+    }
+
+    inline bool cpuRasterEnabled()
+    {
+        return cpuRasterEnabledStorage();
+    }
 
     inline Hooks &mutableHooks()
     {

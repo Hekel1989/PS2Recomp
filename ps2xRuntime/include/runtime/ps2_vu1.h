@@ -3,6 +3,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 class GS;
 class PS2Memory;
@@ -216,6 +218,14 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    // Bit per occupied slot.  Commits and frees walk only live entries instead
+    // of scanning every slot on each executed instruction pair.
+    uint16_t m_flagValid = 0u;
+    uint8_t m_efuValid = 0u;
+    uint16_t m_storeValid = 0u;
+    uint16_t m_vfValid = 0u;
+    uint16_t m_viValid = 0u;
+    uint16_t m_accValid = 0u;
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
@@ -227,6 +237,10 @@ private:
     uint64_t m_cycle = 0;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
+    // Earliest readyCycle among pending pipeline entries.  commitReadyPipelines()
+    // can then return without scanning every array on the cycles where nothing
+    // becomes visible.
+    uint64_t m_nextCommitCycle = UINT64_MAX;
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
     int32_t m_viBranchBackupValue = 0;
@@ -239,6 +253,9 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    // PS2X_VU1_DIFF: run the reference scheduler and capture XGKICK packets.
+    bool m_referenceScheduler = false;
+    std::vector<std::vector<uint8_t>> *m_xgkickCapture = nullptr;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
@@ -278,8 +295,12 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitReadyPipelinesReference();
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
+    void runDifferential(uint8_t *vuCode, uint32_t codeSize,
+                         uint8_t *vuData, uint32_t dataSize,
+                         GS &gs, PS2Memory *memory, uint32_t maxCycles);
     void flushPipelines();
     void progressXgkick();
     void finishXgkick();
@@ -287,7 +308,20 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const;
+    // flush-to-zero/one operand conversion; hot enough (every VF read and
+    // FMAC exact-result lane) that it lives in the header for inlining.
+    float normalizeOperand(float value) const
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exponent = (bits >> 23) & 0xFFu;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0xFFu)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;

@@ -32,6 +32,8 @@ namespace ps2x::iop::detail
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
         m_lastScheduledId = 0;
+        m_nextDelayWakeCycle = UINT64_MAX;
+        m_deadThreadCount = 0;
         m_currentThread = nullptr;
     }
 
@@ -108,6 +110,8 @@ namespace ps2x::iop::detail
             if (m_currentThread != nullptr)
             {
                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
+                if (ordinal == 9)
+                    ++m_deadThreadCount;
                 cpu.stopped = true;
                 cpu.yielded = true;
             }
@@ -667,45 +671,49 @@ namespace ps2x::iop::detail
             return;
         m_currentThread->wakeCycle = wakeCycle;
         m_currentThread->state = IopThreadState::Delay;
+        m_nextDelayWakeCycle = std::min(m_nextDelayWakeCycle, wakeCycle);
         cpu.yielded = true;
     }
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
-
+        // Promote expired delays and pick the next thread in one pass.  The
+        // map is ordered by thread id, so this preserves the original
+        // priority-then-round-robin order while avoiding two extra full scans
+        // per IOP time slice (called tens of millions of times per second).
+        const bool checkDelays = currentCycle >= m_nextDelayWakeCycle;
+        uint64_t nextDelay = UINT64_MAX;
         IopThread *bestPriority = nullptr;
+        IopThread *bestAfterLast = nullptr;
         for (auto &[id, thread] : m_threads)
         {
+            if (thread.state == IopThreadState::Delay)
+            {
+                if (checkDelays && thread.wakeCycle <= currentCycle)
+                    thread.state = IopThreadState::Ready;
+                else
+                    nextDelay = std::min(nextDelay, thread.wakeCycle);
+            }
             if (thread.state != IopThreadState::Ready)
                 continue;
             if (bestPriority == nullptr || thread.priority < bestPriority->priority)
+            {
                 bestPriority = &thread;
+                bestAfterLast = (thread.id > m_lastScheduledId) ? &thread : nullptr;
+            }
+            else if (thread.priority == bestPriority->priority &&
+                     bestAfterLast == nullptr && thread.id > m_lastScheduledId)
+            {
+                bestAfterLast = &thread;
+            }
         }
+        if (checkDelays)
+            m_nextDelayWakeCycle = nextDelay;
+
         if (bestPriority == nullptr)
             return nullptr;
 
-        // Round-robin among threads of the same priority (a map ordered by id
-        // would otherwise starve every equal-priority thread above the lowest
-        // id). Pick the first ready thread after the last scheduled one.
-        IopThread *next = nullptr;
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state != IopThreadState::Ready || thread.priority != bestPriority->priority)
-                continue;
-            if (thread.id > m_lastScheduledId)
-            {
-                next = &thread;
-                break;
-            }
-        }
-        if (next == nullptr)
-            next = bestPriority;
-
+        IopThread *next = bestAfterLast != nullptr ? bestAfterLast : bestPriority;
         m_lastScheduledId = static_cast<uint32_t>(next->id);
         m_currentThread = next;
         next->state = IopThreadState::Running;
@@ -732,13 +740,7 @@ namespace ps2x::iop::detail
 
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
     {
-        uint64_t nextWake = fallback;
-        for (const auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay)
-                nextWake = std::min(nextWake, thread.wakeCycle);
-        }
-        return nextWake;
+        return std::min(fallback, m_nextDelayWakeCycle);
     }
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
@@ -753,6 +755,9 @@ namespace ps2x::iop::detail
 
     void IopKernel::cleanupDeadThreads()
     {
+        if (m_deadThreadCount == 0u)
+            return;
+        uint32_t removed = 0u;
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
         {
             if (thread->second.state != IopThreadState::Dead)
@@ -763,7 +768,9 @@ namespace ps2x::iop::detail
             if (thread->second.stackBase != 0u)
                 (void)m_memory.freeAllocation(thread->second.stackBase);
             thread = m_threads.erase(thread);
+            ++removed;
         }
+        m_deadThreadCount -= removed;
     }
 
     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
@@ -771,8 +778,11 @@ namespace ps2x::iop::detail
         for (auto &[id, thread] : m_threads)
         {
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
-            if (pc >= base && pc < base + size)
+            if (pc >= base && pc < base + size && thread.state != IopThreadState::Dead)
+            {
                 thread.state = IopThreadState::Dead;
+                ++m_deadThreadCount;
+            }
         }
     }
 }

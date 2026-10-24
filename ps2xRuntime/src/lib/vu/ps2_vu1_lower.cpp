@@ -11,6 +11,13 @@
 
 namespace
 {
+    // Cached so the LQ/SQ hot paths do not scan the environment per instruction.
+    bool vu1TraceEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_VU1_TRACE") != nullptr;
+        return s_enabled;
+    }
+
     float vuEatan(float value)
     {
         constexpr float coefficients[] = {
@@ -90,7 +97,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         int16_t imm = IMM11(instr);
         uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
         addr &= (dataSize - 1);
-        if (std::getenv("PS2X_VU1_TRACE") != nullptr && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
+        if (vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
             std::fprintf(stderr, "[vu1:load] LQ pc=0x%x addr=0x%x vf=%u mask=0x%x\n",
                          m_state.pc, addr, it, dest);
         if (addr + 16 <= dataSize)
@@ -112,7 +119,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         // SUIKO(diag-vu1-store-trace): the transition renderer is suspected of
         // never storing the packet it later kicks; show stores to the two
         // packet slots it uses.
-        if (std::getenv("PS2X_VU1_TRACE") != nullptr && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
+        if (vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
             std::fprintf(stderr, "[vu1:store] SQ pc=0x%x addr=0x%x vf=%u mask=0x%x\n",
                          m_state.pc, addr, is, dest);
         if (addr + 16 <= dataSize)
