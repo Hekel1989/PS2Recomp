@@ -439,6 +439,15 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    // Wall-clock anchor for EE time.  The per-dispatch charges under-count
+    // real time (a dispatch costs kGuestDispatchCycles no matter what it
+    // did), so every checkpoint floors m_eeCycle at
+    // m_hostAnchorCycle + elapsed_host_time * kEeClockHz.  The floor only
+    // pulls m_eeCycle forward, never back, so EE time stays monotonic while
+    // host-paced events (VBlank, alarms, thread delays) fire on time even
+    // while guest threads busy-poll.
+    std::chrono::steady_clock::time_point m_hostClockAnchor{};
+    uint64_t m_hostAnchorCycle = 0u;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
@@ -463,6 +472,11 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    // Host-clock time (nanoseconds since the steady_clock epoch) of the event
+    // m_nextDeadlineCycle refers to.  An event fires only when its EE deadline
+    // and its host deadline have both passed, so the checkpoint trigger that
+    // generated code polls must consult both.
+    std::atomic<uint64_t> m_nextDeadlineHostNs{0};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
