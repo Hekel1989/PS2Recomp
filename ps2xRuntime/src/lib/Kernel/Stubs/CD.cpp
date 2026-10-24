@@ -3,6 +3,9 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#include <cstdlib>
+#include <mutex>
+
 namespace ps2_stubs
 {
     namespace
@@ -169,6 +172,34 @@ namespace ps2_stubs
         }
     }
 
+    namespace
+    {
+        // Diagnostics ring buffer for sceCdRead, enabled via PS2X_CD_TRACE or
+        // PS2X_EE_RAM_DUMP. When disabled there is no allocation and no locking.
+        constexpr size_t kCdReadTraceCapacity = 65536u;
+        std::mutex g_cdReadTraceMutex;
+        std::vector<CdReadTraceEntry> g_cdReadTrace;
+
+        bool cdReadPerReadLogEnabled()
+        {
+            static const bool enabled = std::getenv("PS2X_CD_TRACE") != nullptr;
+            return enabled;
+        }
+    }
+
+    bool cdReadTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_CD_TRACE") != nullptr ||
+                                    std::getenv("PS2X_EE_RAM_DUMP") != nullptr;
+        return enabled;
+    }
+
+    std::vector<CdReadTraceEntry> getCdReadTrace()
+    {
+        std::lock_guard<std::mutex> lock(g_cdReadTraceMutex);
+        return g_cdReadTrace;
+    }
+
     CdDebugSnapshot getCdDebugSnapshot()
     {
         CdDebugSnapshot snapshot{};
@@ -315,6 +346,36 @@ namespace ps2_stubs
 
         if (ok)
         {
+            if (cdReadTraceEnabled())
+            {
+                CdReadTraceEntry entry;
+                entry.lbn = selected.lbn;
+                entry.sectors = selected.sectors;
+                entry.dst = selected.buf;
+                entry.bytes = static_cast<uint32_t>(
+                    clampReadBytes(selected.sectors, selected.buf & PS2_RAM_MASK));
+                entry.pc = ctx->pc;
+                entry.ra = getRegU32(ctx, 31);
+                entry.tag = selected.tag;
+                {
+                    std::lock_guard<std::mutex> lock(g_cdReadTraceMutex);
+                    if (g_cdReadTrace.size() < kCdReadTraceCapacity)
+                    {
+                        g_cdReadTrace.push_back(entry);
+                    }
+                }
+                if (cdReadPerReadLogEnabled())
+                {
+                    std::cerr << "[cd-trace] lbn=0x" << std::hex << entry.lbn
+                              << " sectors=0x" << entry.sectors
+                              << " dst=0x" << entry.dst
+                              << " bytes=0x" << entry.bytes
+                              << " pc=0x" << entry.pc
+                              << " ra=0x" << entry.ra << std::dec
+                              << " tag=" << entry.tag << std::endl;
+                }
+            }
+
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;

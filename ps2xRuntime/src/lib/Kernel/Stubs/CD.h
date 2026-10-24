@@ -81,4 +81,19 @@ namespace ps2_stubs
     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSyncS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdTrayReq(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+    // Diagnostics ring buffer of sceCdRead calls, recorded when PS2X_CD_TRACE
+    // or PS2X_EE_RAM_DUMP is set; see ps2_runtime.cpp's EE RAM dump hook.
+    struct CdReadTraceEntry
+    {
+        uint32_t lbn = 0;
+        uint32_t sectors = 0;
+        uint32_t dst = 0;
+        uint32_t bytes = 0;
+        uint32_t pc = 0;
+        uint32_t ra = 0;
+        const char *tag = "";
+    };
+    bool cdReadTraceEnabled();
+    std::vector<CdReadTraceEntry> getCdReadTrace();
 }

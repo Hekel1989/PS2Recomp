@@ -8,6 +8,7 @@
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
+#include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -1184,6 +1186,42 @@ void PS2Runtime::resetMissingFunctionReportOnce()
     m_missingFunctionReported.store(false, std::memory_order_release);
 }
 
+namespace
+{
+    // Diagnostic hook: when PS2X_EE_RAM_DUMP is set, write a full 32 MB EE RAM
+    // snapshot plus the sceCdRead log recorded so far on the first
+    // guest-branch:missing-target report, so overlay loaders can be located
+    // offline against the ISO. No cost when the env var is unset.
+    void dumpEeRamForDiagnostics(uint8_t *rdram, uint32_t targetPc)
+    {
+        const char *prefix = std::getenv("PS2X_EE_RAM_DUMP");
+        if (prefix == nullptr || rdram == nullptr)
+        {
+            return;
+        }
+
+        static std::mutex s_eeRamDumpMutex;
+        std::lock_guard<std::mutex> lock(s_eeRamDumpMutex);
+        static unsigned s_eeRamDumpCount = 0u;
+        const std::string file = std::string(prefix) + std::to_string(s_eeRamDumpCount++) + ".bin";
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(rdram), PS2_RAM_SIZE);
+        std::cerr << "[ee-ram-dump] first-missing-target=0x" << std::hex << targetPc << std::dec
+                  << " wrote " << file << std::endl;
+
+        for (const auto &read : ps2_stubs::getCdReadTrace())
+        {
+            std::cerr << "[cd-trace] lbn=0x" << std::hex << read.lbn
+                      << " sectors=0x" << read.sectors
+                      << " dst=0x" << read.dst
+                      << " bytes=0x" << read.bytes
+                      << " pc=0x" << read.pc
+                      << " ra=0x" << read.ra << std::dec
+                      << " tag=" << read.tag << std::endl;
+        }
+    }
+} // namespace
+
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        R5900Context *ctx,
                                        uint32_t targetPc,
@@ -1322,6 +1360,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             std::lock_guard<std::mutex> lock(s_missingFunctionLogMutex);
             std::cerr << oss.str() << std::endl;
         }
+    }
+
+    if (firstReport)
+    {
+        dumpEeRamForDiagnostics(rdram, targetPc);
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
