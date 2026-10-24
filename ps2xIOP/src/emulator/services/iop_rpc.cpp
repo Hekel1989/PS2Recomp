@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -213,6 +215,12 @@ namespace ps2x::iop::detail
             RpcServer server;
             server.serverData = cpu.gpr[4];
             server.sid = cpu.gpr[5];
+            if (std::getenv("PS2X_ENABLE_IOP_RPC_TRACE"))
+            {
+                std::cerr << "[ps2xIOP] RegisterRpc sid=0x" << std::hex << server.sid
+                          << " f=0x" << cpu.gpr[6] << " buf=0x" << cpu.gpr[7]
+                          << std::dec << std::endl;
+            }
             server.function = cpu.gpr[6];
             server.gp = cpu.gpr[28];
             server.buffer = cpu.gpr[7];

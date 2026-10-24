@@ -319,6 +319,7 @@ void EeScheduler::run()
         {
             std::cerr << "[ee-sched] dispatch tid=" << running->id
                       << " inv=" << running->invocations.size()
+                      << " prio=" << running->currentPriority
                       << " pc=0x" << std::hex << context.pc
                       << " sp=0x" << getRegU32(&context, 29)
                       << " ra=0x" << getRegU32(&context, 31)
@@ -700,6 +701,10 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     {
         return KE_DORMANT;
     }
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] wakeup caller=" << m_currentThreadId << " target=" << id << std::endl;
+    }
     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
         target->wait.reason == EeWaitReason::Sleep)
     {
@@ -748,6 +753,10 @@ int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &o
         return KE_UNKNOWN_THID;
     }
     oldPriority = target->currentPriority;
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] setprio tid=" << id << " " << oldPriority << " -> " << priority << std::endl;
+    }
     if (target->status == EeThreadStatus::Ready)
     {
         removeReady(*target);
@@ -863,6 +872,11 @@ int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uin
     {
         return KE_ERROR;
     }
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] createSema id=" << id << " init=" << initCount
+                  << " max=" << maxCount << std::endl;
+    }
     EeSemaphore semaphore{};
     semaphore.id = id;
     semaphore.count = initCount;
@@ -918,6 +932,10 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
     {
         return KE_SEMA_OVF;
     }
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] signalSema id=" << id << " count=" << object->count + 1 << std::endl;
+    }
     ++object->count;
     publishSnapshot();
     return id;
@@ -934,6 +952,10 @@ int EeScheduler::pollSemaphore(int id)
     if (object->count == 0)
     {
         return KE_SEMA_ZERO;
+    }
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] pollSema id=" << id << " count=" << object->count - 1 << std::endl;
     }
     --object->count;
     publishSnapshot();
@@ -954,6 +976,10 @@ void EeScheduler::waitSemaphore(int id)
     if (object->count != 0)
     {
         --object->count;
+        if (schedTraceEnabled())
+        {
+            std::cerr << "[ee-sched] waitSema-ok id=" << id << " count=" << object->count << std::endl;
+        }
         GuestThread *self = currentThread();
         assert(self != nullptr);
         setReturnS32(&self->activeContext(), id);
@@ -1684,6 +1710,13 @@ void EeScheduler::makeRunning(GuestThread &item)
 
 void EeScheduler::makeDormant(GuestThread &item)
 {
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] dormant tid=" << item.id
+                  << " pc=0x" << std::hex << item.activeContext().pc
+                  << " ra=0x" << getRegU32(&item.activeContext(), 31)
+                  << std::dec << std::endl;
+    }
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;
@@ -1728,6 +1761,27 @@ void EeScheduler::blockCurrent(EeWaitState wait)
 {
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    if (schedTraceEnabled())
+    {
+        const char *reason = "?";
+        switch (wait.reason)
+        {
+        case EeWaitReason::Sleep: reason = "Sleep"; break;
+        case EeWaitReason::Semaphore: reason = "Semaphore"; break;
+        case EeWaitReason::EventFlag: reason = "EventFlag"; break;
+        case EeWaitReason::VSync: reason = "VSync"; break;
+        case EeWaitReason::External: reason = "External"; break;
+        case EeWaitReason::Mpeg: reason = "Mpeg"; break;
+        default: break;
+        }
+        int detail = -1;
+        if (auto *sema = std::get_if<EeSemaphoreWait>(&wait.payload))
+        {
+            detail = sema->id;
+        }
+        std::cerr << "[ee-sched] block tid=" << self->id << " reason=" << reason
+                  << " id=" << detail << std::endl;
+    }
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
