@@ -77,6 +77,24 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         CodeGenerator::BootstrapInfo m_bootstrapInfo;
 
+        // Runtime-copied code blobs ([[code_blobs]] config sections). The bytes
+        // live in the ELF at source_vaddr but execute at exec_vaddr after the
+        // game copies them at runtime, so they are decoded and emitted as
+        // functions at the exec addresses and registered in a sparse list the
+        // runtime consults outside the dense function table.
+        struct CodeBlobState
+        {
+            CodeBlobConfig config;
+            std::vector<uint32_t> words;
+        };
+        std::vector<CodeBlobState> m_codeBlobs;
+        std::vector<Function> m_blobFunctions;
+
+        bool loadCodeBlobs();
+        void discoverCodeBlobFunctions();
+        bool readBlobWord(uint32_t address, uint32_t &word) const;
+        const CodeBlobState *findCodeBlobForExecAddress(uint32_t address) const;
+
         bool decodeFunction(Function &function);
         void discoverAdditionalEntryPoints();
         bool shouldSkipFunction(const Function &function) const;

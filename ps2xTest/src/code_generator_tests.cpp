@@ -179,7 +179,7 @@ void register_code_generator_tests()
         gen.setRenamedFunctions({{func.start, "header_lookup_0x8f00"}});
 
         const std::string generated = gen.generateFunction(func, {makeNop(func.start)}, true);
-        const std::string registration = gen.generateFunctionRegistration({func}, {});
+        const std::string registration = gen.generateFunctionRegistration({func}, {}, {});
 
         t.IsTrue(generated.find("#include <ps2_recompiled_functions.h>") != std::string::npos,
                  "function sources must resolve declarations through the configured include path");
@@ -262,7 +262,7 @@ void register_code_generator_tests()
         gen.setResumeEntryTargets({{0x9100u,
                                     std::vector<uint32_t>(analysis.resumeEntryPoints.begin(),
                                                           analysis.resumeEntryPoints.end())}});
-        const std::string registration = gen.generateFunctionRegistration({func}, {});
+        const std::string registration = gen.generateFunctionRegistration({func}, {}, {});
         t.IsTrue(registration.find(
                      "g_ps2RecompiledFunctionTable[1] = syscall_resume_entry_0x9100; // 0x9104") !=
                      std::string::npos,
@@ -725,7 +725,7 @@ void register_code_generator_tests()
         gen.setRenamedFunctions({{0x7000u, "resume_owner_0x7000"}});
         gen.setResumeEntryTargets({{0x7000u, {0x7008u, 0x700Cu}}});
 
-        std::string registration = gen.generateFunctionRegistration({func}, {});
+        std::string registration = gen.generateFunctionRegistration({func}, {}, {});
         printGeneratedCode("resume entry targets register to the owner wrapper", registration);
 
         t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[2] = resume_owner_0x7000; // 0x7008") != std::string::npos,
@@ -762,7 +762,7 @@ void register_code_generator_tests()
         gen.setResumeEntryTargets(targetsByOwner);
 
         const std::string generated = gen.generateFunction(owner, instructions, false);
-        const std::string registration = gen.generateFunctionRegistration(functions, {});
+        const std::string registration = gen.generateFunctionRegistration(functions, {}, {});
 
         t.IsTrue(generated.find("case 0x7008u: goto label_7008;") != std::string::npos,
                  "the owner must enter directly at the first installed handler");
@@ -812,7 +812,7 @@ void register_code_generator_tests()
         gen.setRenamedFunctions({{0x5000u, "owner_0x5000"}});
         gen.setResumeEntryTargets({{0x5000u, {0x5004u}}});
 
-        std::string registration = gen.generateFunctionRegistration({owner}, {});
+        std::string registration = gen.generateFunctionRegistration({owner}, {}, {});
         printGeneratedCode("external mid-function entry can register to the owner wrapper", registration);
 
         t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[1] = owner_0x5000; // 0x5004") != std::string::npos,

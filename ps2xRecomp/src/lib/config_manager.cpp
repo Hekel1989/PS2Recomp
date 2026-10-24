@@ -104,6 +104,90 @@ namespace ps2recomp
                 config.skipFunctions = toml::find<std::vector<std::string>>(data, "skip");
             }
 
+            if (data.contains("code_blobs") && data.at("code_blobs").is_array())
+            {
+                auto parseU32Field = [](const toml::value &table, const char *key) -> uint32_t
+                {
+                    if (!table.contains(key))
+                    {
+                        return 0u;
+                    }
+                    const auto &value = table.at(key);
+                    if (value.is_string())
+                    {
+                        return static_cast<uint32_t>(std::stoul(value.as_string(), nullptr, 0));
+                    }
+                    if (value.is_integer())
+                    {
+                        return static_cast<uint32_t>(value.as_integer());
+                    }
+                    return 0u;
+                };
+
+                for (const auto &blobNode : data.at("code_blobs").as_array())
+                {
+                    if (!blobNode.is_table())
+                    {
+                        continue;
+                    }
+
+                    CodeBlobConfig blob;
+                    if (blobNode.contains("name") && blobNode.at("name").is_string())
+                    {
+                        blob.name = blobNode.at("name").as_string();
+                    }
+                    blob.sourceVaddr = parseU32Field(blobNode, "source_vaddr");
+                    blob.size = parseU32Field(blobNode, "size");
+                    blob.execVaddr = parseU32Field(blobNode, "exec_vaddr");
+
+                    if (blobNode.contains("entries") && blobNode.at("entries").is_array())
+                    {
+                        for (const auto &entryNode : blobNode.at("entries").as_array())
+                        {
+                            uint32_t entry = 0u;
+                            if (entryNode.is_string())
+                            {
+                                entry = static_cast<uint32_t>(std::stoul(entryNode.as_string(), nullptr, 0));
+                            }
+                            else if (entryNode.is_integer())
+                            {
+                                entry = static_cast<uint32_t>(entryNode.as_integer());
+                            }
+                            if (entry != 0u)
+                            {
+                                blob.entries.push_back(entry);
+                            }
+                        }
+                    }
+
+                    if (blob.name.empty())
+                    {
+                        blob.name = "code_blob";
+                        if (m_reporter)
+                        {
+                            std::ostringstream msg;
+                            msg << "code blob at source 0x" << std::hex << blob.sourceVaddr
+                                << " has no name; using '" << blob.name << "'.";
+                            m_reporter->warning("config", msg.str());
+                        }
+                    }
+
+                    if (blob.sourceVaddr == 0u || blob.size == 0u || blob.execVaddr == 0u)
+                    {
+                        if (m_reporter)
+                        {
+                            std::ostringstream msg;
+                            msg << "Ignoring code blob '" << blob.name
+                                << "': source_vaddr, size and exec_vaddr must all be non-zero.";
+                            m_reporter->warning("config", msg.str());
+                        }
+                        continue;
+                    }
+
+                    config.codeBlobs.push_back(std::move(blob));
+                }
+            }
+
             if (data.contains("patches") && data.at("patches").is_table())
             {
                 const auto &patches = toml::find(data, "patches");

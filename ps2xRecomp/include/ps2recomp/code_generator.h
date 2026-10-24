@@ -41,7 +41,9 @@ namespace ps2recomp
         using AnalysisResult = ControlFlowAnalysisResult;
 
         std::string generateFunction(const Function &function, const std::vector<Instruction> &instructions, const bool &useHeaders);
-        std::string generateFunctionRegistration(const std::vector<Function> &functions, const std::map<uint32_t, std::string> &stubs);
+        std::string generateFunctionRegistration(const std::vector<Function> &functions,
+                                                 const std::map<uint32_t, std::string> &stubs,
+                                                 const std::vector<Function> &blobFunctions);
         std::string handleBranchDelaySlots(const Instruction &branchInst, const Instruction &delaySlot,
                                            const Function &function, const AnalysisResult &analysisResult);
         std::string handleBranchDelaySlots(const Instruction &branchInst, const Instruction &delaySlot,

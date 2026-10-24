@@ -16,7 +16,9 @@ namespace ps2recomp
     public:
         explicit FunctionTableEmitter(CodeGenerator &codeGenerator);
 
-        std::string emit(const std::vector<Function> &functions, const std::map<uint32_t, std::string> &stubs);
+        std::string emit(const std::vector<Function> &functions,
+                         const std::map<uint32_t, std::string> &stubs,
+                         const std::vector<Function> &blobFunctions);
 
     private:
         CodeGenerator &m_codeGenerator;

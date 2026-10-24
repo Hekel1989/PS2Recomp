@@ -289,10 +289,13 @@ namespace ps2recomp
         return fmt::format("throw std::runtime_error(\"{} at 0x{:X} raw=0x{:08X}\");", message, inst.address, inst.raw);
     }
 
-    std::string CodeGenerator::generateFunctionRegistration(const std::vector<Function> &functions, const std::map<uint32_t, std::string> &stubs)
+    std::string CodeGenerator::generateFunctionRegistration(
+        const std::vector<Function> &functions,
+        const std::map<uint32_t, std::string> &stubs,
+        const std::vector<Function> &blobFunctions)
     {
         FunctionTableEmitter emitter(*this);
-        return emitter.emit(functions, stubs);
+        return emitter.emit(functions, stubs, blobFunctions);
     }
 
     const Symbol *CodeGenerator::findSymbolByAddress(uint32_t address) const

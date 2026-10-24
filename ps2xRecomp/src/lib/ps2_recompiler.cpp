@@ -926,6 +926,11 @@ namespace ps2recomp
                 return false;
             }
 
+            if (!loadCodeBlobs())
+            {
+                return false;
+            }
+
             {
                 m_bootstrapInfo = {};
                 uint32_t entry = m_elfParser->getEntryPoint();
@@ -1205,6 +1210,7 @@ namespace ps2recomp
             }
 
             discoverAdditionalEntryPoints();
+            discoverCodeBlobFunctions();
 
             if (failedCount > 0)
             {
@@ -1259,6 +1265,11 @@ namespace ps2recomp
                 if (!shouldGenerateCodeForFunction(function))
                     continue;
 
+                m_functionRenames[function.start] = makeName(function);
+            }
+
+            for (const auto &function : m_blobFunctions)
+            {
                 m_functionRenames[function.start] = makeName(function);
             }
 
@@ -1803,9 +1814,31 @@ namespace ps2recomp
                 }
             }
 
+            if (!m_blobFunctions.empty())
+            {
+                std::stringstream blobOutput;
+                writeCombinedOutputPreamble(blobOutput);
+                for (const auto &function : m_blobFunctions)
+                {
+                    blobOutput << generateFunctionCode(*m_codeGenerator, function, false) << "\n\n";
+                }
+
+                fs::path blobPath = fs::path(m_config.outputPath) / "ps2_recompiled_code_blobs.cpp";
+                if (!writeToFile(blobPath.string(), blobOutput.str()))
+                {
+                    throw std::runtime_error("Failed to write code blob output: " + blobPath.string());
+                }
+                {
+                    std::ostringstream msg;
+                    msg << "wrote " << m_blobFunctions.size() << " code blob function(s) to " << blobPath;
+                    m_reporter.progress(msg.str());
+                }
+            }
+
             m_decodedFunctions.clear();
 
-            std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
+            std::string registerFunctions =
+                m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs, m_blobFunctions);
             m_generatedStubs.clear();
 
             fs::path registerPath = fs::path(m_config.outputPath) / "register_functions.cpp";
@@ -1908,6 +1941,17 @@ namespace ps2recomp
                 }
 
                 std::string finalName = m_codeGenerator->getFunctionName(function.start);
+
+                ss << "void " << finalName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+            }
+
+            for (const auto &function : m_blobFunctions)
+            {
+                std::string finalName = m_codeGenerator->getFunctionName(function.start);
+                if (finalName.empty())
+                {
+                    continue;
+                }
 
                 ss << "void " << finalName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
             }
@@ -2149,6 +2193,212 @@ namespace ps2recomp
         }
     }
 
+    bool PS2Recompiler::loadCodeBlobs()
+    {
+        m_codeBlobs.clear();
+        if (m_config.codeBlobs.empty())
+        {
+            return true;
+        }
+
+        for (const auto &blobConfig : m_config.codeBlobs)
+        {
+            {
+                std::ostringstream msg;
+                msg << "loading code blob '" << blobConfig.name << "' from source 0x" << std::hex
+                    << blobConfig.sourceVaddr << " (size 0x" << blobConfig.size << ") as exec 0x"
+                    << blobConfig.execVaddr;
+                m_reporter.info("code-blob", msg.str());
+            }
+
+            if ((blobConfig.sourceVaddr & 3u) != 0u || (blobConfig.size & 3u) != 0u ||
+                (blobConfig.execVaddr & 3u) != 0u)
+            {
+                std::ostringstream msg;
+                msg << "code blob '" << blobConfig.name
+                    << "': source_vaddr, size and exec_vaddr must be 4-byte aligned.";
+                m_reporter.error("code-blob", msg.str());
+                return false;
+            }
+
+            CodeBlobState state;
+            state.config = blobConfig;
+            state.words.reserve(blobConfig.size / 4u);
+            for (uint32_t offset = 0; offset < blobConfig.size; offset += 4u)
+            {
+                const uint32_t sourceAddress = blobConfig.sourceVaddr + offset;
+                if (!m_elfParser->isValidAddress(sourceAddress))
+                {
+                    std::ostringstream msg;
+                    msg << "code blob '" << blobConfig.name << "' source address 0x" << std::hex
+                        << sourceAddress << " is not inside any ELF section";
+                    m_reporter.error("code-blob", msg.str());
+                    return false;
+                }
+                state.words.push_back(m_elfParser->readWord(sourceAddress));
+            }
+
+            // A synthetic executable section makes branch analysis and function
+            // discovery treat the blob's exec range as code.
+            Section blobSection{};
+            blobSection.name = "code_blob:" + blobConfig.name;
+            blobSection.address = blobConfig.execVaddr;
+            blobSection.size = blobConfig.size;
+            blobSection.offset = 0;
+            blobSection.isCode = true;
+            blobSection.isData = false;
+            blobSection.isBSS = false;
+            blobSection.isReadOnly = false;
+            blobSection.data = nullptr;
+            m_sections.push_back(blobSection);
+
+            m_codeBlobs.push_back(std::move(state));
+        }
+
+        return true;
+    }
+
+    const PS2Recompiler::CodeBlobState *PS2Recompiler::findCodeBlobForExecAddress(uint32_t address) const
+    {
+        for (const auto &blob : m_codeBlobs)
+        {
+            if (address >= blob.config.execVaddr && address < blob.config.execVaddr + blob.config.size)
+            {
+                return &blob;
+            }
+        }
+        return nullptr;
+    }
+
+    bool PS2Recompiler::readBlobWord(uint32_t address, uint32_t &word) const
+    {
+        const CodeBlobState *blob = findCodeBlobForExecAddress(address);
+        if (!blob)
+        {
+            return false;
+        }
+        const size_t index = (address - blob->config.execVaddr) >> 2u;
+        word = blob->words[index];
+        return true;
+    }
+
+    void PS2Recompiler::discoverCodeBlobFunctions()
+    {
+        if (m_codeBlobs.empty() || !m_codeGenerator)
+        {
+            return;
+        }
+
+        for (const auto &blob : m_codeBlobs)
+        {
+            const uint32_t blobStart = blob.config.execVaddr;
+            const uint32_t blobEnd = blobStart + blob.config.size;
+
+            std::vector<uint32_t> seeds{blobStart};
+            for (uint32_t entry : blob.config.entries)
+            {
+                if (entry >= blobStart && entry < blobEnd && (entry & 3u) == 0u)
+                {
+                    seeds.push_back(entry);
+                }
+                else
+                {
+                    std::ostringstream msg;
+                    msg << "code blob '" << blob.config.name << "' entry 0x" << std::hex << entry
+                        << " is outside the blob exec range; ignored";
+                    m_reporter.warning("code-blob", msg.str());
+                }
+            }
+            std::sort(seeds.begin(), seeds.end());
+            seeds.erase(std::unique(seeds.begin(), seeds.end()), seeds.end());
+
+            std::vector<Function> blobFunctions;
+            blobFunctions.reserve(seeds.size());
+            for (size_t i = 0; i < seeds.size(); ++i)
+            {
+                Function function{};
+                std::ostringstream name;
+                name << "blob_" << blob.config.name;
+                function.name = name.str();
+                function.start = seeds[i];
+                function.end = (i + 1 < seeds.size()) ? seeds[i + 1] : blobEnd;
+                function.isRecompiled = true;
+
+                if (!decodeFunction(function))
+                {
+                    m_reporter.warningAt("code-blob", function.name, function.start,
+                                         "Could not decode code blob function; skipping");
+                    continue;
+                }
+
+                blobFunctions.push_back(std::move(function));
+            }
+
+            // Register every branch/jump target inside the blob as an entry
+            // point: the copied syscall handlers jump into each other and the
+            // runtime dispatches those targets through the sparse map, so each
+            // target must be a registered entry or a resume point of its owner.
+            for (const auto &function : blobFunctions)
+            {
+                const auto decodedIt = m_decodedFunctions.find(function.start);
+                if (decodedIt == m_decodedFunctions.end())
+                {
+                    continue;
+                }
+
+                CodeGenerator::AnalysisResult analysisResult =
+                    m_codeGenerator->collectInternalBranchTargets(function, decodedIt->second, &blobFunctions);
+
+                auto &ownerTargets = m_resumeEntryTargetsByOwner[function.start];
+                ownerTargets.insert(ownerTargets.end(),
+                                    analysisResult.resumeEntryPoints.begin(),
+                                    analysisResult.resumeEntryPoints.end());
+                ownerTargets.insert(ownerTargets.end(),
+                                    analysisResult.indirectFallbackEntryPoints.begin(),
+                                    analysisResult.indirectFallbackEntryPoints.end());
+
+                for (uint32_t target : analysisResult.externalEntryPoints)
+                {
+                    const Function *owner = nullptr;
+                    for (const auto &candidate : blobFunctions)
+                    {
+                        if (target >= candidate.start && target < candidate.end &&
+                            (!owner || candidate.start > owner->start))
+                        {
+                            owner = &candidate;
+                        }
+                    }
+                    if (!owner || owner->start == target)
+                    {
+                        continue;
+                    }
+                    m_resumeEntryTargetsByOwner[owner->start].push_back(target);
+                }
+            }
+
+            for (auto &[owner, targets] : m_resumeEntryTargetsByOwner)
+            {
+                (void)owner;
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            }
+
+            m_blobFunctions.insert(m_blobFunctions.end(), blobFunctions.begin(), blobFunctions.end());
+
+            {
+                std::ostringstream msg;
+                msg << "code blob '" << blob.config.name << "': " << blobFunctions.size()
+                    << " function(s) at exec 0x" << std::hex << blobStart;
+                m_reporter.info("code-blob", msg.str());
+            }
+        }
+
+        if (!m_blobFunctions.empty())
+        {
+            m_codeGenerator->setResumeEntryTargets(m_resumeEntryTargetsByOwner);
+        }
+    }
+
     bool PS2Recompiler::decodeFunction(Function &function)
     {
         std::vector<Instruction> instructions;
@@ -2161,18 +2411,22 @@ namespace ps2recomp
         {
             try
             {
-                if (!m_elfParser->isValidAddress(address))
+                uint32_t rawInstruction = 0u;
+                if (!readBlobWord(address, rawInstruction))
                 {
+                    if (!m_elfParser->isValidAddress(address))
                     {
-                        std::ostringstream msg;
-                        msg << "Invalid address 0x" << std::hex << address << " (truncating decode)";
-                        m_reporter.warningAt("decode", function.name, address, msg.str());
+                        {
+                            std::ostringstream msg;
+                            msg << "Invalid address 0x" << std::hex << address << " (truncating decode)";
+                            m_reporter.warningAt("decode", function.name, address, msg.str());
+                        }
+                        truncated = true;
+                        break;
                     }
-                    truncated = true;
-                    break;
-                }
 
-                uint32_t rawInstruction = m_elfParser->readWord(address);
+                    rawInstruction = m_elfParser->readWord(address);
+                }
                 const uint32_t originalInstruction = rawInstruction;
 
                 auto patchIt = m_config.patches.find(address);

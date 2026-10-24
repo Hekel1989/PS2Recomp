@@ -19,7 +19,9 @@ namespace ps2recomp
     {
     }
 
-    std::string FunctionTableEmitter::emit(const std::vector<Function> &functions, const std::map<uint32_t, std::string> &stubs)
+    std::string FunctionTableEmitter::emit(const std::vector<Function> &functions,
+                                           const std::map<uint32_t, std::string> &stubs,
+                                           const std::vector<Function> &blobFunctions)
     {
         (void)stubs;
 
@@ -105,8 +107,24 @@ namespace ps2recomp
             addEntry(address, name);
         }
 
+        // Resume targets belong to the dense table only when their owner is a
+        // dense-table function. Code-blob owners are registered in the sparse
+        // list below; mixing them in here would stretch the dense table across
+        // the whole address space.
+        std::unordered_set<uint32_t> denseFunctionStarts;
+        denseFunctionStarts.reserve(functions.size());
+        for (const auto &function : functions)
+        {
+            denseFunctionStarts.insert(function.start);
+        }
+
         for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
         {
+            if (!denseFunctionStarts.contains(ownerStart))
+            {
+                continue;
+            }
+
             const std::string ownerName = cg.getFunctionName(ownerStart);
             if (ownerName.empty())
             {
@@ -170,6 +188,58 @@ namespace ps2recomp
         ss << "};\n";
         ss << "static const GeneratedFunctionTableInitializer g_generatedFunctionTableInitializer;\n";
         ss << "}\n";
+
+        // Sparse registration list for runtime-copied code blobs. These
+        // functions execute outside the dense table's address range (the game
+        // copies the bytes into place at runtime), so the runtime keeps them in
+        // a sparse map consulted by lookupFunction/hasFunction.
+        if (!blobFunctions.empty())
+        {
+            std::map<uint32_t, std::string> sparseEntries;
+            std::unordered_set<uint32_t> blobFunctionStarts;
+            for (const auto &function : blobFunctions)
+            {
+                blobFunctionStarts.insert(function.start);
+                const std::string name = cg.getFunctionName(function.start);
+                if (!name.empty() && (function.start & 3u) == 0u)
+                {
+                    sparseEntries.emplace(function.start, name);
+                }
+            }
+            for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
+            {
+                if (!blobFunctionStarts.contains(ownerStart))
+                {
+                    continue;
+                }
+                const std::string ownerName = cg.getFunctionName(ownerStart);
+                if (ownerName.empty())
+                {
+                    continue;
+                }
+                for (uint32_t target : targets)
+                {
+                    if ((target & 3u) == 0u)
+                    {
+                        sparseEntries.emplace(target, ownerName);
+                    }
+                }
+            }
+
+            ss << "namespace {\n";
+            ss << "struct GeneratedSparseFunctionInitializer {\n";
+            ss << "    GeneratedSparseFunctionInitializer() {\n";
+            for (const auto &[address, name] : sparseEntries)
+            {
+                ss << "        PS2Runtime::registerSparseFunction(0x" << std::hex << address
+                   << "u, " << name << "); // blob entry\n"
+                   << std::dec;
+            }
+            ss << "    }\n";
+            ss << "};\n";
+            ss << "static const GeneratedSparseFunctionInitializer g_generatedSparseFunctionInitializer;\n";
+            ss << "}\n";
+        }
 
         return ss.str();
     }

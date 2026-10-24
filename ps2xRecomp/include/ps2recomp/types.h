@@ -172,6 +172,20 @@ namespace ps2recomp
         std::string calleeName;
     };
 
+    // Runtime-copied code blob declared in the config ([[code_blobs]]).
+    // `size` bytes are read from the ELF at `source_vaddr` (e.g. a .data image)
+    // and recompiled as if located at `exec_vaddr`, where the game copies the
+    // bytes at runtime before jumping into them. `entries` lists additional
+    // function entry points inside the blob (execution addresses).
+    struct CodeBlobConfig
+    {
+        std::string name;
+        uint32_t sourceVaddr = 0;
+        uint32_t size = 0;
+        uint32_t execVaddr = 0;
+        std::vector<uint32_t> entries;
+    };
+
     // Recompiler configuration
     struct RecompilerConfig
     {
@@ -190,6 +204,7 @@ namespace ps2recomp
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+        std::vector<CodeBlobConfig> codeBlobs;
     };
 
 } // namespace ps2recomp
