@@ -91,7 +91,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
         addr &= (dataSize - 1);
         if (std::getenv("PS2X_VU1_TRACE") != nullptr && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
-            std::fprintf(stderr, "[vu1:store] ISW pc=0x%x addr=0x%x vi=%u mask=0x%x\n",
+            std::fprintf(stderr, "[vu1:load] LQ pc=0x%x addr=0x%x vf=%u mask=0x%x\n",
                          m_state.pc, addr, it, dest);
         if (addr + 16 <= dataSize)
         {

@@ -1752,6 +1752,30 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (m_cycle >= budgetEnd)
             break;
 
+        {
+            // SUIKO(diag-vu1-itrace): PS2X_VU1_ITRACE=<startpc hex>[:<count>]
+            // logs every pair of the first <count> runs that begin at startpc.
+            static const char *s_itrace = std::getenv("PS2X_VU1_ITRACE");
+            static uint32_t s_itracePc = s_itrace ? static_cast<uint32_t>(std::strtoul(s_itrace, nullptr, 16)) : 0xFFFFFFFFu;
+            static uint32_t s_itraceRuns = [] {
+                const char *c = s_itrace ? std::strchr(s_itrace, ':') : nullptr;
+                return c ? static_cast<uint32_t>(std::strtoul(c + 1, nullptr, 10)) : 1u;
+            }();
+            static uint64_t s_itraceRunCycle = ~0ull;
+            if (s_itrace && traceStartPc == s_itracePc && s_itraceRuns != 0u)
+            {
+                if (s_itraceRunCycle == ~0ull)
+                    s_itraceRunCycle = budgetEnd;
+                if (s_itraceRunCycle == budgetEnd)
+                {
+                    std::fprintf(stderr, "[vu1:i] pc=0x%04x L=%08x U=%08x vi", m_state.pc, decoded.lower, decoded.upper);
+                    for (int r = 1; r < 16; ++r)
+                        std::fprintf(stderr, " %x", static_cast<uint32_t>(m_state.vi[r]) & 0xFFFFu);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
+
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;
         for (uint32_t reg = 1; reg < 16u; ++reg)
