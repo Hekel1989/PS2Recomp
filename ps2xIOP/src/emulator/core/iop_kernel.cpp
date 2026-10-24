@@ -31,6 +31,7 @@ namespace ps2x::iop::detail
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
+        m_lastScheduledId = 0;
         m_currentThread = nullptr;
     }
 
@@ -677,23 +678,56 @@ namespace ps2x::iop::detail
                 thread.state = IopThreadState::Ready;
         }
 
-        IopThread *next = nullptr;
+        IopThread *bestPriority = nullptr;
         for (auto &[id, thread] : m_threads)
         {
             if (thread.state != IopThreadState::Ready)
                 continue;
-            if (next == nullptr || thread.priority < next->priority ||
-                (thread.priority == next->priority && thread.id < next->id))
-                next = &thread;
+            if (bestPriority == nullptr || thread.priority < bestPriority->priority)
+                bestPriority = &thread;
         }
-        if (next == nullptr)
+        if (bestPriority == nullptr)
             return nullptr;
 
+        // Round-robin among threads of the same priority (a map ordered by id
+        // would otherwise starve every equal-priority thread above the lowest
+        // id). Pick the first ready thread after the last scheduled one.
+        IopThread *next = nullptr;
+        for (auto &[id, thread] : m_threads)
+        {
+            if (thread.state != IopThreadState::Ready || thread.priority != bestPriority->priority)
+                continue;
+            if (thread.id > m_lastScheduledId)
+            {
+                next = &thread;
+                break;
+            }
+        }
+        if (next == nullptr)
+            next = bestPriority;
+
+        m_lastScheduledId = static_cast<uint32_t>(next->id);
         m_currentThread = next;
         next->state = IopThreadState::Running;
         next->cpu.stopped = false;
         next->cpu.yielded = false;
         return next;
+    }
+
+    bool IopKernel::preemptIfHigherPriority(IopCpuState &cpu)
+    {
+        if (m_currentThread == nullptr || &m_currentThread->cpu != &cpu)
+            return false;
+        for (const auto &[id, thread] : m_threads)
+        {
+            if (thread.state == IopThreadState::Ready &&
+                thread.priority < m_currentThread->priority)
+            {
+                cpu.yielded = true;
+                return true;
+            }
+        }
+        return false;
     }
 
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const

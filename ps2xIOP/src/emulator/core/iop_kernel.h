@@ -61,6 +61,10 @@ namespace ps2x::iop::detail
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        // PS2 threads are priority-preemptive and round-robin within a
+        // priority. Returns true when a wake-up import readied a thread that
+        // should run before the caller; the caller must then yield.
+        [[nodiscard]] bool preemptIfHigherPriority(IopCpuState &cpu);
         [[nodiscard]] IopThread *currentThread() noexcept { return m_currentThread; }
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
@@ -106,6 +110,7 @@ namespace ps2x::iop::detail
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
+        uint32_t m_lastScheduledId = 0;
         IopThread *m_currentThread = nullptr;
     };
 }

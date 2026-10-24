@@ -609,6 +609,12 @@ namespace ps2x::iop::detail
                     recordBranch(importPc, cpu.pc);
                     return true;
                 }
+                // A wake-up import may have readied a higher-priority thread;
+                // real hardware switches before the caller executes another
+                // instruction. (Interrupt-context calls use a temporary CPU
+                // and are not the current thread, so they keep running until
+                // the interrupt returns, like the i* variants.)
+                (void)kernel.preemptIfHigherPriority(cpu);
                 cpu.pc = cpu.gpr[31];
                 cpu.branchPending = false;
                 return !cpu.stopped;
