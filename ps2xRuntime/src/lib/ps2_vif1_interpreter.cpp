@@ -1,5 +1,8 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -79,6 +82,108 @@ namespace
 
         return 0u;
     }
+
+    // --- SUIKO(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
+    // Log VIF1 DIRECT/DIRECTHL payloads whose GIFtags declare more data than
+    // the DIRECT carries (the GIF FIFO would expect the remainder from later
+    // data on the path) or that were cut short at the DMA chunk boundary.
+    bool directTraceEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_DMA_CHAIN_TRACE") != nullptr;
+        return s_enabled;
+    }
+
+    bool directTraceBudget()
+    {
+        static int s_budget = 400;
+        if (s_budget > 0)
+        {
+            --s_budget;
+            return true;
+        }
+        return false;
+    }
+
+    // Qwords the last GIFtag in the payload still wants beyond what is present
+    // (0 when complete). Same walk as gifTrailingDeficitQwords (ps2_memory.cpp).
+    uint64_t gifTrailingDeficitQwords(const uint8_t *data, uint32_t qwords)
+    {
+        uint64_t offset = 0u;
+        while (offset < qwords)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset * 16u, sizeof(tagLo));
+            const uint64_t nloop = tagLo & 0x7FFFu;
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 3u);
+            uint64_t nreg = (tagLo >> 60u) & 0xFu;
+            if (nreg == 0u)
+                nreg = 16u;
+            ++offset;
+            if (nloop == 0u)
+                continue;
+            uint64_t need = nloop;
+            if (flg == 0u)
+                need = nloop * nreg;
+            else if (flg == 1u)
+                need = (nloop * nreg + 1u) / 2u;
+            if (offset + need > qwords)
+                return offset + need - qwords;
+            offset += need;
+        }
+        return 0u;
+    }
+
+    void logGifTagWalk(const uint8_t *data, uint32_t qwords)
+    {
+        uint64_t offset = 0u;
+        int tagIndex = 0;
+        while (offset < qwords)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset * 16u, sizeof(tagLo));
+            const uint64_t nloop = tagLo & 0x7FFFu;
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 3u);
+            uint64_t nreg = (tagLo >> 60u) & 0xFu;
+            if (nreg == 0u)
+                nreg = 16u;
+            const bool eop = ((tagLo >> 15u) & 0x1ull) != 0ull;
+            ++offset;
+            uint64_t need = nloop;
+            if (flg == 0u)
+                need = nloop * nreg;
+            else if (flg == 1u)
+                need = (nloop * nreg + 1u) / 2u;
+            const uint64_t present = std::min(need, static_cast<uint64_t>(qwords) - offset);
+            std::fprintf(stderr,
+                         "[dma-chain]   giftag[%d] @qw=%llu nloop=%llu flg=%u nreg=%llu eop=%d need=%llu present=%llu\n",
+                         tagIndex,
+                         static_cast<unsigned long long>(offset - 1u),
+                         static_cast<unsigned long long>(nloop), flg,
+                         static_cast<unsigned long long>(nreg), eop ? 1 : 0,
+                         static_cast<unsigned long long>(need),
+                         static_cast<unsigned long long>(present));
+            ++tagIndex;
+            if (nloop == 0u)
+                continue;
+            offset += need;
+        }
+    }
+
+    void logBufferDump(const char *what, const uint8_t *data, uint32_t qwords)
+    {
+        std::fprintf(stderr, "[dma-chain] dump %s (%u qwords):\n", what, qwords);
+        for (uint32_t qw = 0u; qw < qwords; ++qw)
+        {
+            std::fprintf(stderr, "  [%3u]", qw);
+            for (uint32_t b = 0u; b < 16u; ++b)
+                std::fprintf(stderr, " %02x", data[qw * 16u + b]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+
+    // Set when a DIRECT was cut at the chunk end; the next VIF1 chunk carries
+    // the continuation, so dump its head once.
+    bool s_dumpNextChunkHead = false;
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -300,6 +405,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    // SUIKO(dma-chain-trace): after a DIRECT was cut at the previous chunk's
+    // end, dump the head of this chunk (it holds the continuation bytes).
+    if (s_dumpNextChunkHead)
+    {
+        s_dumpNextChunkHead = false;
+        if (directTraceEnabled())
+            logBufferDump("vif1-chunk-head", data, std::min<uint32_t>(sizeBytes / 16u, 8u));
+    }
+
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
@@ -503,6 +617,30 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
+                // SUIKO(dma-chain-trace): log DIRECTs whose GIFtags
+                // over-declare the payload or that were cut at the chunk end.
+                if (directTraceEnabled() && directTraceBudget())
+                {
+                    const uint64_t deficit = gifTrailingDeficitQwords(data + pos, qwCount);
+                    if (truncated || deficit != 0u)
+                    {
+                        std::fprintf(stderr,
+                                     "[dma-chain] VIF1 %s OVER-DECLARED imm=%u sent=%u available=%u truncated=%d"
+                                     " deficit=%llu\n",
+                                     directHl ? "DIRECTHL" : "DIRECT", imm, qwCount, availableQw, truncated ? 1 : 0,
+                                     static_cast<unsigned long long>(deficit));
+                        logGifTagWalk(data + pos, qwCount);
+                        static bool s_dumpedDirect = false;
+                        if (!s_dumpedDirect)
+                        {
+                            s_dumpedDirect = true;
+                            logBufferDump("vif1-chunk", data,
+                                          std::min<uint32_t>(static_cast<uint32_t>(sizeBytes / 16u), 64u));
+                        }
+                        if (truncated)
+                            s_dumpNextChunkHead = true;
+                    }
+                }
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);

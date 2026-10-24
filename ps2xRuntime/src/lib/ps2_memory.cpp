@@ -5,6 +5,8 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
@@ -214,9 +216,14 @@ namespace
         uint32_t upper = 0;
     };
 
-    inline DmaTagView decodeDmaTag(uint64_t tag)
+    inline const char *dmaTagName(uint8_t id)
     {
-        DmaTagView out{};
+        static const char *const kNames[8] = {"REFE", "CNT", "NEXT", "REF", "REFS", "CALL", "RET", "END"};
+        return kNames[id & 7u];
+    }
+
+    inline DmaTagView decodeDmaTag(uint64_t tag)
+    {        DmaTagView out{};
         out.qwc = static_cast<uint16_t>(tag & 0xFFFFu);
         out.id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
         out.irq = ((tag >> 31u) & 0x1ull) != 0ull;
@@ -239,6 +246,120 @@ namespace
     {
         uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
         return nreg == 0u ? 16u : nreg;
+    }
+
+    // Qwords the last GIFtag in [data, data + qwords*16) still wants beyond
+    // what is present (0 when every GIFtag's payload is complete). Same walk
+    // as the PCSX2 mirror's trailingDeficit() (src/gs/gs_backend.cpp).
+    inline uint64_t gifTrailingDeficitQwords(const uint8_t *data, uint32_t qwords)
+    {
+        uint64_t offset = 0u;
+        while (offset < qwords)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset * 16u, sizeof(tagLo));
+            const uint64_t nloop = gifTagNloop(tagLo);
+            const uint32_t flg = gifTagFlg(tagLo);
+            const uint64_t nreg = gifTagNreg(tagLo);
+            ++offset; // the GIFtag qword itself
+            if (nloop == 0u)
+                continue;
+            uint64_t need = nloop; // IMAGE / IMAGE2
+            if (flg == 0u)
+                need = nloop * nreg; // PACKED
+            else if (flg == 1u)
+                need = (nloop * nreg + 1u) / 2u; // REGLIST
+            if (offset + need > qwords)
+                return offset + need - qwords;
+            offset += need;
+        }
+        return 0u;
+    }
+
+    // --- SUIKO(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
+    // Diagnostic for GIF packets that reach the frontend with less data than
+    // their GIFtags declare. When enabled, every GIF submission whose trailing
+    // GIFtag over-declares its payload is logged with full provenance: the DMA
+    // chain walk (tag id/QWC/ADDR/IRQ per tag, CHCR TTE/TIE, stop reason) or
+    // the VIF1 DIRECT command, plus a GIFtag header walk of the submitted
+    // buffer. Budgeted so a long run cannot flood the log.
+    inline bool dmaChainTraceEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_DMA_CHAIN_TRACE") != nullptr;
+        return s_enabled;
+    }
+
+    inline bool dmaChainTraceBudget()
+    {
+        static int s_budget = 400;
+        if (s_budget > 0)
+        {
+            --s_budget;
+            return true;
+        }
+        return false;
+    }
+
+    // One line per GIFtag in the buffer: what it declares vs what follows it.
+    inline void logGifTagWalk(const uint8_t *data, uint32_t qwords)
+    {
+        uint64_t offset = 0u;
+        int tagIndex = 0;
+        while (offset < qwords)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset * 16u, sizeof(tagLo));
+            const uint64_t nloop = gifTagNloop(tagLo);
+            const uint32_t flg = gifTagFlg(tagLo);
+            const uint64_t nreg = gifTagNreg(tagLo);
+            const bool eop = ((tagLo >> 15u) & 0x1ull) != 0ull;
+            ++offset;
+            uint64_t need = nloop;
+            if (flg == 0u)
+                need = nloop * nreg;
+            else if (flg == 1u)
+                need = (nloop * nreg + 1u) / 2u;
+            const uint64_t present = std::min(need, qwords - offset);
+            std::fprintf(stderr,
+                         "[dma-chain]   giftag[%d] @qw=%llu nloop=%llu flg=%u nreg=%llu eop=%d need=%llu present=%llu\n",
+                         tagIndex,
+                         static_cast<unsigned long long>(offset - 1u),
+                         static_cast<unsigned long long>(nloop), flg,
+                         static_cast<unsigned long long>(nreg), eop ? 1 : 0,
+                         static_cast<unsigned long long>(need),
+                         static_cast<unsigned long long>(present));
+            ++tagIndex;
+            if (nloop == 0u)
+                continue;
+            offset += need;
+        }
+    }
+
+    // One-shot raw hexdump of a submitted buffer (first occurrence only).
+    inline void logGifBufferDumpOnce(const char *what, const uint8_t *data, uint32_t qwords)
+    {
+        static bool s_done[2] = {false, false};
+        static int s_slot = 0;
+        const int slot = s_slot;
+        if (s_slot < 2)
+        {
+            if (s_done[slot])
+                return;
+            s_done[slot] = true;
+            ++s_slot;
+        }
+        else
+        {
+            return;
+        }
+        std::fprintf(stderr, "[dma-chain] dump %s (%u qwords):\n", what, qwords);
+        for (uint32_t qw = 0u; qw < qwords; ++qw)
+        {
+            std::fprintf(stderr, "  [%3u]", qw);
+            for (uint32_t b = 0u; b < 16u; ++b)
+                std::fprintf(stderr, " %02x", data[qw * 16u + b]);
+            std::fprintf(stderr, "\n");
+        }
     }
 
 }
@@ -1343,6 +1464,35 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 {
                     if (qwCount == 0)
                         return;
+                    // SUIKO(dma-chain-trace): normal-mode (MADR/QWC) GIF
+                    // transfer; log it when its GIFtags over-declare.
+                    if (channelBase == 0x1000A000u && dmaChainTraceEnabled() && dmaChainTraceBudget())
+                    {
+                        const bool traceScratch = isScratchpad(srcAddr);
+                        uint32_t tracePhys = 0u;
+                        const uint8_t *traceBase = nullptr;
+                        uint32_t traceMax = 0u;
+                        try
+                        {
+                            tracePhys = translateAddress(srcAddr);
+                            traceBase = traceScratch ? m_scratchpad : m_rdram;
+                            traceMax = traceScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                        }
+                        catch (const std::exception &)
+                        {
+                        }
+                        if (traceBase && tracePhys + qwCount * 16u <= traceMax)
+                        {
+                            const uint64_t deficit = gifTrailingDeficitQwords(traceBase + tracePhys, qwCount);
+                            if (deficit != 0u)
+                            {
+                                std::fprintf(stderr,
+                                             "[dma-chain] GIF normal OVER-DECLARED madr=0x%08x qwc=%u deficit=%llu\n",
+                                             srcAddr, qwCount, static_cast<unsigned long long>(deficit));
+                                logGifTagWalk(traceBase + tracePhys, qwCount);
+                            }
+                        }
+                    }
                     const bool scratch = isScratchpad(srcAddr);
                     PendingTransfer pt;
                     pt.fromScratchpad = scratch;
@@ -1430,6 +1580,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    // SUIKO(dma-chain-trace): record the walk so an
+                    // over-declared GIF packet can be traced back to the chain
+                    // that produced it (see dmaChainTraceEnabled()).
+                    const bool chainTrace =
+                        channelBase == 0x1000A000u && dmaChainTraceEnabled();
+                    std::vector<std::string> chainTraceTags;
+                    const char *chainStop = "max-tags";
 
                     while (tagsProcessed < kMaxChainTags)
                     {
@@ -1442,6 +1599,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                         catch (...)
                         {
+                            chainStop = "translate-fail";
                             break;
                         }
                         const uint8_t *tagBase;
@@ -1457,7 +1615,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             tagMax = PS2_RAM_SIZE;
                         }
                         if (physTag + 16 > tagMax)
+                        {
+                            chainStop = "tag-out-of-range";
                             break;
+                        }
 
                         const uint8_t *tp = tagBase + physTag;
                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
@@ -1467,6 +1628,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
+
+                        if (chainTrace)
+                        {
+                            char line[128];
+                            std::snprintf(line, sizeof(line), "tag[%d] @0x%08x id=%u(%s) qwc=%u addr=0x%08x irq=%d",
+                                          tagsProcessed - 1, currentTagAddr, id, dmaTagName(id), tagQwc, addr,
+                                          irq ? 1 : 0);
+                            chainTraceTags.emplace_back(line);
+                        }
 
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
@@ -1478,6 +1648,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             dataAddr = addr;
                             tagAddr = tagAddr + 16;
                             endChain = true;
+                            chainStop = "REFE";
                             break;
                         case 1:
                             dataAddr = tagAddr + 16;
@@ -1524,15 +1695,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             else
                             {
                                 endChain = true;
+                                chainStop = "RET-empty";
                             }
                             break;
                         case 7:
                             dataAddr = tagAddr + 16;
                             endChain = true;
+                            chainStop = "END";
                             break;
                         default:
                             hasPayload = false;
                             endChain = true;
+                            chainStop = "bad-id";
                             break;
                         }
 
@@ -1542,7 +1716,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
+                        {
                             endChain = true;
+                            chainStop = "tag-irq";
+                        }
                         if (endChain)
                             break;
                     }
@@ -1553,6 +1730,37 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
+
+                    if (chainTrace && !chainBuf.empty() && dmaChainTraceBudget())
+                    {
+                        const uint32_t chainQw = static_cast<uint32_t>(chainBuf.size() / 16u);
+                        const uint64_t deficit = gifTrailingDeficitQwords(chainBuf.data(), chainQw);
+                        if (deficit != 0u)
+                        {
+                            std::fprintf(stderr,
+                                         "[dma-chain] GIF chain OVER-DECLARED tadr=0x%08x chcr=0x%08x "
+                                         "TTE=%d TIE=%d asp=%u tags=%d qwords=%u deficit=%llu stop=%s\n",
+                                         m_ioRegisters[channelBase + 0x30], value, (value >> 6) & 1,
+                                         (value >> 7) & 1, asp, tagsProcessed, chainQw,
+                                         static_cast<unsigned long long>(deficit), chainStop);
+                            for (const std::string &line : chainTraceTags)
+                                std::fprintf(stderr, "[dma-chain]   %s\n", line.c_str());
+                            logGifTagWalk(chainBuf.data(), chainQw);
+                            logGifBufferDumpOnce("gif-chain", chainBuf.data(), chainQw);
+                        }
+                    }
+                    else if (dmaChainTraceEnabled() && channelBase != 0x1000A000u && !chainBuf.empty())
+                    {
+                        // One-shot dump of a VIF chain buffer for stream analysis.
+                        static bool s_vifDumped = false;
+                        if (!s_vifDumped && chainBuf.size() >= 800u && chainBuf.size() <= 900u)
+                        {
+                            s_vifDumped = true;
+                            logGifBufferDumpOnce("vif-chain", chainBuf.data(),
+                                                 static_cast<uint32_t>(chainBuf.size() / 16u));
+                        }
+                    }
+
 
                     if (!chainBuf.empty())
                     {
@@ -2222,6 +2430,14 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
         }
     }
 
+    // SUIKO(dma-chain-trace): this fast path consumes the chain before the
+    // generic walker, so note it when tracing (the over-declaration, if any,
+    // would then be inside the consumed payload, not the walk).
+    if (dmaChainTraceEnabled())
+    {
+        std::fprintf(stderr, "[dma-chain] GIF fast IMAGE consumed tadr=0x%08x imageQwc=%u\n", tadr, imageQwc);
+    }
+
     gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes);
 
     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
@@ -2311,6 +2527,12 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.gifConsume)
     {
         gsHooks.gifConsume(2u, payloadBytes / 16u);
+    }
+
+    // SUIKO(dma-chain-trace): note the fast-path consumption (see above).
+    if (dmaChainTraceEnabled())
+    {
+        std::fprintf(stderr, "[dma-chain] GIF fast PACKED consumed tadr=0x%08x qwc=%u\n", tadr, tag.qwc);
     }
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
