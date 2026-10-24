@@ -233,6 +233,10 @@ namespace ps2x::iop::detail
                 if (readSectors(a0, a1, a2))
                 {
                     signalCommandComplete();
+                    // Real CDVDSec sets the int pointed to by the optional
+                    // attr argument to 1 when the read completes.
+                    if (a3 != 0u)
+                        memory.write32(a3, 1u);
                     if (callback.address != 0u)
                     {
                         completionCallback = CompletionCallback{
