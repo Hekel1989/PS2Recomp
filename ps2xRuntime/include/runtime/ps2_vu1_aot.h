@@ -84,11 +84,17 @@ namespace suiko::vu1
         const uint32_t *entries = nullptr;
         uint32_t entryCount = 0;
         AotResult (*run)(VU1Interpreter &) = nullptr;
+        // The exact extent bytes the generator compiled.  The self-test uses
+        // this to run the compiled and interpreted paths from identical code
+        // without needing the ELF at test time.
+        const uint8_t *bytes = nullptr;
     };
 
     // FNV-1a 32-bit, the hash convention used by docs/vu1-inventory.md.
     uint32_t hash(const uint8_t *data, uint32_t size);
     void registerCompiledProgram(const CompiledProgram *program);
+    uint32_t compiledProgramCount();
+    const CompiledProgram *compiledProgram(uint32_t index);
 }
 
 // The generated registry defines this strongly; the runtime provides a weak

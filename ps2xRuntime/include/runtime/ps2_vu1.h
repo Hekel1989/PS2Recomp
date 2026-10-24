@@ -3,8 +3,16 @@
 
 #include "runtime/ps2_vu1_aot.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define SUIKO_VU1_INLINE inline __attribute__((always_inline))
+#else
+#define SUIKO_VU1_INLINE inline
+#endif
+
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -67,10 +75,28 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
+    // SUIKO(vu1-aot-v2): test seams (tests/vu1/vu1_aot_selftest.cpp).  Both
+    // are inert unless called: the game never disables AOT per interpreter and
+    // never captures packets outside the differential harness.
+    void setAotEnabled(bool enabled) { m_aotDisabled = !enabled; }
+    void setXgkickCapture(std::vector<std::vector<uint8_t>> *capture) { m_xgkickCapture = capture; }
+    void resetAotProgramCache() { m_aotProgramCacheValid = false; }
+    uint64_t lastRunPairs() const { return m_traceInsns; }
+
     // SUIKO(vu1-aot): narrow seam used by generated code.  The decoded pair
     // comes from the program's constexpr table; everything else stays private.
     suiko::vu1::AotResult aotStepPair(const suiko::vu1::DecodedPair &decoded);
     uint32_t aotPc() const { return m_state.pc; }
+
+    // SUIKO(vu1-aot-v2): one instantiation per microcode pair.  kPc and the
+    // decoded pair are compile-time constants so the compiler removes every
+    // branch and loop that the generic step routine would evaluate at run time.
+    template <uint32_t kPc, const suiko::vu1::DecodedPair &D>
+    suiko::vu1::AotResult aotStepConstant();
+    template <uint32_t kPc, const suiko::vu1::DecodedPair &D>
+    uint64_t pairReadyCycleConstant() const;
+    template <const suiko::vu1::DecodedPair &D>
+    void markPairWritesConstant();
 
 private:
     using Pipeline = suiko::vu1::Pipeline;
@@ -201,6 +227,17 @@ private:
     // can then return without scanning every array on the cycles where nothing
     // becomes visible.
     uint64_t m_nextCommitCycle = UINT64_MAX;
+    // SUIKO(vu1-aot-v2): earliest ready cycle per pipeline type.  commit only
+    // walks a type whose entries can be visible this cycle; the others are one
+    // compare.  The exhaustive scan used to visit every pending entry just to
+    // recompute the global minimum.
+    uint64_t m_nextFlagCycle = UINT64_MAX;
+    uint64_t m_nextFdivCycle = UINT64_MAX;
+    uint64_t m_nextEfuCycle = UINT64_MAX;
+    uint64_t m_nextStoreCycle = UINT64_MAX;
+    uint64_t m_nextVfCycle = UINT64_MAX;
+    uint64_t m_nextViCycle = UINT64_MAX;
+    uint64_t m_nextAccCycle = UINT64_MAX;
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
     int32_t m_viBranchBackupValue = 0;
@@ -249,15 +286,41 @@ private:
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
+    template <uint32_t U> void execUpperConstant();
+    template <uint32_t U, uint32_t Op, bool WriteAcc, bool CrossNoAcc>
+    void execUpperArith();
+    template <uint32_t U, uint32_t Special> void execUpperSpecial();
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+    template <uint32_t kPc, uint32_t L>
+    void execLowerConstant(uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
+                           uint32_t upperInstr);
+
+    // SUIKO(vu1-aot-v2): kRuntimeUpper selects the interpreter's runtime
+    // instruction word; any other value is the generated pair's compile-time
+    // upper word, which lets the compiler fold the opcode switches (and the
+    // dead branches of the exact-result machinery) out of every pair.
+    static constexpr uint32_t kRuntimeUpper = 0xFFFFFFFFu;
+    template <uint32_t U>
+    uint32_t upperWord() const
+    {
+        if constexpr (U == kRuntimeUpper)
+            return m_currentUpperInstruction;
+        else
+            return U;
+    }
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
+    template <uint32_t U = kRuntimeUpper>
     void applyFmacDest(float *dst, float *result, uint8_t dest);
+    template <uint32_t U = kRuntimeUpper>
     void applyFmacDestAcc(float *result, uint8_t dest);
+    template <uint32_t U = kRuntimeUpper>
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
+    template <uint32_t U = kRuntimeUpper>
     bool calculateFmacExactResult(uint32_t component, long double &result) const;
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+    template <uint32_t U = kRuntimeUpper>
     uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
@@ -273,8 +336,18 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    SUIKO_VU1_INLINE void advanceOneCycle()
+    {
+        ++m_cycle;
+        m_state.cycles = m_cycle;
+        // LSU commits become visible at the cycle boundary before PATH1
+        // consumes its next qword from VU memory.
+        if (m_nextCommitCycle <= m_cycle)
+            commitReadyPipelines();
+        if (m_xgkick.active)
+            progressXgkick();
+    }
     void commitReadyPipelinesReference();
-    void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void runDifferential(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
@@ -293,6 +366,11 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
+    static constexpr uint8_t lane(uint32_t component)
+    {
+        return static_cast<uint8_t>(1u << (3u - component));
+    }
+
     // flush-to-zero/one operand conversion; hot enough (every VF read and
     // FMAC exact-result lane) that it lives in the header for inlining.
     float normalizeOperand(float value) const
@@ -308,11 +386,16 @@ private:
         return value;
     }
     float normalizeResult(float value, uint32_t &laneFlags) const;
-    uint32_t microAddressMask() const;
+    uint32_t microAddressMask() const { return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu; }
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
     float broadcast(const float *vf, uint8_t bc);
 };
+
+#include "runtime/ps2_vu1_pipe_inl.h"
+#include "runtime/ps2_vu1_upper_inl.h"
+#include "runtime/ps2_vu1_lower_inl.h"
+#include "runtime/ps2_vu1_aot_step.inl"
 
 #endif
