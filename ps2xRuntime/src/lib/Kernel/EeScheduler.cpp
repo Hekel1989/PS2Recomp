@@ -1161,6 +1161,12 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
     invocation.sequence = ++m_invocationSequence;
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] inv-queue kind=" << static_cast<int>(invocation.kind)
+                  << " pc=0x" << std::hex << invocation.context.pc
+                  << " a0=0x" << getRegU32(&invocation.context, 4) << std::dec << std::endl;
+    }
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
 }
@@ -1277,6 +1283,11 @@ int EeScheduler::addIrqHandler(bool dmac,
                                   sp,
                                   true,
                                   append ? ++tail : --head});
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] addIrq dmac=" << (dmac ? 1 : 0) << " cause=" << cause
+                  << " handler=0x" << std::hex << handler << std::dec << " id=" << id << std::endl;
+    }
     return id;
 }
 
@@ -1326,6 +1337,11 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] irq-fire dmac=" << (dmac ? 1 : 0) << " cause=" << cause
+                  << " mask=0x" << std::hex << mask << std::dec << std::endl;
+    }
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
         return;
@@ -1343,6 +1359,11 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    if (schedTraceEnabled() && !matching.empty())
+    {
+        std::cerr << "[ee-sched] dispatchIrq dmac=" << (dmac ? 1 : 0) << " cause=" << cause
+                  << " handlers=" << matching.size() << std::endl;
+    }
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};

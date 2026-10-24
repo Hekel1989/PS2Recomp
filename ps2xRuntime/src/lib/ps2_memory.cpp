@@ -1124,6 +1124,13 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    static const bool s_traceIntc = std::getenv("PS2X_EE_SCHED") != nullptr;
+    if (s_traceIntc &&
+        ((address >= 0x1000E010u && address <= 0x1000E020u) ||
+         (address >= 0x1000F000u && address <= 0x1000F010u)))
+    {
+        std::cerr << "[intc-mmio] write 0x" << std::hex << address << " = 0x" << value << std::dec << std::endl;
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

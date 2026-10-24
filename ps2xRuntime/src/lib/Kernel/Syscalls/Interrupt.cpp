@@ -18,6 +18,14 @@ namespace ps2_syscalls
                              bool dmac,
                              bool enabled)
         {
+            static const bool s_trace = std::getenv("PS2X_EE_SCHED") != nullptr;
+            if (s_trace)
+            {
+                std::cerr << "[ee-sched] setIrqCause dmac=" << (dmac ? 1 : 0)
+                          << " cause=" << getRegU32(ctx, 4)
+                          << " enabled=" << (enabled ? 1 : 0)
+                          << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+            }
             setReturnS32(ctx,
                          scheduler(rdram, ctx, runtime)
                              .setIrqCauseEnabled(dmac, getRegU32(ctx, 4), enabled));
@@ -57,6 +65,13 @@ namespace ps2_syscalls
                                bool dmac,
                                bool enabled)
         {
+            static const bool s_trace = std::getenv("PS2X_EE_SCHED") != nullptr;
+            if (s_trace)
+            {
+                std::cerr << "[ee-sched] setIrqEnabled dmac=" << (dmac ? 1 : 0)
+                          << " id=" << static_cast<int>(getRegU32(ctx, 5))
+                          << " enabled=" << (enabled ? 1 : 0) << std::endl;
+            }
             setReturnS32(ctx,
                          scheduler(rdram, ctx, runtime)
                              .setIrqHandlerEnabled(dmac,

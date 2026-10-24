@@ -1351,6 +1351,13 @@ namespace
         const uint32_t payloadArg = getRegU32(ctx, 5);
         const uint32_t countArg = getRegU32(ctx, 6);
         const uint32_t channelBase = resolveDmaChannelBase(rdram, chanArg);
+        static const bool s_trace = std::getenv("PS2X_EE_SCHED") != nullptr;
+        if (s_trace)
+        {
+            std::cerr << "[dma-send] chanArg=0x" << std::hex << chanArg << " payload=0x" << payloadArg
+                      << " count=0x" << countArg << " base=0x" << channelBase
+                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
         if (channelBase == 0)
         {
             return -1;
