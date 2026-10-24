@@ -98,6 +98,8 @@ namespace ps2x::iop::detail
         {
             m_ram[phys] = value;
             markOwned(phys, sizeof(value));
+            if (m_watchCallback && phys >= m_watchLow && phys < m_watchHigh)
+                m_watchCallback(phys, value, 1u);
             return;
         }
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
@@ -119,6 +121,8 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            if (m_watchCallback && phys >= m_watchLow && phys < m_watchHigh)
+                m_watchCallback(phys, value, 2u);
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -132,6 +136,8 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            if (m_watchCallback && phys >= m_watchLow && phys < m_watchHigh)
+                m_watchCallback(phys, value, 4u);
             return;
         }
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
@@ -169,6 +175,8 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, source, size);
             markOwned(phys, size);
+            if (m_watchCallback && phys + size > m_watchLow && phys < m_watchHigh)
+                m_watchCallback(phys, 0u, static_cast<uint32_t>(size));
         }
         return true;
     }
@@ -182,6 +190,8 @@ namespace ps2x::iop::detail
         {
             std::memset(m_ram.data() + phys, 0, size);
             markOwned(phys, size);
+            if (m_watchCallback && phys + size > m_watchLow && phys < m_watchHigh)
+                m_watchCallback(phys, 0u, static_cast<uint32_t>(size));
         }
         return true;
     }

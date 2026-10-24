@@ -18,11 +18,18 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <sstream>
+#include <string>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -116,6 +123,32 @@ namespace ps2x::iop::detail
         void reset()
         {
             memory.reset();
+            if (const char *watch = std::getenv("PS2X_IOP_WATCH"); watch != nullptr)
+            {
+                uint32_t watchLo = 0u;
+                uint32_t watchHi = 0u;
+                if (std::sscanf(watch, "%x:%x", &watchLo, &watchHi) == 2)
+                {
+                    unsigned watchBudget = 80u;
+                    memory.setWriteWatch(
+                        watchLo, watchHi,
+                        [this, watchBudget](uint32_t addr, uint32_t value, uint32_t size) mutable
+                        {
+                            if (size <= 8u && value != 0u)
+                                return;
+                            if (watchBudget == 0u)
+                                return;
+                            --watchBudget;
+                            std::ostringstream out;
+                            out << "[IOP] watch write 0x" << std::hex
+                                << std::setw(8) << std::setfill('0') << addr
+                                << " = 0x" << value << " size=0x" << size;
+                            if (activeCpu != nullptr)
+                                out << " pc=0x" << activeCpu->pc << " ra=0x" << activeCpu->gpr[31];
+                            log(LogLevel::Info, out.str());
+                        });
+                }
+            }
             kernel.reset();
             modules.clear();
             imports.reset();
@@ -130,6 +163,9 @@ namespace ps2x::iop::detail
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
             totalInstructions = 0;
+            branchTraceNext = 0u;
+            branchTraceFilled = 0u;
+            firstRunLogged.clear();
             eeCycleCarry = 0;
             activeCpu = nullptr;
             lastError.clear();
@@ -268,9 +304,27 @@ namespace ps2x::iop::detail
 
             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
             {
-                return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                const uint32_t descriptor = cpu.gpr[4];
+                const bool handled =
+                    kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles);
+                if (handled && (call.ordinal == 4u || call.ordinal == 6u || call.ordinal == 7u))
+                {
+                    std::ostringstream out;
+                    if (call.ordinal == 4u)
+                    {
+                        out << "[IOP] CreateThread id=" << std::dec << cpu.gpr[2]
+                            << " entry=0x" << std::hex << read32(descriptor + 8u)
+                            << " stack=0x" << read32(descriptor + 12u)
+                            << " prio=0x" << read32(descriptor + 16u);
+                    }
+                    else
+                    {
+                        out << "[IOP] StartThread id=" << std::dec << descriptor;
+                    }
+                    log(LogLevel::Info, out.str());
+                }
+                return handled ? ImportDisposition::Handled
+                               : ImportDisposition::Missing;
             }
             if (iequals(call.library, "thsemap"))
             {
@@ -358,6 +412,14 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        void recordBranch(uint32_t from, uint32_t to)
+        {
+            branchTrace[branchTraceNext] = {from, to};
+            branchTraceNext = (branchTraceNext + 1u) % kBranchTraceCapacity;
+            if (branchTraceFilled < kBranchTraceCapacity)
+                ++branchTraceFilled;
+        }
+
         bool step(CpuState &cpu)
         {
             if (cpu.stopped)
@@ -370,8 +432,75 @@ namespace ps2x::iop::detail
             if (physicalAddress(cpu.pc) >= kRamSize)
             {
                 std::ostringstream out;
-                out << "[IOP] execution outside RAM pc=0x" << std::hex << cpu.pc;
+                out << "[IOP] execution outside RAM pc=0x" << std::hex << cpu.pc
+                    << " ra=0x" << cpu.gpr[31]
+                    << " sp=0x" << cpu.gpr[29]
+                    << " gp=0x" << cpu.gpr[28];
+                const uint32_t raPhys = physicalAddress(cpu.gpr[31]);
+                for (const auto &[moduleId, module] : modules)
+                {
+                    if (raPhys >= module.base && raPhys < module.base + module.size)
+                    {
+                        out << " caller=" << module.name
+                            << "+0x" << (raPhys - module.base);
+                        break;
+                    }
+                }
+                if (IopThread *thread = kernel.currentThread();
+                    thread != nullptr && &thread->cpu == &cpu)
+                {
+                    out << " thread=" << std::dec << thread->id
+                        << " entry=0x" << std::hex << thread->entry
+                        << " stack=0x" << thread->stackBase
+                        << "+0x" << thread->stackSize;
+                }
                 log(LogLevel::Error, out.str());
+                const auto dumpRange = [&](uint32_t start, uint32_t end)
+                {
+                    const uint32_t from = physicalAddress(start) & ~0xFu;
+                    const uint32_t to = physicalAddress(end);
+                    for (uint32_t line = from; line + 16u <= to; line += 16u)
+                    {
+                        std::ostringstream row;
+                        row << "[IOP]   mem 0x" << std::hex << std::setw(8)
+                            << std::setfill('0') << line << ": ";
+                        for (uint32_t i = 0u; i < 16u; ++i)
+                        {
+                            row << std::hex << std::setw(2) << std::setfill('0')
+                                << static_cast<uint32_t>(read8(line + i)) << ' ';
+                        }
+                        log(LogLevel::Error, row.str());
+                    }
+                };
+                dumpRange(cpu.gpr[29] - 64u, cpu.gpr[29] + 256u);
+                if (IopThread *thread = kernel.currentThread();
+                    thread != nullptr && &thread->cpu == &cpu)
+                {
+                    dumpRange(thread->stackBase, thread->stackBase + thread->stackSize);
+                }
+                for (size_t i = 0; i < branchTraceFilled; ++i)
+                {
+                    const BranchTraceEntry &entry =
+                        branchTrace[(branchTraceNext + i) % kBranchTraceCapacity];
+                    std::ostringstream line;
+                    line << "[IOP]   branch 0x" << std::hex << entry.from
+                         << " -> 0x" << entry.to;
+                    log(LogLevel::Error, line.str());
+                }
+                if (const char *dumpPrefix = std::getenv("PS2X_IOP_RAM_DUMP");
+                    dumpPrefix != nullptr)
+                {
+                    static unsigned dumpCount = 0u;
+                    const std::string file = std::string(dumpPrefix) +
+                                             std::to_string(dumpCount++) + ".bin";
+                    std::ofstream out(file, std::ios::binary);
+                    const auto ram = memory.ram();
+                    out.write(reinterpret_cast<const char *>(ram.data()),
+                              static_cast<std::streamsize>(ram.size()));
+                    std::ostringstream note;
+                    note << "[IOP]   ram dump -> " << file;
+                    log(LogLevel::Error, note.str());
+                }
                 cpu.stopped = true;
                 return false;
             }
@@ -380,17 +509,24 @@ namespace ps2x::iop::detail
 
             if (const auto import = imports.decode(cpu.pc))
             {
+                const uint32_t importPc = cpu.pc;
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
                 ++totalCycles;
                 if (disposition == ImportDisposition::JumpToGuest)
+                {
+                    recordBranch(importPc, cpu.pc);
                     return true;
+                }
                 cpu.pc = cpu.gpr[31];
                 cpu.branchPending = false;
                 return !cpu.stopped;
             }
 
+            const uint32_t previousPc = cpu.pc;
             const bool running = cpuCore.executeInstruction(cpu);
+            if (cpu.pc != previousPc + 4u)
+                recordBranch(previousPc, cpu.pc);
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
@@ -431,6 +567,18 @@ namespace ps2x::iop::detail
 
             const uint32_t depth = callDepth++;
             const CallDepthGuard depthGuard{callDepth};
+            {
+                static uint32_t s_callFunctionLogCount = 0u;
+                if (s_callFunctionLogCount < 256u)
+                {
+                    ++s_callFunctionLogCount;
+                    std::ostringstream out;
+                    out << "[IOP] callFunction addr=0x" << std::hex << address
+                        << " a0=0x" << a0 << " a1=0x" << a1
+                        << " gp=0x" << gp << " depth=" << std::dec << depth;
+                    log(LogLevel::Info, out.str());
+                }
+            }
             CpuState cpu{};
             cpu.pc = address;
             cpu.gpr[4] = a0;
@@ -564,6 +712,16 @@ namespace ps2x::iop::detail
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
+                    if (next != nullptr &&
+                        firstRunLogged.insert(next->id).second)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP] thread " << std::dec << next->id << " first-run pc=0x"
+                            << std::hex << next->cpu.pc << " sp=0x" << next->cpu.gpr[29]
+                            << " gp=0x" << next->cpu.gpr[28]
+                            << " ra=0x" << next->cpu.gpr[31];
+                        log(LogLevel::Info, out.str());
+                    }
                     if (!next)
                     {
                         uint64_t nextWake = kernel.nextWakeCycle(target);
@@ -697,6 +855,19 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+
+        // Ring buffer of taken branches (delay-slot pc -> target), dumped when
+        // execution leaves RAM so the path into the bad jump is visible.
+        struct BranchTraceEntry
+        {
+            uint32_t from = 0;
+            uint32_t to = 0;
+        };
+        static constexpr size_t kBranchTraceCapacity = 64u;
+        std::array<BranchTraceEntry, kBranchTraceCapacity> branchTrace{};
+        size_t branchTraceNext = 0u;
+        size_t branchTraceFilled = 0u;
+        std::set<int> firstRunLogged;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;

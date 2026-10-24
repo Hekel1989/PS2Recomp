@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -70,6 +71,16 @@ namespace ps2x::iop::detail
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
+        // Diagnostic write watchpoint over physical RAM: invokes the callback with
+        // the physical address, stored value, and access size for every write into
+        // [low, high).
+        void setWriteWatch(uint32_t low, uint32_t high, std::function<void(uint32_t, uint32_t, uint32_t)> callback)
+        {
+            m_watchLow = low;
+            m_watchHigh = high;
+            m_watchCallback = std::move(callback);
+        }
+
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
     private:
@@ -87,5 +98,8 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        std::function<void(uint32_t, uint32_t, uint32_t)> m_watchCallback;
+        uint32_t m_watchLow = 0;
+        uint32_t m_watchHigh = 0;
     };
 }
