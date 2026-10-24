@@ -625,18 +625,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.ofst = imm & 0x3FFu;
             vif1_regs.tops = vif1_regs.base & 0x3FFu;
             vif1_regs.stat &= ~(1u << 7); // clear DBF
+            if (vu1TraceEnabled())
+                std::fprintf(stderr, "[vu1:vif] OFFSET imm=0x%x base=0x%x tops=0x%x\n",
+                             imm, vif1_regs.base, vif1_regs.tops);
             continue;
         }
         else if (opcode == VIF_BASE)
         {
             // BASE only updates the base register. TOPS changes on OFFSET/MSCAL.
             vif1_regs.base = imm & 0x3FFu;
+            if (vu1TraceEnabled())
+                std::fprintf(stderr, "[vu1:vif] BASE imm=0x%x tops=0x%x ofst=0x%x\n",
+                             imm, vif1_regs.tops, vif1_regs.ofst);
             continue;
         }
         else if (opcode == VIF_ITOP)
         {
             // ITOP VIFcode writes pending ITOPS; VU XITOP observes it after MSCAL/MSCNT.
             vif1_regs.itops = imm & 0x3FFu;
+            if (vu1TraceEnabled())
+                std::fprintf(stderr, "[vu1:vif] ITOP imm=0x%x itops=0x%x\n", imm, vif1_regs.itops);
             continue;
         }
         else if (opcode == VIF_STMOD)
@@ -681,8 +689,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (vu1TraceEnabled())
             {
-                std::fprintf(stderr, "[vu1:vif] %s start=0x%x top=0x%x itop=0x%x\n",
-                             opcode == VIF_MSCALF ? "MSCALF" : "MSCAL", startPC, runTop, runItop);
+                std::fprintf(stderr, "[vu1:vif] %s start=0x%x top=0x%x itop=0x%x vsync=%llu\n",
+                             opcode == VIF_MSCALF ? "MSCALF" : "MSCAL", startPC, runTop, runItop,
+                             static_cast<unsigned long long>(gs().vsyncTick.load(std::memory_order_relaxed)));
             }
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
@@ -899,9 +908,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            if (vu1TraceEnabled())
             {
-                const uint8_t *srcBase = data + pos;
+                const bool willWrite = (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes);
+                char srcHex[33] = {};
+                const uint32_t srcDump = std::min<uint32_t>(totalBytes, 16u);
+                if (pos + srcDump <= sizeBytes)
+                {
+                    for (uint32_t i = 0; i < srcDump; ++i)
+                        std::snprintf(srcHex + i * 2, 3, "%02x", data[pos + i]);
+                }
+                std::fprintf(stderr,
+                             "[vu1:vif] UNPACK op=0x%02x vn=%u vl=%u num=%u imm=0x%04x flg=%d usn=%d addr=0x%x tops=0x%x bytes=%u write=%d src=%s\n",
+                             opcode, static_cast<unsigned>(vn), static_cast<unsigned>(vl), num, imm,
+                             (imm & 0x8000u) ? 1 : 0, (imm & 0x4000u) ? 1 : 0, vuAddr,
+                             vif1_regs.tops & 0x3FFu, totalBytes, willWrite ? 1 : 0, srcHex);
+            }
+
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            {                const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
                 {
