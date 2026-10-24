@@ -209,6 +209,62 @@ namespace
         return enabled;
     }
 
+    // Diagnostic: PS2X_EE_VBLANK_TRACE=<start>[,<count>] prints one line per
+    // VBlank with the host wall/CPU time the interval took, the VU1 fence wait
+    // before the present, the present call itself and the emulated clock.  A
+    // frame that misses its VBlank shows up as a wall interval of two periods
+    // (or a long before/present time) at the vsync where no new picture
+    // appeared.  Optional PS2X_EE_VBLANK_WATCH=<hexaddr>[,<hexaddr>...] appends
+    // the guest u32 at each address (for the game's own frame counter/target).
+    // Off by default; the clock reads only happen while tracing.
+    struct VBlankTraceConfig
+    {
+        bool enabled = false;
+        uint64_t start = 0u;
+        uint64_t count = 0u;
+        std::vector<uint32_t> watch;
+    };
+
+    const VBlankTraceConfig &vblankTraceConfig()
+    {
+        static const VBlankTraceConfig config = [] {
+            VBlankTraceConfig parsed;
+            const char *env = std::getenv("PS2X_EE_VBLANK_TRACE");
+            if (env == nullptr || env[0] == '\0' || env[0] == '0')
+                return parsed;
+            char *end = nullptr;
+            parsed.start = std::strtoull(env, &end, 10);
+            parsed.count = 600u;
+            if (end != nullptr && *end == ',')
+                parsed.count = std::strtoull(end + 1, nullptr, 10);
+            parsed.enabled = parsed.count != 0u;
+
+            const char *watch = std::getenv("PS2X_EE_VBLANK_WATCH");
+            if (watch != nullptr)
+            {
+                const char *p = watch;
+                while (*p != '\0')
+                {
+                    while (*p == ',' || *p == ' ' || *p == '\t')
+                        ++p;
+                    if (*p == '\0')
+                        break;
+                    char *watchEnd = nullptr;
+                    const unsigned long long address = std::strtoull(p, &watchEnd, 16);
+                    if (watchEnd == p)
+                    {
+                        ++p;
+                        continue;
+                    }
+                    parsed.watch.push_back(static_cast<uint32_t>(address) & 0x01FFFFFFu);
+                    p = (*watchEnd == ',') ? watchEnd + 1 : watchEnd;
+                }
+            }
+            return parsed;
+        }();
+        return config;
+    }
+
     // Diagnostic: PS2X_EE_SWITCH_STATS=1 counts dispatcher transfers by reason
     // and measures how long the throw-to-catch unwind takes.  Used to decide
     // whether a fiber switch is worth implementing; no clock is read when unset.
@@ -2892,6 +2948,14 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
     {
+        const VBlankTraceConfig &vblankTrace = vblankTraceConfig();
+        const uint64_t traceTick = m_vsyncTick + 1u;
+        const bool traceThisVblank = vblankTrace.enabled && traceTick >= vblankTrace.start &&
+                                     traceTick < vblankTrace.start + vblankTrace.count;
+        const uint64_t traceWallStart = traceThisVblank ? steadyNowNs() : 0u;
+        const uint64_t traceCpuStart = traceThisVblank ? threadCpuNowNs() : 0u;
+        const uint64_t tracePaceStart = traceThisVblank ? m_paceAdvanceNs : 0u;
+        const uint64_t traceBeforeStart = traceWallStart;
         // The frame presented below must contain every VIF1/VU1 kick queued
         // before this VBlank (docs/vu1-thread.md).  With a register-carrying
         // vsync hook the present is queued behind that work instead of
@@ -2905,6 +2969,8 @@ void EeScheduler::processEvent(const EeEvent &event)
             else
                 vu1Thread->sync(ps2x::Vu1SyncReason::VBlank);
         }
+        const uint64_t traceBeforeUs =
+            traceThisVblank ? (steadyNowNs() - traceBeforeStart) / 1000u : 0u;
         ++m_vsyncTick;
         {
             // PS2X_EE_BURN=<us>@<vsync>: from that vsync on, spend <us> of extra
@@ -2941,6 +3007,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         // PS2X(gs-phase4): tick the optional external GS backend (no-op unless
         // the host registered hooks; see runtime/ps2_gs_host_hooks.h).
+        const uint64_t tracePresentStart = traceThisVblank ? steadyNowNs() : 0u;
         if (vblankHooks.vsyncRegs)
         {
             const auto regs = ps2x::Vu1Thread::captureVsyncRegs(m_runtime.memory().gs());
@@ -2953,6 +3020,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         {
             vblankHooks.vsync(m_vsyncTick);
         }
+        const uint64_t tracePresentUs =
+            traceThisVblank ? (steadyNowNs() - tracePresentStart) / 1000u : 0u;
         if (ps2x::diag::gsSyncEnabled())
             ps2x::diag::gsEvent(m_vsyncTick, "present");
         if (ps2x::Vu1Thread *vu1Thread = m_runtime.memory().vu1Thread())
@@ -2981,6 +3050,49 @@ void EeScheduler::processEvent(const EeEvent &event)
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
+        if (traceThisVblank)
+        {
+            static uint64_t lastWallNs = 0u;
+            static uint64_t lastCpuNs = 0u;
+            static uint64_t lastCycle = 0u;
+            static uint64_t lastPaceNs = 0u;
+            const uint64_t endWallNs = steadyNowNs();
+            const uint64_t endCpuNs = threadCpuNowNs();
+            const uint64_t wallUs = lastWallNs != 0u ? (traceWallStart - lastWallNs) / 1000u : 0u;
+            const uint64_t cpuUs = lastWallNs != 0u ? (traceCpuStart - lastCpuNs) / 1000u : 0u;
+            const uint64_t offCpuUs = wallUs > cpuUs ? wallUs - cpuUs : 0u;
+            std::fprintf(stderr,
+                         "[vblank-trace] vsync=%llu wall_us=%llu cpu_us=%llu offcpu_us=%llu"
+                         " ee=%llu dcycle=%llu before_us=%llu present_us=%llu total_us=%llu"
+                         " pace_us=%llu debt_us=%llu",
+                         static_cast<unsigned long long>(traceTick),
+                         static_cast<unsigned long long>(wallUs),
+                         static_cast<unsigned long long>(cpuUs),
+                         static_cast<unsigned long long>(offCpuUs),
+                         static_cast<unsigned long long>(m_eeCycle),
+                         static_cast<unsigned long long>(lastWallNs != 0u ? m_eeCycle - lastCycle : 0u),
+                         static_cast<unsigned long long>(traceBeforeUs),
+                         static_cast<unsigned long long>(tracePresentUs),
+                         static_cast<unsigned long long>((endWallNs - traceWallStart) / 1000u),
+                         static_cast<unsigned long long>(
+                             lastWallNs != 0u ? (m_paceAdvanceNs - lastPaceNs) / 1000u : 0u),
+                         static_cast<unsigned long long>(m_paceDebtNs / 1000u));
+            const GuestThread *vblankRunning = currentThread();
+            std::fprintf(stderr, " pc=0x%x",
+                         vblankRunning != nullptr ? vblankRunning->activeContext().pc : 0u);
+            for (const uint32_t address : vblankTrace.watch)
+            {
+                uint32_t value = 0u;
+                if (m_rdram != nullptr && address + sizeof(value) <= PS2_RAM_SIZE)
+                    std::memcpy(&value, m_rdram + address, sizeof(value));
+                std::fprintf(stderr, " w%06x=%u", address, value);
+            }
+            std::fprintf(stderr, "\n");
+            lastWallNs = traceWallStart;
+            lastCpuNs = traceCpuStart;
+            lastCycle = m_eeCycle;
+            lastPaceNs = tracePaceStart;
+        }
         break;
     }
     case EeEventType::ExternalWake:
