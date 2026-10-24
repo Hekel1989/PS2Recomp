@@ -130,14 +130,19 @@ namespace ps2x::iop::detail
                 if (std::sscanf(watch, "%x:%x", &watchLo, &watchHi) == 2)
                 {
                     unsigned watchBudget = 80u;
+                    if (const char *wb = std::getenv("PS2X_IOP_WATCH_BUDGET"); wb != nullptr)
+                        watchBudget = static_cast<unsigned>(std::atol(wb));
                     memory.setWriteWatch(
                         watchLo, watchHi,
                         [this, watchBudget](uint32_t addr, uint32_t value, uint32_t size) mutable
-                        {
-                            if (size <= 8u && value != 0u)
-                                return;
-                            if (watchBudget == 0u)
-                                return;
+                            {
+                                if (const char *all = std::getenv("PS2X_IOP_WATCH_ALL"); all == nullptr)
+                                {
+                                    if (size <= 8u && value != 0u)
+                                        return;
+                                }
+                                if (watchBudget == 0u)
+                                    return;
                             --watchBudget;
                             std::ostringstream out;
                             out << "[IOP] watch write 0x" << std::hex
@@ -145,6 +150,44 @@ namespace ps2x::iop::detail
                                 << " = 0x" << value << " size=0x" << size;
                             if (activeCpu != nullptr)
                                 out << " pc=0x" << activeCpu->pc << " ra=0x" << activeCpu->gpr[31];
+                            log(LogLevel::Info, out.str());
+                        });
+                }
+            }
+            if (const char *hw = std::getenv("PS2X_IOP_HWREAD_TRACE"); hw != nullptr)
+            {
+                uint32_t hwLo = 0u;
+                uint32_t hwHi = 0u;
+                if (std::sscanf(hw, "%x-%x", &hwLo, &hwHi) == 2)
+                {
+                    memory.setReadWatch(
+                        hwLo, hwHi,
+                        [this](uint32_t addr, uint32_t value)
+                        {
+                            static const long budget = []
+                            {
+                                if (const char *b = std::getenv("PS2X_IOP_TRACEBUDGET"); b != nullptr)
+                                    return std::atol(b);
+                                return 4000L;
+                            }();
+                            static const uint64_t after = []
+                            {
+                                if (const char *a = std::getenv("PS2X_IOP_TRACEAFTER"); a != nullptr)
+                                    return std::strtoull(a, nullptr, 0);
+                                return 0ULL;
+                            }();
+                            static long budget2 = budget;
+                            if (totalCycles < after || budget2 == 0)
+                                return;
+                            if (budget2 > 0)
+                                --budget2;
+                            std::ostringstream out;
+                            out << "[IOP] hwread 0x" << std::hex << addr << " val=0x" << value;
+                            if (const IopThread *thread = kernel.currentThread(); thread != nullptr)
+                                out << " tpc=0x" << thread->cpu.pc << " tra=0x" << thread->cpu.gpr[31]
+                                    << " tid=" << std::dec << thread->id;
+                            if (activeCpu != nullptr)
+                                out << " apc=0x" << activeCpu->pc;
                             log(LogLevel::Info, out.str());
                         });
                 }
@@ -166,6 +209,7 @@ namespace ps2x::iop::detail
             branchTraceFilled = 0u;
             firstRunLogged.clear();
             eeCycleCarry = 0;
+            lastIdleDumpCycle = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -212,7 +256,15 @@ namespace ps2x::iop::detail
         void schedulePendingDma()
         {
             if (const auto dma = memory.takeDmaStart())
+            {
+                if (std::getenv("PS2X_IOP_DMAIRQ_TRACE") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP] dma-start irq=" << dma->irq << " delay=" << std::dec << dma->delayCycles;
+                    log(LogLevel::Info, out.str());
+                }
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+            }
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -413,6 +465,39 @@ namespace ps2x::iop::detail
 
         void recordBranch(uint32_t from, uint32_t to)
         {
+            static const char *s_range = std::getenv("PS2X_IOP_TRACERANGE");
+            if (s_range != nullptr)
+            {
+                static uint32_t lo = 0u, hi = 0u;
+                static long budget = -1;
+                static uint64_t after = 0u;
+                if (hi == 0u)
+                {
+                    unsigned h = 0u;
+                    if (std::sscanf(s_range, "%x-%x", &lo, &h) == 2)
+                        hi = h;
+                    else
+                    {
+                        lo = 0u;
+                        hi = 0u;
+                    }
+                    if (const char *b = std::getenv("PS2X_IOP_TRACEBUDGET"); b != nullptr)
+                        budget = std::atol(b);
+                    if (const char *a = std::getenv("PS2X_IOP_TRACEAFTER"); a != nullptr)
+                        after = std::strtoull(a, nullptr, 0);
+                }
+                if (hi != 0u && totalCycles >= after && to >= lo && to < hi && budget != 0)
+                {
+                    if (budget > 0)
+                        --budget;
+                    const IopThread *thread = kernel.currentThread();
+                    std::ostringstream out;
+                    out << "[IOP] branch tid=" << std::dec
+                        << (thread != nullptr ? thread->id : -1)
+                        << " 0x" << std::hex << from << " -> 0x" << to;
+                    log(LogLevel::Info, out.str());
+                }
+            }
             branchTrace[branchTraceNext] = {from, to};
             branchTraceNext = (branchTraceNext + 1u) % kBranchTraceCapacity;
             if (branchTraceFilled < kBranchTraceCapacity)
@@ -649,7 +734,15 @@ namespace ps2x::iop::detail
             try
             {
                 for (const int irq : completed)
+                {
+                    if (std::getenv("PS2X_IOP_DMAIRQ_TRACE") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP] dma-irq fire cause=" << std::dec << irq << " cycles=" << totalCycles;
+                        log(LogLevel::Info, out.str());
+                    }
                     (void)intrman.dispatchInterrupt(irq, *this);
+                }
             }
             catch (...)
             {
@@ -682,6 +775,13 @@ namespace ps2x::iop::detail
                 {
                     if (callback.function != 0u)
                     {
+                        if (std::getenv("PS2X_IOP_GUESTCB_TRACE") != nullptr)
+                        {
+                            std::ostringstream cbOut;
+                            cbOut << "[IOP] guest-callback fn=0x" << std::hex << callback.function
+                                  << " arg=0x" << callback.argument << " cycles=" << std::dec << totalCycles;
+                            log(LogLevel::Info, cbOut.str());
+                        }
                         (void)callFunction(callback.function,
                                            callback.argument,
                                            0u,
@@ -698,6 +798,77 @@ namespace ps2x::iop::detail
                 throw;
             }
             servicingGuestCallbacks = false;
+        }
+
+        void maybeDumpIdleThreads()
+        {
+            static const bool s_dump = std::getenv("PS2X_IOP_IDLE_DUMP") != nullptr;
+            if (!s_dump)
+                return;
+            if (totalCycles - lastIdleDumpCycle < 33000000ull)
+                return;
+            lastIdleDumpCycle = totalCycles;
+            std::ostringstream out;
+            out << "[IOP] idle thread-dump cycles=" << std::dec << totalCycles;
+            kernel.forEachThread([&](const IopThread &thread)
+                                 {
+                                     static constexpr const char *kStates[] = {
+                                         "Dormant", "Ready", "Running", "Sleep",
+                                         "Delay", "Semaphore", "EventFlag", "Suspended", "Dead",
+                                     };
+                                     const auto stateIndex = static_cast<size_t>(thread.state);
+                                     out << "\n  tid=" << thread.id
+                                         << " state=" << (stateIndex < 9u ? kStates[stateIndex] : "?")
+                                         << " prio=0x" << std::hex << thread.priority
+                                         << " pc=0x" << thread.cpu.pc
+                                         << " ra=0x" << thread.cpu.gpr[31]
+                                         << " sp=0x" << thread.cpu.gpr[29]
+                                         << " waitId=" << std::dec << thread.waitId
+                                         << " waitBits=0x" << std::hex << thread.waitBits
+                                         << " wake=0x" << thread.wakeCycle;
+                                     for (const auto &[moduleId, module] : modules)
+                                     {
+                                         if (thread.cpu.pc >= module.base && thread.cpu.pc < module.base + module.size)
+                                         {
+                                             out << " in=" << module.name << "+0x" << (thread.cpu.pc - module.base);
+                                             break;
+                                         }
+                                     } });
+            std::ostringstream intrOut;
+            intrOut << "[IOP] idle intc-handlers:";
+            intrman.forEachHandler([&](int irq, uint32_t function)
+                                   { intrOut << " cause=" << irq << "@0x" << std::hex << function; });
+            log(LogLevel::Info, intrOut.str());
+            log(LogLevel::Info, out.str());
+            if (const char *pokes = std::getenv("PS2X_IOP_POKE"); pokes != nullptr)
+            {
+                std::istringstream pin(pokes);
+                std::string pitem;
+                while (std::getline(pin, pitem, ','))
+                {
+                    uint32_t paddr = 0u;
+                    uint32_t pval = 0u;
+                    if (std::sscanf(pitem.c_str(), "%x:%x", &paddr, &pval) == 2)
+                        memory.write32(paddr, pval);
+                }
+            }
+            if (const char *ranges = std::getenv("PS2X_IOP_DUMP_RANGES"); ranges != nullptr)
+            {
+                std::istringstream in(ranges);
+                std::string item;
+                while (std::getline(in, item, ','))
+                {
+                    uint32_t start = 0u;
+                    unsigned len = 0u;
+                    if (std::sscanf(item.c_str(), "%x:%x", &start, &len) != 2 || len == 0u)
+                        continue;
+                    std::ostringstream memOut;
+                    memOut << "[IOP] idle mem 0x" << std::hex << start << " len=0x" << std::hex << len << ":";
+                    for (unsigned off = 0u; off < len; off += 4u)
+                        memOut << " " << std::setw(8) << std::setfill('0') << std::hex << memory.read32(start + off);
+                    log(LogLevel::Info, memOut.str());
+                }
+            }
         }
 
         void runCycles(uint64_t cycles) noexcept
@@ -723,6 +894,7 @@ namespace ps2x::iop::detail
                     }
                     if (!next)
                     {
+                        maybeDumpIdleThreads();
                         uint64_t nextWake = kernel.nextWakeCycle(target);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
@@ -869,6 +1041,7 @@ namespace ps2x::iop::detail
         std::set<int> firstRunLogged;
         uint32_t nextModuleId = 1;
         uint64_t totalCycles = 0;
+        uint64_t lastIdleDumpCycle = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;

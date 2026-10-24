@@ -23,6 +23,7 @@
 #include <array>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -432,6 +433,37 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastHeight = outHeight;
         s_hasUploadedFrame = true;
         return;
+    }
+
+    // Diagnostic: dump the composed presentation frame as a PPM image once,
+    // at presentation frame PS2X_DIAG_FB_DUMP (0 disables).
+    {
+        static uint64_t fbPresentCount = 0;
+        ++fbPresentCount;
+        static const uint64_t fbWant = [] {
+            const char *env = std::getenv("PS2X_DIAG_FB_DUMP");
+            return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+        }();
+        if (fbWant != 0ull && fbPresentCount >= fbWant && width != 0u && height != 0u)
+        {
+            static bool fbDumped = false;
+            if (!fbDumped)
+            {
+                fbDumped = true;
+                FILE *f = std::fopen("/tmp/opencode/frame.ppm", "wb");
+                if (f != nullptr)
+                {
+                    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
+                    for (size_t i = 0u; i + 3u < s_scratch.size(); i += 4u)
+                    {
+                        std::fwrite(&s_scratch[i], 1u, 3u, f);
+                    }
+                    std::fclose(f);
+                    RUNTIME_LOG("[diag:fbdump] wrote /tmp/opencode/frame.ppm "
+                                << width << "x" << height << std::endl);
+                }
+            }
+        }
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -2501,6 +2533,52 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        // Diagnostic: one-shot guest RAM dump for offline disassembly.
+        // PS2X_DIAG_EE_DUMP=<hexaddr>:<hexlen>[:<frame>] (default frame 600).
+        {
+            static uint64_t dumpFrame = 0;
+            ++dumpFrame;
+            static const struct EeDumpConfig
+            {
+                bool enabled;
+                uint32_t addr;
+                uint32_t len;
+                uint64_t frame;
+            } eeDump = [] {
+                EeDumpConfig config{false, 0u, 0u, 600u};
+                const char *env = std::getenv("PS2X_DIAG_EE_DUMP");
+                if (env != nullptr)
+                {
+                    char *end = nullptr;
+                    config.addr = static_cast<uint32_t>(std::strtoul(env, &end, 16));
+                    if (end != nullptr && *end == ':')
+                    {
+                        config.len = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+                        if (end != nullptr && *end == ':')
+                        {
+                            config.frame = std::strtoull(end + 1, nullptr, 10);
+                        }
+                        config.enabled = config.len != 0u;
+                    }
+                }
+                return config;
+            }();
+            static bool eeDumped = false;
+            if (eeDump.enabled && !eeDumped && dumpFrame >= eeDump.frame)
+            {
+                eeDumped = true;
+                const uint8_t *ram = m_memory.getRDRAM();
+                char path[128];
+                std::snprintf(path, sizeof(path), "/tmp/opencode/ee_%x.bin", eeDump.addr);
+                FILE *f = std::fopen(path, "wb");
+                if (f != nullptr)
+                {
+                    std::fwrite(ram + eeDump.addr, 1u, eeDump.len, f);
+                    std::fclose(f);
+                    RUNTIME_LOG("[diag:eedump] wrote " << path << " frame=" << dumpFrame << std::endl);
+                }
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)

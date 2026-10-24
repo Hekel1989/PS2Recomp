@@ -69,6 +69,13 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
 
+        template <typename Fn>
+        void forEachThread(Fn &&fn) const
+        {
+            for (const auto &[id, thread] : m_threads)
+                fn(thread);
+        }
+
     private:
         struct Semaphore
         {

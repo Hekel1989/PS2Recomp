@@ -227,6 +227,8 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if (m_readCallback && address >= m_readLow && address < m_readHigh)
+            m_readCallback(address, m_hardware.count(address) ? m_hardware.at(address) : 0u);
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;

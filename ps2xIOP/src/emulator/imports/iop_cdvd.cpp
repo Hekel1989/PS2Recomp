@@ -211,6 +211,7 @@ namespace ps2x::iop::detail
             const uint32_t a0 = cpu.gpr[4];
             const uint32_t a1 = cpu.gpr[5];
             const uint32_t a2 = cpu.gpr[6];
+            const uint32_t a3 = cpu.gpr[7];
 
             switch (ordinal)
             {
@@ -919,7 +920,8 @@ namespace ps2x::iop::detail
             auto it = kNames.find(ordinal);
             std::cerr << "[iop-cdvd] " << (it != kNames.end() ? it->second : "Unknown")
                       << "(" << std::dec << ordinal << ") a0=0x" << std::hex << cpu.gpr[4]
-                      << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6] << std::endl;
+                      << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
+                      << " a3=0x" << cpu.gpr[7] << " pc=0x" << cpu.pc << std::endl;
         }
         const bool handled = m_impl->dispatchImport(ordinal, cpu);
         if (s_trace)

@@ -38,6 +38,8 @@ namespace ps2_syscalls
                           << " num=0x" << event.rpcNum
                           << " mode=0x" << event.mode
                           << " flags=0x" << event.flags
+                          << " pc=0x" << event.pc << " ra=0x" << event.ra
+                          << " tid=0x" << event.threadId
                           << " send=0x" << event.sendBuf << "/0x" << event.sendSize
                           << " recv=0x" << event.recvBuf << "/0x" << event.recvSize
                           << " recvData=" << formatRpcTraceBytes(event.recvPreview, event.recvPreviewSize)
@@ -608,9 +610,32 @@ namespace ps2_syscalls
 
             if (receiveBuffer != 0u && receiveSize != 0u)
             {
+                // DIAG: hexdump request/response for the CRI stream server (sid 0x30).
+                if (std::getenv("PS2X_DIAG_RPC30_DUMP") != nullptr && sid == 0x30u)
+                {
+                    const uint8_t *resp = getMemPtr(rdram, receiveBuffer);
+                    const uint8_t *req = sendBuf != 0u ? getMemPtr(rdram, sendBuf) : nullptr;
+                    std::printf("[diag:rpc30] num=%u recv=0x%x send=0x%x/%u req=",
+                                rpcNum, receiveBuffer, sendBuf, sendSize);
+                    for (unsigned i = 0u; i < 32u && req != nullptr; ++i)
+                    {
+                        std::printf("%02x", req[i]);
+                    }
+                    std::printf(" resp=");
+                    for (unsigned i = 0u; i < 32u && resp != nullptr; ++i)
+                    {
+                        std::printf("%02x", resp[i]);
+                    }
+                    std::printf("\n");
+                }
                 if (handled && resultPointer != 0u && resultPointer != receiveBuffer)
                 {
                     rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize);
+                    if (std::getenv("PS2X_DIAG_RPC0_FORCE3") != nullptr && sid == 0u &&
+                        rpcNum == 1u && receiveBuffer != 0u)
+                    {
+                        *reinterpret_cast<uint32_t *>(getMemPtr(rdram, receiveBuffer)) = 3u;
+                    }
                 }
                 else if (!handled && sendBuf != 0u && sendSize != 0u && sendBuf != receiveBuffer)
                 {

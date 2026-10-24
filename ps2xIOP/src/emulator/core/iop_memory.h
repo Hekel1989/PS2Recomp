@@ -93,6 +93,13 @@ namespace ps2x::iop::detail
             m_watchCallback = std::move(callback);
         }
 
+        void setReadWatch(uint32_t low, uint32_t high, std::function<void(uint32_t, uint32_t)> callback)
+        {
+            m_readLow = low;
+            m_readHigh = high;
+            m_readCallback = std::move(callback);
+        }
+
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
     private:
@@ -112,5 +119,8 @@ namespace ps2x::iop::detail
         std::function<void(uint32_t, uint32_t, uint32_t)> m_watchCallback;
         uint32_t m_watchLow = 0;
         uint32_t m_watchHigh = 0;
+        std::function<void(uint32_t, uint32_t)> m_readCallback;
+        uint32_t m_readLow = 0;
+        uint32_t m_readHigh = 0;
     };
 }

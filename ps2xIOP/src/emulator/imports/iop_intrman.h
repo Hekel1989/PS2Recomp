@@ -18,6 +18,13 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
 
+        template <typename Fn>
+        void forEachHandler(Fn &&fn) const
+        {
+            for (const auto &[irq, handler] : m_handlers)
+                fn(irq, handler.function);
+        }
+
     private:
         struct Handler
         {

@@ -805,6 +805,18 @@ namespace ps2_stubs
                         port, slot, readOk ? 1 : 0, data[1], data[2], data[3]);
             ++g_padReadLogCount;
         }
+        // DIAG (temporary): periodic heartbeat so we can tell whether the game
+        // keeps polling the pad later in the run (every 600th call).
+        {
+            static uint64_t padReadTotal = 0;
+            ++padReadTotal;
+            if ((padReadTotal % 600u) == 0u)
+            {
+                std::printf("[padread-beat] total=%llu port=%d data2=0x%02x data3=0x%02x vsync=%llu\n",
+                            (unsigned long long)padReadTotal, port, data[2], data[3],
+                            runtime ? (unsigned long long)runtime->eeScheduler().currentVSyncTick() : 0ull);
+            }
+        }
         if (readOk && (data[2] != 0xFFu || data[3] != 0xFFu) && g_padPressLogCount < 16)
         {
             std::printf("[padread-press] port=%d data2=0x%02x data3=0x%02x\n", port, data[2], data[3]);
