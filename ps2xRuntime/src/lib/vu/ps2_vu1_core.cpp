@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <set>
 #include <ps2_log.h>
 
 namespace
@@ -50,6 +51,132 @@ namespace
                      static_cast<unsigned long long>(s_diffRuns),
                      static_cast<unsigned long long>(s_diffMismatches));
     }
+
+    bool vu1DiffAotEnabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *value = std::getenv("PS2X_VU1_DIFF");
+            return value != nullptr && std::strcmp(value, "aot") == 0;
+        }();
+        return s_enabled;
+    }
+
+    bool vu1AotEnabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *value = std::getenv("PS2X_VU1_AOT");
+            if (value == nullptr)
+                return true;
+            return std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "off") != 0;
+        }();
+        return s_enabled;
+    }
+
+    constexpr uint32_t kMaxCompiledPrograms = 64u;
+    const suiko::vu1::CompiledProgram *s_compiledPrograms[kMaxCompiledPrograms]{};
+    uint32_t s_compiledProgramCount = 0u;
+    bool s_compiledProgramsRegistered = false;
+    std::set<uint64_t> s_aotMisses;
+    std::set<uint64_t> s_aotHits;
+
+    void logAotHit(uint32_t programHash, uint32_t pc)
+    {
+        const uint64_t key = (static_cast<uint64_t>(programHash) << 32) | pc;
+        if (s_aotHits.insert(key).second)
+        {
+            std::fprintf(stderr, "[vu1-aot] run program=0x%08x pc=0x%x\n",
+                         programHash, pc);
+        }
+    }
+
+    void ensureCompiledProgramsRegistered()
+    {
+        if (s_compiledProgramsRegistered)
+            return;
+        s_compiledProgramsRegistered = true;
+        suikoVu1RegisterGeneratedPrograms();
+        if (s_compiledProgramCount != 0u)
+        {
+            std::fprintf(stderr, "[vu1-aot] registered %u compiled program(s)\n",
+                         s_compiledProgramCount);
+        }
+    }
+
+    void logAotMiss(uint32_t programHash, uint32_t pc)
+    {
+        const uint64_t key = (static_cast<uint64_t>(programHash) << 32) | pc;
+        if (s_aotMisses.insert(key).second)
+        {
+            std::fprintf(stderr, "[vu1-aot] miss program=0x%08x pc=0x%x\n",
+                         programHash, pc);
+        }
+    }
+
+    bool vu1AotStatsEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_VU1_AOT_STATS") != nullptr;
+        return s_enabled;
+    }
+
+    uint64_t s_statsAotNs = 0;
+    uint64_t s_statsAotPairs = 0;
+    uint64_t s_statsInterpNs = 0;
+    uint64_t s_statsInterpPairs = 0;
+    uint64_t s_statsRuns = 0;
+
+    void addAotStats(bool compiled, uint64_t hostNs, uint32_t pairs)
+    {
+        if (compiled)
+        {
+            s_statsAotNs += hostNs;
+            s_statsAotPairs += pairs;
+        }
+        else
+        {
+            s_statsInterpNs += hostNs;
+            s_statsInterpPairs += pairs;
+        }
+        ++s_statsRuns;
+        if ((s_statsRuns & 0xFFFFu) == 0u)
+        {
+            const double aotPerPair = s_statsAotPairs
+                                          ? static_cast<double>(s_statsAotNs) / s_statsAotPairs
+                                          : 0.0;
+            const double interpPerPair = s_statsInterpPairs
+                                             ? static_cast<double>(s_statsInterpNs) / s_statsInterpPairs
+                                             : 0.0;
+            std::fprintf(stderr,
+                         "[vu1:stats] aot pairs=%llu ns/pair=%.1f interp pairs=%llu ns/pair=%.1f\n",
+                         static_cast<unsigned long long>(s_statsAotPairs), aotPerPair,
+                         static_cast<unsigned long long>(s_statsInterpPairs), interpPerPair);
+        }
+    }
+}
+
+uint32_t suiko::vu1::hash(const uint8_t *data, uint32_t size)
+{
+    uint32_t value = 0x811C9DC5u;
+    for (uint32_t index = 0; index < size; ++index)
+    {
+        value ^= data[index];
+        value *= 0x01000193u;
+    }
+    return value;
+}
+
+void suiko::vu1::registerCompiledProgram(const CompiledProgram *program)
+{
+    if (program == nullptr || s_compiledProgramCount >= kMaxCompiledPrograms)
+        return;
+    s_compiledPrograms[s_compiledProgramCount++] = program;
+}
+
+extern "C" __attribute__((weak)) void suikoVu1RegisterGeneratedPrograms()
+{
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -1871,9 +1998,303 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
+const suiko::vu1::CompiledProgram *VU1Interpreter::findCompiledProgram(
+    uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory)
+{
+    if (m_unit != Unit::VU1 || m_aotDisabled || !vu1AotEnabled())
+        return nullptr;
+
+    ensureCompiledProgramsRegistered();
+    if (s_compiledProgramCount == 0u)
+        return nullptr;
+
+    const bool tracked = memory != nullptr && vuCode == memory->getVU1Code();
+    const uint64_t generation = tracked ? memory->getVU1CodeGeneration() : 0u;
+    if (m_aotProgramCacheValid &&
+        m_aotProgramCode == vuCode &&
+        m_aotProgramCodeSize == codeSize &&
+        (!tracked || m_aotProgramGeneration == generation))
+    {
+        return m_aotProgram;
+    }
+
+    m_aotProgram = nullptr;
+    m_aotProgramCode = vuCode;
+    m_aotProgramCodeSize = codeSize;
+    m_aotProgramGeneration = generation;
+    m_aotProgramCacheValid = true;
+    for (uint32_t index = 0; index < s_compiledProgramCount; ++index)
+    {
+        const suiko::vu1::CompiledProgram *program = s_compiledPrograms[index];
+        if (program == nullptr || program->run == nullptr)
+            continue;
+        if (program->extentOffset > codeSize ||
+            program->extentSize > codeSize - program->extentOffset)
+            continue;
+        if (suiko::vu1::hash(vuCode + program->extentOffset, program->extentSize) ==
+            program->programHash)
+        {
+            m_aotProgram = program;
+            break;
+        }
+    }
+    return m_aotProgram;
+}
+
+suiko::vu1::AotResult VU1Interpreter::aotStepPair(const DecodedInstructionPair &decoded)
+{
+    if (m_stopRequested)
+        return suiko::vu1::AotResult::StopRequested;
+    if (m_cycle >= m_budgetEnd)
+        return suiko::vu1::AotResult::BudgetEnded;
+    commitReadyPipelines();
+    if (m_state.pc + 8u > m_activeCodeSize)
+    {
+        m_stopReason = "pc-out-of-range";
+        return suiko::vu1::AotResult::StopRequested;
+    }
+
+    if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+    {
+        m_stopReason = "reserved";
+        reportReservedInstruction(decoded.upperUsage.reserved,
+                                  decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+        return suiko::vu1::AotResult::StopRequested;
+    }
+
+    const uint64_t readyCycle = calculatePairReadyCycle(decoded);
+    if (readyCycle > m_cycle)
+    {
+        if (m_inventory != nullptr)
+            m_inventory->onStall(readyCycle - m_cycle);
+        if (readyCycle >= m_budgetEnd)
+            advanceTo(m_budgetEnd);
+        else
+            advanceTo(readyCycle);
+    }
+    if (m_cycle >= m_budgetEnd)
+        return suiko::vu1::AotResult::BudgetEnded;
+
+    {
+        // SUIKO(diag-vu1-itrace): PS2X_VU1_ITRACE=<startpc hex>[:<count>]
+        // logs every pair of the first <count> runs that begin at startpc.
+        static const char *s_itrace = std::getenv("PS2X_VU1_ITRACE");
+        static uint32_t s_itracePc = s_itrace ? static_cast<uint32_t>(std::strtoul(s_itrace, nullptr, 16)) : 0xFFFFFFFFu;
+        static uint32_t s_itraceRuns = [] {
+            const char *c = s_itrace ? std::strchr(s_itrace, ':') : nullptr;
+            return c ? static_cast<uint32_t>(std::strtoul(c + 1, nullptr, 10)) : 1u;
+        }();
+        static uint64_t s_itraceRunCycle = ~0ull;
+        if (s_itrace && m_traceStartPc == s_itracePc && s_itraceRuns != 0u)
+        {
+            if (s_itraceRunCycle == ~0ull)
+                s_itraceRunCycle = m_budgetEnd;
+            if (s_itraceRunCycle == m_budgetEnd)
+            {
+                std::fprintf(stderr, "[vu1:i] pc=0x%04x L=%08x U=%08x vi", m_state.pc, decoded.lower, decoded.upper);
+                for (int r = 1; r < 16; ++r)
+                    std::fprintf(stderr, " %x", static_cast<uint32_t>(m_state.vi[r]) & 0xFFFFu);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    uint8_t writtenVi = 0u;
+    int32_t oldVi = 0;
+    for (uint32_t reg = 1; reg < 16u; ++reg)
+    {
+        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+        {
+            writtenVi = static_cast<uint8_t>(reg);
+            oldVi = m_state.vi[reg];
+            break;
+        }
+    }
+
+    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+    const bool hasUpperWrite = upperWrite.reg != 0u;
+    const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+    const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+    float oldUpperVf[4]{};
+    float newUpperVf[4]{};
+    float oldLowerVf[4]{};
+    float newLowerVf[4]{};
+    float oldAcc[4]{};
+    float newAcc[4]{};
+    if (hasUpperWrite)
+        std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+    if (hasDistinctLowerWrite)
+        std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+    if (decoded.upperUsage.accWrite != 0u)
+        std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+
+    if (decoded.iBit)
+    {
+        execUpper(decoded.upper);
+        float immediate = 0.0f;
+        std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+        m_state.i = normalizeOperand(immediate);
+    }
+    else if (decoded.upperVfShadowReg != 0u)
+    {
+        float oldVf[4]{};
+        float upperVf[4]{};
+        std::memcpy(oldVf,
+                    m_state.vf[decoded.upperVfShadowReg],
+                    sizeof(oldVf));
+        execUpper(decoded.upper);
+        std::memcpy(upperVf,
+                    m_state.vf[decoded.upperVfShadowReg],
+                    sizeof(upperVf));
+        std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+                    oldVf,
+                    sizeof(oldVf));
+        execLower(decoded.lower, m_activeVuData, m_activeVuDataSize, *m_activeGs, m_activeMemory, decoded.upper);
+        std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+                    upperVf,
+                    sizeof(upperVf));
+    }
+    else
+    {
+        execUpper(decoded.upper);
+        execLower(decoded.lower, m_activeVuData, m_activeVuDataSize, *m_activeGs, m_activeMemory, decoded.upper);
+    }
+
+    if (m_inventory != nullptr)
+    {
+        m_inventory->onPair(m_state.pc, decoded.lower, decoded.upper,
+                            decoded.iBit, decoded.eBit, decoded.dBit,
+                            decoded.tBit, decoded.mBit, m_state.branchPending,
+                            m_state.branchTarget);
+    }
+
+    m_viBranchBackupValid = false;
+
+    if (hasUpperWrite)
+    {
+        std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
+        std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
+        const uint32_t latency =
+            decoded.upperUsage.vfLatency != 0u
+                ? decoded.upperUsage.vfLatency
+                : decoded.upperUsage.latency;
+        queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
+    }
+    if (hasDistinctLowerWrite)
+    {
+        std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
+        std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
+        const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
+                                     ? decoded.lowerUsage.vfLatency
+                                     : decoded.lowerUsage.latency;
+        queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
+    }
+    if (decoded.upperUsage.accWrite != 0u)
+    {
+        std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+        std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+        // ACC is forwarded to the next upper instruction. Its arithmetic
+        // flags still use the normal four-cycle FMAC timeline.
+        queueAccWrite(decoded.upperUsage.accWrite, newAcc,
+                      kAccForwardLatency);
+    }
+    if (writtenVi != 0u)
+    {
+        const int32_t newVi = m_state.vi[writtenVi];
+        m_state.vi[writtenVi] = oldVi;
+        const uint32_t latency =
+            decoded.lowerUsage.viLatency != 0u
+                ? decoded.lowerUsage.viLatency
+                : decoded.lowerUsage.latency;
+        queueViWrite(writtenVi, newVi, latency);
+    }
+
+    markPairWrites(decoded);
+    if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+        recordViWriteForBranch(writtenVi, oldVi);
+
+    m_state.vf[0][0] = 0.0f;
+    m_state.vf[0][1] = 0.0f;
+    m_state.vf[0][2] = 0.0f;
+    m_state.vf[0][3] = 1.0f;
+    m_state.vi[0] = 0;
+
+    uint32_t nextPc = m_state.pc + 8u;
+    if (nextPc >= m_activeCodeSize)
+        nextPc = 0u;
+    m_state.pc = nextPc;
+
+    if (m_state.branchPending)
+    {
+        if (m_state.branchDelay == 0u)
+        {
+            m_state.pc = m_state.branchTarget & microAddressMask();
+            m_state.branchPending = false;
+        }
+        else
+        {
+            --m_state.branchDelay;
+        }
+    }
+
+    const bool dHalt = decoded.dBit && m_state.dBitEnabled;
+    const bool tHalt = decoded.tBit && m_state.tBitEnabled;
+    const bool haltBit = dHalt || tHalt;
+    const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
+
+    bool programEnded = false;
+    if (m_state.haltAfterDelaySlot)
+    {
+        m_state.stoppedByD = m_pendingHaltD;
+        m_state.stoppedByT = m_pendingHaltT;
+        programEnded = true;
+    }
+    else if (m_state.ebit)
+        programEnded = true;
+    else if (haltBit && !haltBranch)
+    {
+        m_state.stoppedByD = dHalt;
+        m_state.stoppedByT = tHalt;
+        programEnded = true;
+    }
+    else if (decoded.eBit)
+        m_state.ebit = true;
+    else if (haltBranch)
+    {
+        m_state.haltAfterDelaySlot = true;
+        m_pendingHaltD = dHalt;
+        m_pendingHaltT = tHalt;
+    }
+
+    advanceOneCycle();
+    ++m_traceInsns;
+    if (programEnded)
+    {
+        m_stopReason = m_state.stoppedByD ? "d-bit" : m_state.stoppedByT ? "t-bit" : "e-bit";
+        return suiko::vu1::AotResult::ProgramEnded;
+    }
+    return suiko::vu1::AotResult::Continue;
+}
+
 void VU1Interpreter::runDifferential(uint8_t *vuCode, uint32_t codeSize,
                                      uint8_t *vuData, uint32_t dataSize,
                                      GS &gs, PS2Memory *memory, uint32_t maxCycles)
+{
+    runDifferentialImpl(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, false);
+}
+
+void VU1Interpreter::runAotDifferential(uint8_t *vuCode, uint32_t codeSize,
+                                        uint8_t *vuData, uint32_t dataSize,
+                                        GS &gs, PS2Memory *memory, uint32_t maxCycles)
+{
+    runDifferentialImpl(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, true);
+}
+
+void VU1Interpreter::runDifferentialImpl(uint8_t *vuCode, uint32_t codeSize,
+                                         uint8_t *vuData, uint32_t dataSize,
+                                         GS &gs, PS2Memory *memory, uint32_t maxCycles,
+                                         bool candidateAot)
 {
     if (!s_diffRegistered)
     {
@@ -1888,6 +2309,7 @@ void VU1Interpreter::runDifferential(uint8_t *vuCode, uint32_t codeSize,
     std::vector<std::vector<uint8_t>> referencePackets;
     *this = saved;
     m_referenceScheduler = true;
+    m_aotDisabled = true;
     m_xgkickCapture = &referencePackets;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
     m_xgkickCapture = nullptr;
@@ -1898,9 +2320,12 @@ void VU1Interpreter::runDifferential(uint8_t *vuCode, uint32_t codeSize,
     std::vector<std::vector<uint8_t>> newPackets;
     *this = saved;
     std::memcpy(vuData, initialData.data(), dataSize);
+    m_referenceScheduler = false;
+    m_aotDisabled = !candidateAot;
     m_xgkickCapture = &newPackets;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
     m_xgkickCapture = nullptr;
+    m_aotDisabled = saved.m_aotDisabled;
 
     ++s_diffRuns;
     bool mismatch = false;
@@ -1967,7 +2392,9 @@ void VU1Interpreter::runDifferential(uint8_t *vuCode, uint32_t codeSize,
     }
     if ((s_diffRuns & 0xFFFu) == 0u)
     {
-        std::fprintf(stderr, "[vu1:diff] runs=%llu mismatches=%llu\n",
+        // Also report current totals periodically: the frontend leaves through
+        // std::_Exit(), so atexit() never runs on a normal game shutdown.
+        std::fprintf(stderr, "[vu1:diff] total runs=%llu mismatches=%llu\n",
                      static_cast<unsigned long long>(s_diffRuns),
                      static_cast<unsigned long long>(s_diffMismatches));
     }
@@ -2019,7 +2446,12 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         }
     }
     if (m_unit == Unit::VU1 && vu1DiffEnabled())
-        runDifferential(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    {
+        if (vu1DiffAotEnabled())
+            runAotDifferential(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+        else
+            runDifferential(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    }
     else
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
@@ -2034,7 +2466,12 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
     if (m_unit == Unit::VU1 && vu1DiffEnabled())
-        runDifferential(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    {
+        if (vu1DiffAotEnabled())
+            runAotDifferential(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+        else
+            runDifferential(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    }
     else
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
@@ -2045,20 +2482,27 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 {
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
+    m_activeVuCode = vuCode;
+    m_activeCodeSize = codeSize;
     m_activeGs = &gs;
     m_activeMemory = memory;
+    m_budgetEnd = m_cycle + maxCycles;
 
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
-    const uint64_t budgetEnd = m_cycle + maxCycles;
+    const bool stats = vu1AotStatsEnabled();
+    std::chrono::steady_clock::time_point statsStart{};
+    if (stats)
+        statsStart = std::chrono::steady_clock::now();
+    bool compiledOnly = false;
     bool programEnded = false;
-    const bool trace = vu1TraceEnabled();
-    uint32_t traceInsns = 0;
-    const char *stopReason = "budget";
-    const uint32_t traceStartPc = m_state.pc;
-    const uint64_t runStartCycle = m_cycle;
+    m_traceActive = vu1TraceEnabled();
+    m_traceInsns = 0;
+    m_stopReason = "budget";
+    m_traceStartPc = m_state.pc;
     VU1InventoryRecorder *inventory =
         (m_unit == Unit::VU1 && !vu1DiffEnabled()) ? VU1InventoryRecorder::instance() : nullptr;
+    m_inventory = inventory;
     if (inventory != nullptr)
     {
         const uint64_t generation = memory != nullptr ? memory->getVU1CodeGeneration() : 0u;
@@ -2068,239 +2512,71 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         inventory->beginRun(vuCode, codeSize, generation, m_state.pc, m_cycle, vsync);
     }
     const auto inventoryHostStart = std::chrono::steady_clock::now();
-    if (trace)
+    if (m_traceActive)
     {
         std::fprintf(stderr, "[vu1:run] begin pc=0x%x top=0x%x itop=0x%x budget=%u\n",
                      m_state.pc, m_state.top, m_state.itop, maxCycles);
     }
-    while (m_cycle < budgetEnd && !m_stopRequested)
+
+    bool runInterpreter = true;
+    const suiko::vu1::CompiledProgram *compiled = findCompiledProgram(vuCode, codeSize, memory);
+    if (compiled != nullptr)
     {
-        commitReadyPipelines();
-        if (m_state.pc + 8u > codeSize)
+        bool entry = false;
+        for (uint32_t index = 0; index < compiled->entryCount; ++index)
         {
-            stopReason = "pc-out-of-range";
-            break;
-        }
-
-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
-        if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
-        {
-            stopReason = "reserved";
-            reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-            break;
-        }
-
-        const uint64_t readyCycle = calculatePairReadyCycle(decoded);
-        if (readyCycle > m_cycle)
-        {
-            if (inventory != nullptr)
-                inventory->onStall(readyCycle - m_cycle);
-            if (readyCycle >= budgetEnd)
-                advanceTo(budgetEnd);
-            else
-                advanceTo(readyCycle);
-        }
-        if (m_cycle >= budgetEnd)
-            break;
-
-        {
-            // SUIKO(diag-vu1-itrace): PS2X_VU1_ITRACE=<startpc hex>[:<count>]
-            // logs every pair of the first <count> runs that begin at startpc.
-            static const char *s_itrace = std::getenv("PS2X_VU1_ITRACE");
-            static uint32_t s_itracePc = s_itrace ? static_cast<uint32_t>(std::strtoul(s_itrace, nullptr, 16)) : 0xFFFFFFFFu;
-            static uint32_t s_itraceRuns = [] {
-                const char *c = s_itrace ? std::strchr(s_itrace, ':') : nullptr;
-                return c ? static_cast<uint32_t>(std::strtoul(c + 1, nullptr, 10)) : 1u;
-            }();
-            static uint64_t s_itraceRunCycle = ~0ull;
-            if (s_itrace && traceStartPc == s_itracePc && s_itraceRuns != 0u)
+            if (compiled->entries[index] == m_state.pc)
             {
-                if (s_itraceRunCycle == ~0ull)
-                    s_itraceRunCycle = budgetEnd;
-                if (s_itraceRunCycle == budgetEnd)
-                {
-                    std::fprintf(stderr, "[vu1:i] pc=0x%04x L=%08x U=%08x vi", m_state.pc, decoded.lower, decoded.upper);
-                    for (int r = 1; r < 16; ++r)
-                        std::fprintf(stderr, " %x", static_cast<uint32_t>(m_state.vi[r]) & 0xFFFFu);
-                    std::fprintf(stderr, "\n");
-                }
-            }
-        }
-
-        uint8_t writtenVi = 0u;
-        int32_t oldVi = 0;
-        for (uint32_t reg = 1; reg < 16u; ++reg)
-        {
-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            {
-                writtenVi = static_cast<uint8_t>(reg);
-                oldVi = m_state.vi[reg];
+                entry = true;
                 break;
             }
         }
-
-        const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-        const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
-        const bool hasUpperWrite = upperWrite.reg != 0u;
-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
-        const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
-        float oldUpperVf[4]{};
-        float newUpperVf[4]{};
-        float oldLowerVf[4]{};
-        float newLowerVf[4]{};
-        float oldAcc[4]{};
-        float newAcc[4]{};
-        if (hasUpperWrite)
-            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
-        if (hasDistinctLowerWrite)
-            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
-        if (decoded.upperUsage.accWrite != 0u)
-            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
-
-        if (decoded.iBit)
+        if (entry)
         {
-            execUpper(decoded.upper);
-            float immediate = 0.0f;
-            std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
-            m_state.i = normalizeOperand(immediate);
-        }
-        else if (decoded.upperVfShadowReg != 0u)
-        {
-            float oldVf[4]{};
-            float upperVf[4]{};
-            std::memcpy(oldVf,
-                        m_state.vf[decoded.upperVfShadowReg],
-                        sizeof(oldVf));
-            execUpper(decoded.upper);
-            std::memcpy(upperVf,
-                        m_state.vf[decoded.upperVfShadowReg],
-                        sizeof(upperVf));
-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
-                        oldVf,
-                        sizeof(oldVf));
-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
-            std::memcpy(m_state.vf[decoded.upperVfShadowReg],
-                        upperVf,
-                        sizeof(upperVf));
-        }
-        else
-        {
-            execUpper(decoded.upper);
-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
-        }
-
-        if (inventory != nullptr)
-        {
-            inventory->onPair(m_state.pc, decoded.lower, decoded.upper,
-                              decoded.iBit, decoded.eBit, decoded.dBit,
-                              decoded.tBit, decoded.mBit, m_state.branchPending,
-                              m_state.branchTarget);
-        }
-
-        m_viBranchBackupValid = false;
-
-        if (hasUpperWrite)
-        {
-            std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
-            std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
-            const uint32_t latency =
-                decoded.upperUsage.vfLatency != 0u
-                    ? decoded.upperUsage.vfLatency
-                    : decoded.upperUsage.latency;
-            queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
-        }
-        if (hasDistinctLowerWrite)
-        {
-            std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
-            std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
-            const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
-                                         ? decoded.lowerUsage.vfLatency
-                                         : decoded.lowerUsage.latency;
-            queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
-        }
-        if (decoded.upperUsage.accWrite != 0u)
-        {
-            std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
-            std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
-            // ACC is forwarded to the next upper instruction. Its arithmetic
-            // flags still use the normal four-cycle FMAC timeline.
-            queueAccWrite(decoded.upperUsage.accWrite, newAcc,
-                          kAccForwardLatency);
-        }
-        if (writtenVi != 0u)
-        {
-            const int32_t newVi = m_state.vi[writtenVi];
-            m_state.vi[writtenVi] = oldVi;
-            const uint32_t latency =
-                decoded.lowerUsage.viLatency != 0u
-                    ? decoded.lowerUsage.viLatency
-                    : decoded.lowerUsage.latency;
-            queueViWrite(writtenVi, newVi, latency);
-        }
-
-        markPairWrites(decoded);
-        if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
-            recordViWriteForBranch(writtenVi, oldVi);
-
-        m_state.vf[0][0] = 0.0f;
-        m_state.vf[0][1] = 0.0f;
-        m_state.vf[0][2] = 0.0f;
-        m_state.vf[0][3] = 1.0f;
-        m_state.vi[0] = 0;
-
-        uint32_t nextPc = m_state.pc + 8u;
-        if (nextPc >= codeSize)
-            nextPc = 0u;
-        m_state.pc = nextPc;
-
-        if (m_state.branchPending)
-        {
-            if (m_state.branchDelay == 0u)
+            logAotHit(compiled->programHash, m_state.pc);
+            compiledOnly = true;
+            const suiko::vu1::AotResult result = compiled->run(*this);
+            if (result == suiko::vu1::AotResult::ProgramEnded)
             {
-                m_state.pc = m_state.branchTarget & microAddressMask();
-                m_state.branchPending = false;
+                programEnded = true;
+                runInterpreter = false;
+            }
+            else if (result == suiko::vu1::AotResult::Fallback)
+            {
+                compiledOnly = false;
+                logAotMiss(compiled->programHash, m_state.pc);
             }
             else
             {
-                --m_state.branchDelay;
+                if (result == suiko::vu1::AotResult::BudgetEnded)
+                    m_stopReason = "budget";
+                else
+                    m_stopReason = "stop";
+                runInterpreter = false;
             }
         }
-
-        const bool dHalt = decoded.dBit && m_state.dBitEnabled;
-        const bool tHalt = decoded.tBit && m_state.tBitEnabled;
-        const bool haltBit = dHalt || tHalt;
-        const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
-
-        if (m_state.haltAfterDelaySlot)
+        else
         {
-            m_state.stoppedByD = m_pendingHaltD;
-            m_state.stoppedByT = m_pendingHaltT;
-            programEnded = true;
+            logAotMiss(compiled->programHash, m_state.pc);
         }
-        else if (m_state.ebit)
-            programEnded = true;
-        else if (haltBit && !haltBranch)
-        {
-            m_state.stoppedByD = dHalt;
-            m_state.stoppedByT = tHalt;
-            programEnded = true;
-        }
-        else if (decoded.eBit)
-            m_state.ebit = true;
-        else if (haltBranch)
-        {
-            m_state.haltAfterDelaySlot = true;
-            m_pendingHaltD = dHalt;
-            m_pendingHaltT = tHalt;
-        }
+    }
+    else if (!m_aotDisabled && vu1AotEnabled())
+    {
+        logAotMiss(0u, m_state.pc);
+    }
 
-        advanceOneCycle();
-        ++traceInsns;
-        if (programEnded)
+    while (runInterpreter && m_cycle < m_budgetEnd && !m_stopRequested)
+    {
+        const DecodedInstructionPair decoded =
+            getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        const suiko::vu1::AotResult result = aotStepPair(decoded);
+        if (result == suiko::vu1::AotResult::ProgramEnded)
         {
-            stopReason = m_state.stoppedByD ? "d-bit" : m_state.stoppedByT ? "t-bit" : "e-bit";
+            programEnded = true;
             break;
         }
+        if (result != suiko::vu1::AotResult::Continue)
+            break;
     }
 
     if (programEnded)
@@ -2311,11 +2587,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltD = false;
         m_pendingHaltT = false;
     }
-    if (trace)
+    if (m_traceActive)
     {
         std::fprintf(stderr, "[vu1:run] end pc=0x%x insns=%u cycles=%llu reason=%s xgkick=%s\n",
-                     m_state.pc, traceInsns,
-                     static_cast<unsigned long long>(m_cycle), stopReason,
+                     m_state.pc, m_traceInsns,
+                     static_cast<unsigned long long>(m_cycle), m_stopReason,
                      m_xgkick.active ? "pending" : "idle");
     }
     m_state.cycles = m_cycle;
@@ -2326,15 +2602,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 inventoryHostEnd - inventoryHostStart)
                 .count());
-        inventory->endRun(m_state.pc, m_cycle, traceInsns, hostNs);
+        inventory->endRun(m_state.pc, m_cycle, m_traceInsns, hostNs);
     }
-    if (trace && m_activeVuData && m_activeVuDataSize >= 0x1e10u && m_state.pc == 0x200u)
+    if (m_traceActive && m_activeVuData && m_activeVuDataSize >= 0x1e10u && m_state.pc == 0x200u)
     {
         uint64_t lo = 0, hi = 0;
         std::memcpy(&lo, m_activeVuData + 0x1e00u, 8u);
         std::memcpy(&hi, m_activeVuData + 0x1e08u, 8u);
         std::fprintf(stderr, "[vu1:dump] after pc=0x200 q1e0=%016llx %016llx\n",
                      static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+    }
+    m_inventory = nullptr;
+    if (stats)
+    {
+        const uint64_t hostNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - statsStart)
+                .count());
+        addAotStats(compiledOnly, hostNs, m_traceInsns);
     }
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);

@@ -1,6 +1,8 @@
 #ifndef PS2_VU1_H
 #define PS2_VU1_H
 
+#include "runtime/ps2_vu1_aot.h"
+
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -8,6 +10,7 @@
 
 class GS;
 class PS2Memory;
+class VU1InventoryRecorder;
 
 struct VU1State
 {
@@ -64,60 +67,17 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
+    // SUIKO(vu1-aot): narrow seam used by generated code.  The decoded pair
+    // comes from the program's constexpr table; everything else stays private.
+    suiko::vu1::AotResult aotStepPair(const suiko::vu1::DecodedPair &decoded);
+    uint32_t aotPc() const { return m_state.pc; }
+
 private:
-    enum Pipeline : uint8_t
-    {
-        PipelineNone = 0,
-        PipelineFmac,
-        PipelineLsu,
-        PipelineFdiv,
-        PipelineEfu,
-        PipelineIalu,
-        PipelineBranch,
-        PipelineXgkick
-    };
-
-    struct VfAccess
-    {
-        uint8_t reg = 0;
-        uint8_t lanes = 0;
-    };
-
-    struct InstructionUsage
-    {
-        std::array<VfAccess, 2> vfRead{};
-        VfAccess vfWrite{};
-        uint8_t vfReadCount = 0;
-        uint16_t viRead = 0;
-        uint16_t viWrite = 0;
-        uint8_t accRead = 0;
-        uint8_t accWrite = 0;
-        uint8_t latency = 0;
-        uint8_t vfLatency = 0;
-        uint8_t viLatency = 0;
-        Pipeline pipeline = PipelineNone;
-        bool waitQ = false;
-        bool waitP = false;
-        bool readsClip = false;
-        bool writesClip = false;
-        bool delaysNextBranchRead = false;
-        bool reserved = false;
-    };
-
-    struct DecodedInstructionPair
-    {
-        uint32_t lower = 0;
-        uint32_t upper = 0;
-        InstructionUsage lowerUsage{};
-        InstructionUsage upperUsage{};
-        bool iBit = false;
-        bool eBit = false;
-        bool mBit = false;
-        bool dBit = false;
-        bool tBit = false;
-        uint8_t upperVfShadowReg = 0;
-        uint8_t suppressedLowerVf = 0;
-    };
+    using Pipeline = suiko::vu1::Pipeline;
+    using enum suiko::vu1::Pipeline;
+    using VfAccess = suiko::vu1::VfAccess;
+    using InstructionUsage = suiko::vu1::InstructionUsage;
+    using DecodedInstructionPair = suiko::vu1::DecodedPair;
 
     struct FlagPipelineEntry
     {
@@ -257,6 +217,24 @@ private:
     bool m_referenceScheduler = false;
     std::vector<std::vector<uint8_t>> *m_xgkickCapture = nullptr;
 
+    // SUIKO(vu1-aot): compiled-program dispatch.
+    const uint8_t *m_activeVuCode = nullptr;
+    uint32_t m_activeCodeSize = 0;
+    uint64_t m_budgetEnd = 0;
+    VU1InventoryRecorder *m_inventory = nullptr;
+    bool m_traceActive = false;
+    uint32_t m_traceInsns = 0;
+    const char *m_stopReason = "budget";
+    uint32_t m_traceStartPc = 0;
+    const suiko::vu1::CompiledProgram *m_aotProgram = nullptr;
+    const uint8_t *m_aotProgramCode = nullptr;
+    uint32_t m_aotProgramCodeSize = 0;
+    uint64_t m_aotProgramGeneration = 0;
+    bool m_aotProgramCacheValid = false;
+    bool m_aotDisabled = false;
+
+    const suiko::vu1::CompiledProgram *findCompiledProgram(uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
+
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
              GS &gs, PS2Memory *memory, uint32_t maxCycles);
@@ -301,6 +279,13 @@ private:
     void runDifferential(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    void runAotDifferential(uint8_t *vuCode, uint32_t codeSize,
+                            uint8_t *vuData, uint32_t dataSize,
+                            GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    void runDifferentialImpl(uint8_t *vuCode, uint32_t codeSize,
+                             uint8_t *vuData, uint32_t dataSize,
+                             GS &gs, PS2Memory *memory, uint32_t maxCycles,
+                             bool candidateAot);
     void flushPipelines();
     void progressXgkick();
     void finishXgkick();
