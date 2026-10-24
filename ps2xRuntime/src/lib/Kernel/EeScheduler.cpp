@@ -2,6 +2,7 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_gs_host_hooks.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2038,6 +2039,12 @@ void EeScheduler::processEvent(const EeEvent &event)
         else
         {
             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
+        }
+        // SUIKO(gs-phase4): tick the optional external GS backend (no-op unless
+        // the host registered hooks; see runtime/ps2_gs_host_hooks.h).
+        if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.vsync)
+        {
+            gsHooks.vsync(m_vsyncTick);
         }
         writeGuestU32(m_vsyncFlagAddress, 1u);
         if (m_vsyncTickAddress != 0u)

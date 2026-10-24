@@ -1,6 +1,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_gs_host_hooks.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
@@ -139,6 +140,18 @@ namespace
             desired = (expected & kW1cMask) | (value & ~kW1cMask);
             desired &= ~(value & kW1cMask);
         } while (!csr.compare_exchange_weak(expected, desired));
+    }
+
+    // SUIKO(gs-phase4): forward a completed GS privileged-register write to the
+    // optional host hooks (see runtime/ps2_gs_host_hooks.h). value is the full
+    // 64-bit register contents after PS2Recomp semantics were applied.
+    inline void notifyGsPrivRegWrite(uint32_t regOff, uint64_t value)
+    {
+        const auto &hooks = Ps2GsHostHooks::hooks();
+        if (hooks.privRegWrite)
+        {
+            hooks.privRegWrite(regOff, value);
+        }
     }
 
     constexpr std::array<uint32_t, 4> kEeTimerBases = {
@@ -960,12 +973,14 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
             // Done as a single atomic RMW -- see writeCsrHalf's comment.
             writeCsrHalf(gs_regs.csr, off, value);
+            notifyGsPrivRegWrite(regOff, gs_regs.csr.load());
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
+            notifyGsPrivRegWrite(regOff, newVal);
         }
         return;
     }
@@ -1019,10 +1034,12 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
             // atomic RMW -- see writeCsrFull's comment.
             writeCsrFull(gs_regs.csr, value);
+            notifyGsPrivRegWrite(regOff, gs_regs.csr.load());
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            notifyGsPrivRegWrite(regOff, value);
         }
         return;
     }
@@ -1176,11 +1193,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
+            notifyGsPrivRegWrite(regOff, gs_regs.csr.load());
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
             *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            notifyGsPrivRegWrite(regOff, *reg);
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
