@@ -625,6 +625,12 @@ bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
     return m_iopSubsystem->stopModule(moduleId, result);
 }
 
+void PS2Runtime::setIopSpu2Host(ps2x::iop::IopSpu2Host *host)
+{
+    if (m_iopSubsystem)
+        m_iopSubsystem->setSpu2Host(host);
+}
+
 ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
 {
     return m_iopSubsystem->selectRpcAbi(request);

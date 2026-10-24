@@ -40,6 +40,7 @@
 
 namespace ps2x::iop
 {
+    class IopSpu2Host;
     class IopSubsystem;
 }
 
@@ -349,6 +350,9 @@ public:
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+    // SUIKO: attach the real SPU2 host to the IOP (nullptr = original
+    // register-store/fake-DMA behaviour).
+    void setIopSpu2Host(ps2x::iop::IopSpu2Host *host);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
     bool freeIopMemory(uint32_t address);

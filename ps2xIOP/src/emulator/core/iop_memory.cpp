@@ -62,6 +62,16 @@ namespace ps2x::iop::detail
     uint16_t IopMemory::read16(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Host != nullptr)
+        {
+            if (phys >= Spu2Base && phys < Spu2End)
+                return m_spu2Host->readRegister(phys);
+            if (isSpu2DmaRegister(phys))
+            {
+                const uint32_t value = m_spu2Host->readDmaRegister(phys & ~3u);
+                return static_cast<uint16_t>(value >> ((phys & 2u) * 8u));
+            }
+        }
         if (phys + 1u < RamSize)
         {
             uint16_t value;
@@ -121,6 +131,23 @@ namespace ps2x::iop::detail
     void IopMemory::write16(uint32_t address, uint16_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Host != nullptr)
+        {
+            if (phys >= Spu2Base && phys < Spu2End)
+            {
+                m_spu2Host->writeRegister(phys, value);
+                return;
+            }
+            if (isSpu2DmaRegister(phys))
+            {
+                const uint32_t aligned = phys & ~3u;
+                const uint32_t shift = (phys & 2u) * 8u;
+                uint32_t merged = m_spu2Host->readDmaRegister(aligned);
+                merged = (merged & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(value) << shift);
+                m_spu2Host->writeDmaRegister(aligned, merged);
+                return;
+            }
+        }
         if (phys + 1u < RamSize)
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
@@ -227,6 +254,16 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if (m_spu2Host != nullptr)
+        {
+            if (address >= Spu2Base && address < Spu2End)
+            {
+                return static_cast<uint32_t>(m_spu2Host->readRegister(address)) |
+                       (static_cast<uint32_t>(m_spu2Host->readRegister(address + 2u)) << 16u);
+            }
+            if (isSpu2DmaRegister(address))
+                return m_spu2Host->readDmaRegister(address);
+        }
         if (m_readCallback && address >= m_readLow && address < m_readHigh)
             m_readCallback(address, m_hardware.count(address) ? m_hardware.at(address) : 0u);
         const auto value = m_hardware.find(address);
@@ -247,6 +284,20 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        if (m_spu2Host != nullptr)
+        {
+            if (address >= Spu2Base && address < Spu2End)
+            {
+                m_spu2Host->writeRegister(address, static_cast<uint16_t>(value & 0xFFFFu));
+                m_spu2Host->writeRegister(address + 2u, static_cast<uint16_t>(value >> 16u));
+                return;
+            }
+            if (isSpu2DmaRegister(address))
+            {
+                m_spu2Host->writeDmaRegister(address, value);
+                return;
+            }
+        }
         switch (address)
         {
         case 0x1F801070u:

@@ -215,6 +215,7 @@ namespace ps2x::iop::detail
             servicingDmaInterrupts = false;
             servicingGuestCallbacks = false;
             callDepth = 0u;
+            nextSpu2Cycle = 0;
             secrMcCommandHandler = {};
             secrMcDevIdHandler = {};
             checkKelfPathCallback = {};
@@ -237,18 +238,24 @@ namespace ps2x::iop::detail
 
         void write8(uint32_t address, uint8_t value)
         {
+            if (spu2Host != nullptr)
+                spu2Host->syncCycles(totalCycles);
             memory.write8(address, value);
             schedulePendingDma();
         }
 
         void write16(uint32_t address, uint16_t value)
         {
+            if (spu2Host != nullptr)
+                spu2Host->syncCycles(totalCycles);
             memory.write16(address, value);
             schedulePendingDma();
         }
 
         void write32(uint32_t address, uint32_t value)
         {
+            if (spu2Host != nullptr)
+                spu2Host->syncCycles(totalCycles);
             memory.write32(address, value);
             schedulePendingDma();
         }
@@ -626,6 +633,7 @@ namespace ps2x::iop::detail
             {
                 if (!step(cpu))
                     break;
+                advanceSpu2();
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
@@ -871,6 +879,28 @@ namespace ps2x::iop::detail
             }
         }
 
+        void advanceSpu2() noexcept
+        {
+            if (spu2Host == nullptr || totalCycles < nextSpu2Cycle)
+                return;
+            // Drive the SPU2 at sub-sample granularity (768 IOP cycles per
+            // 48 kHz sample at 36.864 MHz) so IRQs land close to their cycle.
+            nextSpu2Cycle = totalCycles + 768u;
+            try
+            {
+                const uint64_t irqs = spu2Host->advance(totalCycles);
+                for (int irq = 0; irq < 64; ++irq)
+                {
+                    if ((irqs & (uint64_t{1} << irq)) != 0u)
+                        pendingDmaInterrupts[irq] = totalCycles;
+                }
+            }
+            catch (...)
+            {
+                // Host audio must never take the emulator down.
+            }
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -878,6 +908,7 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    advanceSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -1026,6 +1057,8 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        IopSpu2Host *spu2Host = nullptr;
+        uint64_t nextSpu2Cycle = 0;
 
         // Ring buffer of taken branches (delay-slot pc -> target), dumped when
         // execution leaves RAM so the path into the bad jump is visible.
@@ -1103,6 +1136,15 @@ namespace ps2x::iop::detail
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
         m_impl->rpc.onSifTransfer(transfer);
+    }
+
+    void IopEmulator::setSpu2Host(IopSpu2Host *host) noexcept
+    {
+        m_impl->spu2Host = host;
+        m_impl->nextSpu2Cycle = 0u;
+        m_impl->memory.setSpu2Host(host);
+        if (host != nullptr)
+            host->setIopRam(m_impl->memory.ramData(), IopMemory::RamSize);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)

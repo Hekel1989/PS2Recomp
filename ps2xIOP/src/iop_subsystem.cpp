@@ -251,6 +251,11 @@ namespace ps2x::iop
         return m_impl->emulator.isMemoryRange(address, size);
     }
 
+    void IopSubsystem::setSpu2Host(IopSpu2Host *host) noexcept
+    {
+        m_impl->emulator.setSpu2Host(host);
+    }
+
     DebugSnapshot IopSubsystem::debugSnapshot() const
     {
         DebugSnapshot snapshot;

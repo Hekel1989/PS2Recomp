@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2x/iop/iop_host.h"
+#include "ps2x/iop/iop_spu2_host.h"
 #include "ps2x/iop/iop_types.h"
 
 #include <cstdint>
@@ -28,6 +29,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
+
+        // SUIKO: attach the real SPU2. Passing nullptr restores the original
+        // register-store / fake DMA behaviour.
+        void setSpu2Host(IopSpu2Host *host) noexcept;
 
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
         [[nodiscard]] bool freeMemory(uint32_t address);

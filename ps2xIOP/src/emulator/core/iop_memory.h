@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ps2x/iop/iop_spu2_host.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -82,6 +84,19 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }
+
+        // SUIKO: optional real SPU2. When set, the SPU2 register window and
+        // DMA channels 4/7 are routed to the host instead of the register
+        // store / fake DMA-complete path below.
+        void setSpu2Host(IopSpu2Host *host) noexcept { m_spu2Host = host; }
+        [[nodiscard]] IopSpu2Host *spu2Host() const noexcept { return m_spu2Host; }
+
+        [[nodiscard]] static bool isSpu2DmaRegister(uint32_t physicalAddress) noexcept
+        {
+            return (physicalAddress >= 0x1F8010C0u && physicalAddress < 0x1F8010D0u) ||
+                   (physicalAddress >= 0x1F801500u && physicalAddress < 0x1F801510u);
+        }
 
         // Diagnostic write watchpoint over physical RAM: invokes the callback with
         // the physical address, stored value, and access size for every write into
@@ -122,5 +137,6 @@ namespace ps2x::iop::detail
         std::function<void(uint32_t, uint32_t)> m_readCallback;
         uint32_t m_readLow = 0;
         uint32_t m_readHigh = 0;
+        IopSpu2Host *m_spu2Host = nullptr;
     };
 }

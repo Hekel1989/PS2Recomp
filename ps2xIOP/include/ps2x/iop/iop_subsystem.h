@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2x/iop/iop_host.h"
+#include "ps2x/iop/iop_spu2_host.h"
 #include "ps2x/iop/iop_types.h"
 
 #include <memory>
@@ -42,6 +43,9 @@ namespace ps2x::iop
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+
+        // SUIKO: attach/detach the real SPU2 (see iop_spu2_host.h).
+        void setSpu2Host(IopSpu2Host *host) noexcept;
 
     private:
         class Impl;
