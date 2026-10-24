@@ -287,6 +287,14 @@ public:
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
+    // True once a guest (or EnableDmac/DisableDmac) has written a DMAC
+    // channel mask bit in D_STAT.  Until then the scheduler keeps its
+    // historical all-enabled default rather than treating the hardware reset
+    // value (zero, all channels masked) as programmed state.
+    [[nodiscard]] bool dmacChannelMasksProgrammed() const noexcept
+    {
+        return m_dmacChannelMasksProgrammed;
+    }
 
     // Read/write memory
     uint8_t read8(uint32_t address);
@@ -406,6 +414,7 @@ public:
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    bool m_dmacChannelMasksProgrammed = false;
 
     // Registers
     GSRegisters gs_regs;

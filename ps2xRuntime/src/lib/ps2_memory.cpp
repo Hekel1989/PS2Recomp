@@ -514,6 +514,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        m_dmacChannelMasksProgrammed = false;
 
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
@@ -1493,6 +1494,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if ((status & mask) != 0u)
             next |= (1u << 31);
         m_ioRegisters[address] = next;
+        if (((value >> 16u) & 0x3FFu) != 0u)
+        {
+            // The guest (or EnableDmac/DisableDmac) has programmed channel
+            // masks; from now on D_STAT is the scheduler's authority instead
+            // of its historical all-enabled default.
+            m_dmacChannelMasksProgrammed = true;
+        }
         // PS2X(diag-dmac-trace): direct D_STAT writes that touch the masks.
         static const bool s_dmacTrace = std::getenv("PS2X_DMAC_TRACE") != nullptr;
         if (s_dmacTrace && (value >> 16) != 0u)
