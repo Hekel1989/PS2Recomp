@@ -30,7 +30,9 @@ namespace ps2x::iop::detail
     public:
         explicit IopCpuCore(IopMemory &memory) noexcept;
 
-        [[nodiscard]] bool executeInstruction(IopCpuState &cpu);
+        // The caller fetches the instruction word once (it also feeds the
+        // import-stub check), so the core does not read it a second time.
+        [[nodiscard]] bool executeInstruction(IopCpuState &cpu, uint32_t instruction);
         void raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress = std::nullopt) const;
 
     private:

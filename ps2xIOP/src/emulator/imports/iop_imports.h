@@ -26,6 +26,8 @@ namespace ps2x::iop::detail
 
         void reset();
         [[nodiscard]] std::optional<IopImportCall> decode(uint32_t pc) const;
+        // Same lookup when the caller already fetched the instruction word.
+        [[nodiscard]] std::optional<IopImportCall> decode(uint32_t pc, uint32_t instruction) const;
         [[nodiscard]] bool registerExportTable(uint32_t address);
         [[nodiscard]] bool releaseExportTable(uint32_t address);
         [[nodiscard]] uint32_t findTable(std::string_view library, std::optional<uint16_t> version = std::nullopt) const;

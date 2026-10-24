@@ -299,6 +299,11 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            // Called after every interpreted instruction; almost every call
+            // has nothing to take.  The inline flag check keeps the optional
+            // copy out of that path.
+            if (!memory.hasPendingDma())
+                return;
             if (const auto dma = memory.takeDmaStart())
             {
                 if (std::getenv("PS2X_IOP_DMAIRQ_TRACE") != nullptr)
@@ -659,7 +664,10 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // Fetch once; the import-stub check and the interpreter both use
+            // this word (the interpreter used to read it a second time).
+            const uint32_t instruction = memory.read32(cpu.pc);
+            if (const auto import = imports.decode(cpu.pc, instruction))
             {
                 const uint32_t importPc = cpu.pc;
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
@@ -682,7 +690,7 @@ namespace ps2x::iop::detail
             }
 
             const uint32_t previousPc = cpu.pc;
-            const bool running = cpuCore.executeInstruction(cpu);
+            const bool running = cpuCore.executeInstruction(cpu, instruction);
             if (cpu.pc != previousPc + 4u)
                 recordBranch(previousPc, cpu.pc);
             schedulePendingDma();

@@ -52,10 +52,9 @@ namespace ps2x::iop::detail
         cpu.exception = true;
     }
 
-    bool IopCpuCore::executeInstruction(IopCpuState &cpu)
+    bool IopCpuCore::executeInstruction(IopCpuState &cpu, uint32_t instruction)
     {
         const uint32_t pc = cpu.pc;
-        const uint32_t instruction = m_memory.read32(pc);
         const bool wasDelaySlot = cpu.branchPending;
         const uint32_t priorBranchTarget = cpu.branchTarget;
 
