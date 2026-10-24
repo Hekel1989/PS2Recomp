@@ -2620,23 +2620,6 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
-        if (m_headlessPresentation)
-        {
-            // SUIKO(gs-phase6): the host owns presentation (PCSX2 GS swapchain
-            // window). Pump its events via mainTick; a true return means the
-            // window closed. The game thread paces itself through the VBlank
-            // scheduler, so a short sleep here is all the pacing this loop needs.
-            const auto &hooks = Ps2PresentHooks::hooks();
-            const bool hostShutdown = hooks.mainTick && hooks.mainTick();
-            std::this_thread::sleep_for(std::chrono::milliseconds(4));
-            if (hostShutdown)
-            {
-                RUNTIME_LOG("[run] host presentation requested shutdown, breaking out of loop");
-                requestStop();
-                break;
-            }
-            continue;
-        }
         // Diagnostic: one-shot guest RAM dump for offline disassembly.
         // PS2X_DIAG_EE_DUMP=<hexaddr>:<hexlen>[:<frame>] (default frame 600).
         {
@@ -2814,6 +2797,25 @@ void PS2Runtime::run()
                     RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
                 }
             }
+        }
+        if (m_headlessPresentation)
+        {
+            // SUIKO(gs-phase6): the host owns presentation (PCSX2 GS swapchain
+            // window). Pump its events via mainTick; a true return means the
+            // window closed. The game thread paces itself through the VBlank
+            // scheduler, so a short sleep here is all the pacing this loop needs.
+            // The diagnostics above run before this branch so PS2X_DUMP_AT and
+            // PS2X_DIAG_EE_DUMP also work with video.backend=pcsx2.
+            const auto &hooks = Ps2PresentHooks::hooks();
+            const bool hostShutdown = hooks.mainTick && hooks.mainTick();
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            if (hostShutdown)
+            {
+                RUNTIME_LOG("[run] host presentation requested shutdown, breaking out of loop");
+                requestStop();
+                break;
+            }
+            continue;
         }
         // Diagnostic: PS2X_EE_THREAD_DUMP_AT=<vsync>[,<vsync>...] prints the
         // scheduler snapshot (every thread's PC and wait reason) when the EE
