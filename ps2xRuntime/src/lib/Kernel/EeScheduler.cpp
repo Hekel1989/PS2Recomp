@@ -1320,14 +1320,41 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
     assertExecutor();
     if (cause < 32u)
     {
-        uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
-        if (enabled)
+        if (dmac)
         {
-            mask |= 1u << cause;
+            // The Sony kernel guards EnableDmac/DisableDmac with a software
+            // cache of the channel-enable state and only writes the D_STAT
+            // mask bit when the requested state differs from the cached one
+            // (same pattern as the dmac_mask guard in Linux' PS2 irq driver).
+            // A game that enables DMAC IRQs via direct D_STAT MMIO writes and
+            // then calls DisableDmac for a channel the kernel never enabled
+            // therefore keeps its IRQs on real hardware; model that here.
+            const uint32_t bit = 1u << cause;
+            if (enabled)
+            {
+                if ((m_dmacEnableCache & bit) == 0u)
+                {
+                    m_dmacEnableCache |= bit;
+                    m_enabledDmacMask |= bit;
+                }
+            }
+            else if ((m_dmacEnableCache & bit) != 0u)
+            {
+                m_dmacEnableCache &= ~bit;
+                m_enabledDmacMask &= ~bit;
+            }
         }
         else
         {
-            mask &= ~(1u << cause);
+            uint32_t &mask = m_enabledIntcMask;
+            if (enabled)
+            {
+                mask |= 1u << cause;
+            }
+            else
+            {
+                mask &= ~(1u << cause);
+            }
         }
     }
     return KE_OK;

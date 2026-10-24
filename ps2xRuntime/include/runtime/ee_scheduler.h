@@ -427,6 +427,12 @@ private:
     int m_dmacTailOrder = 1000;
     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+    // Software mirror of the DMAC channel-enable state as tracked by the Sony
+    // kernel's EnableDmac/DisableDmac syscalls.  The kernel only flips the
+    // D_STAT mask bits when the requested state differs from this cache, so
+    // direct D_STAT MMIO writes by a game (which the kernel cannot observe)
+    // are not undone by a DisableDmac for a channel the kernel never enabled.
+    uint32_t m_dmacEnableCache = 0u;
     int m_currentThreadId = 0;
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
