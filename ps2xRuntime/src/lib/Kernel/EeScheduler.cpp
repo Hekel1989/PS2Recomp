@@ -8,6 +8,13 @@
 #include "runtime/ps2_diag_shares.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <string>
+#include <unwind.h>
+#include <dlfcn.h>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -424,6 +431,33 @@ void EeScheduler::run()
                               << " sp=0x" << getRegU32(&context, 29)
                               << " entry=0x" << item.entry
                               << std::dec << std::endl;
+                    // PS2X_EE_THREAD_DUMP_REGS=1 adds the argument/saved
+                    // registers and f20-f22, for loops that never return.
+                    static const bool dumpRegs = std::getenv("PS2X_EE_THREAD_DUMP_REGS") != nullptr;
+                    if (dumpRegs)
+                    {
+                        std::cerr << "[ee-threads] tid=" << id << " regs" << std::hex;
+                        static const int kRegs[] = {2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 30};
+                        for (const int reg : kRegs)
+                        {
+                            std::cerr << " r" << std::dec << reg << std::hex << "=0x" << getRegU32(&context, reg);
+                        }
+                        std::cerr << std::dec << " f20=" << context.f[20] << " f21=" << context.f[21]
+                                  << " f22=" << context.f[22] << std::endl;
+                    }
+                }
+                // With PS2X_EE_RAM_DUMP=<prefix>, the last requested dump also
+                // writes EE RAM to <prefix>v<vsync>.bin.
+                const char *ramPrefix = std::getenv("PS2X_EE_RAM_DUMP");
+                if (ramPrefix != nullptr && dumpNext == dump.count && m_rdram != nullptr)
+                {
+                    const std::string file = std::string(ramPrefix) + "v" + std::to_string(m_vsyncTick) + ".bin";
+                    if (FILE *out = std::fopen(file.c_str(), "wb"))
+                    {
+                        std::fwrite(m_rdram, 1, PS2_RAM_SIZE, out);
+                        std::fclose(out);
+                        std::cerr << "[ee-threads] wrote " << file << std::endl;
+                    }
                 }
             }
         }
@@ -860,6 +894,85 @@ void EeScheduler::dispatchOnFiber(PS2Runtime::RecompiledFunction function, R5900
     }
 }
 
+namespace
+{
+    // Diagnostic: PS2X_EE_FIBER_AUDIT=1 walks the fiber's host stack at every
+    // fiber transfer and reports each new chain that contains a frame with
+    // C++ exception tables (a try/catch or an object with a destructor).  The
+    // exception path ran those clean-ups while unwinding; the fiber path
+    // abandons the stack, so every reported chain must be checked by hand.
+    // Addresses are module-relative for addr2line.
+    bool eeFiberAuditEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_FIBER_AUDIT") != nullptr;
+        return enabled;
+    }
+
+    struct FiberAuditWalk
+    {
+        uintptr_t top = 0;
+        std::array<uintptr_t, 48> ips{};
+        std::array<bool, 48> hasTables{};
+        size_t count = 0;
+    };
+
+    _Unwind_Reason_Code fiberAuditFrame(_Unwind_Context *context, void *argument)
+    {
+        auto *walk = static_cast<FiberAuditWalk *>(argument);
+        if (_Unwind_GetCFA(context) >= walk->top || walk->count >= walk->ips.size())
+        {
+            return _URC_END_OF_STACK;
+        }
+        walk->ips[walk->count] = _Unwind_GetIP(context);
+        walk->hasTables[walk->count] = _Unwind_GetLanguageSpecificData(context) != nullptr;
+        ++walk->count;
+        return _URC_NO_REASON;
+    }
+
+    void auditFiberTransfer(const void *stackTop, uint32_t reason)
+    {
+        FiberAuditWalk walk;
+        walk.top = reinterpret_cast<uintptr_t>(stackTop);
+        _Unwind_Backtrace(&fiberAuditFrame, &walk);
+
+        std::string key;
+        bool anyTables = false;
+        for (size_t i = 0; i < walk.count; ++i)
+        {
+            if (walk.hasTables[i])
+            {
+                anyTables = true;
+                key += std::to_string(walk.ips[i]);
+                key += ',';
+            }
+        }
+        if (!anyTables)
+        {
+            return;
+        }
+
+        static std::mutex mutex;
+        static std::set<std::string> seen;
+        std::lock_guard lock(mutex);
+        if (seen.size() >= 500u || !seen.insert(key).second)
+        {
+            return;
+        }
+        std::cerr << "[ee-fiber-audit] reason=" << reason << " frames:";
+        for (size_t i = 0; i < walk.count; ++i)
+        {
+            Dl_info info{};
+            uintptr_t offset = walk.ips[i];
+            if (dladdr(reinterpret_cast<void *>(walk.ips[i]), &info) != 0 && info.dli_fbase != nullptr)
+            {
+                offset -= reinterpret_cast<uintptr_t>(info.dli_fbase);
+            }
+            std::cerr << ' ' << (walk.hasTables[i] ? "*" : "") << "0x" << std::hex << offset << std::dec;
+        }
+        std::cerr << std::endl;
+    }
+} // namespace
+
 [[noreturn]] void EeScheduler::switchToDispatcher(uint32_t reason)
 {
     // The dispatcher itself (a completion/onComplete callback) still uses the
@@ -874,6 +987,10 @@ void EeScheduler::dispatchOnFiber(PS2Runtime::RecompiledFunction function, R5900
     {
         beginTransfer(reason);
         throw EeDispatcherTransfer{};
+    }
+    if (eeFiberAuditEnabled())
+    {
+        auditFiberTransfer(m_currentFiber->stackTop(), reason);
     }
     beginTransfer(reason);
     m_dispatchReason = reason;

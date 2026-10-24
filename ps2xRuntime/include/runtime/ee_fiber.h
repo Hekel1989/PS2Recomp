@@ -53,6 +53,11 @@ namespace ps2x::ee
         // set at construction (0 otherwise).  The stack is painted once.
         [[nodiscard]] std::size_t peakStackBytes() const noexcept;
         [[nodiscard]] std::size_t stackSize() const noexcept { return m_stackSize; }
+        // One past the highest usable byte of the stack (the first frame's top).
+        [[nodiscard]] const void *stackTop() const noexcept
+        {
+            return static_cast<const char *>(m_stack) + m_stackSize;
+        }
         [[nodiscard]] const char *name() const noexcept { return m_name; }
 
     private:
