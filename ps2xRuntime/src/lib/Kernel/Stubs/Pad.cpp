@@ -729,13 +729,23 @@ namespace ps2_stubs
             setReturnS32(ctx, 0);
             return;
         case 4: // PAD_MODETABLE
+            // SUIKO(pad-mode-table): a DualShock 2 advertises both its digital
+            // (id 4 / report 0x41) and analog (id 7 / report 0x73) modes. The
+            // game's pad init walks this table looking for id 7 and only leaves
+            // its setup state once it can call scePadSetMainMode with that
+            // index (see sub_00111BA8/sub_00111C60); advertising only id 4
+            // left it stuck before the report parser ever ran.
             if (index == -1)
             {
-                setReturnS32(ctx, 1); // one available mode
+                setReturnS32(ctx, 2); // digital + DualShock
             }
             else if (index == 0)
             {
-                setReturnS32(ctx, currentId);
+                setReturnS32(ctx, kPadTypeDigital);
+            }
+            else if (index == 1)
+            {
+                setReturnS32(ctx, kPadTypeDualShock);
             }
             else
             {
