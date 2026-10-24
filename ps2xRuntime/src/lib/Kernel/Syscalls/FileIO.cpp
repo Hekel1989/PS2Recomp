@@ -38,6 +38,13 @@ namespace ps2_syscalls
         }
 
         const int32_t descriptor = runtime->vfs().open(ps2Path, static_cast<uint32_t>(flags), currentVfsMounts(), runtime->romDevice());
+        // Diagnostic: PS2X_FIO_TRACE=1 logs every guest open with the resulting descriptor.
+        static const bool fioTrace = std::getenv("PS2X_FIO_TRACE") != nullptr;
+        if (fioTrace)
+        {
+            std::cerr << "[fio] open \"" << ps2Path << "\" flags=0x" << std::hex << flags << std::dec
+                      << " -> " << descriptor << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
         setReturnS32(ctx, descriptor);
     }
 
