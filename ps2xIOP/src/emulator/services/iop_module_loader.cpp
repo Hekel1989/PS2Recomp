@@ -367,10 +367,9 @@ namespace ps2x::iop::detail
         return host.readGuest(guestAddress, bytes.data(), bytes.size());
     }
 
-    IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor)
+    IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory)
     {
         IopImageLoadResult result;
-        result.nextModuleCursor = moduleCursor;
         if (image.size() < sizeof(Elf32Ehdr))
             return result;
 
@@ -431,19 +430,36 @@ namespace ps2x::iop::detail
         int64_t delta = 0;
         if (relocate)
         {
-            base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            base = memory.allocate(span, 0x100u);
+            if (base == 0u)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
             delta = static_cast<int64_t>(base) - minVaddr;
-            result.nextModuleCursor = base + span;
         }
         else
         {
-            base = minVaddr;
+            base = memory.allocate(span, 0x100u, minVaddr);
+            if (base == 0u)
+            {
+                // The fixed link address is already occupied (e.g. by heap
+                // allocations made before this module was loaded): relocate.
+                base = memory.allocate(span, 0x100u);
+                if (base == 0u)
+                {
+                    result.error = IopImageLoadError::ArenaExhausted;
+                    return result;
+                }
+                delta = static_cast<int64_t>(base) - minVaddr;
+            }
         }
+        // Release the reservation again when the image turns out to be unusable.
+        const auto failLoad = [&]
+        {
+            memory.freeAllocation(base);
+            return result;
+        };
 
         if (hasLoad)
         {
@@ -453,14 +469,14 @@ namespace ps2x::iop::detail
                     continue;
                 if (!checkedRange(image.size(), program.offset, program.filesz) ||
                     program.memsz < program.filesz)
-                    return result;
+                    return failLoad();
                 const uint32_t destination = static_cast<uint32_t>(static_cast<int64_t>(program.vaddr) + delta);
                 if (destination >= IopMemory::RamSize || program.memsz > IopMemory::RamSize - destination)
-                    return result;
+                    return failLoad();
                 if (!memory.writeRam(destination, image.data() + program.offset, program.filesz))
-                    return result;
+                    return failLoad();
                 if (program.memsz > program.filesz && !memory.zeroRam(destination + program.filesz, program.memsz - program.filesz))
-                    return result;
+                    return failLoad();
             }
         }
         else
@@ -483,17 +499,17 @@ namespace ps2x::iop::detail
                     sectionCursor += section.size;
                 }
                 if (destination >= IopMemory::RamSize || section.size > IopMemory::RamSize - destination)
-                    return result;
+                    return failLoad();
                 if (section.type == SHT_NOBITS)
                 {
                     if (!memory.zeroRam(destination, section.size))
-                        return result;
+                        return failLoad();
                 }
                 else
                 {
                     if (!checkedRange(image.size(), section.offset, section.size) ||
                         !memory.writeRam(destination, image.data() + section.offset, section.size))
-                        return result;
+                        return failLoad();
                 }
             }
         }

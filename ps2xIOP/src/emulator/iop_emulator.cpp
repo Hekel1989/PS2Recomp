@@ -160,7 +160,6 @@ namespace ps2x::iop::detail
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
-            moduleCursor = kModuleLoadBase;
             totalCycles = 0;
             totalInstructions = 0;
             branchTraceNext = 0u;
@@ -749,8 +748,7 @@ namespace ps2x::iop::detail
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
-            const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
-            moduleCursor = loaded.nextModuleCursor;
+            const IopImageLoadResult loaded = IopModuleLoader::load(image, memory);
             if (!loaded)
             {
                 if (loaded.error == IopImageLoadError::InvalidElf)
@@ -829,6 +827,7 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            memory.freeAllocation(it->second.base);
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -869,7 +868,6 @@ namespace ps2x::iop::detail
         size_t branchTraceFilled = 0u;
         std::set<int> firstRunLogged;
         uint32_t nextModuleId = 1;
-        uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;

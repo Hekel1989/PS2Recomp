@@ -23,7 +23,12 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // The sysmem allocation region covers all RAM available to modules and
+        // AllocSysMemory: from the module load base up to the emulator's call
+        // stack reservation (mirroring how the real IOP kernel reserves the top
+        // of RAM for its stacks). Module images are registered as fixed
+        // allocations so the free list never hands out their ranges.
+        static constexpr uint32_t HeapBase = 0x00010000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -56,9 +61,16 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isHardwareAddress(uint32_t address) const;
         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
 
-        [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+        // Free-list allocator over [HeapBase, HeapLimit). `fixed` selects an
+        // exact address (AllocSysMemory ADDR mode); `last` allocates the
+        // highest fitting free block (LAST mode); the default is the lowest
+        // fitting free block (FIRST mode).
+        [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u,
+                                        std::optional<uint32_t> fixed = std::nullopt,
+                                        bool last = false);
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
+        [[nodiscard]] uint32_t totalFreeMemory() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
@@ -93,7 +105,6 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
-        uint32_t m_heapCursor = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
