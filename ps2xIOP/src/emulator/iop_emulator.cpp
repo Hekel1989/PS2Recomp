@@ -245,7 +245,7 @@ namespace ps2x::iop::detail
             branchTraceNext = 0u;
             branchTraceFilled = 0u;
             firstRunLogged.clear();
-            eeCycleCarry = 0;
+            eeCyclesSeen = 0;
             lastIdleDumpCycle = 0;
             activeCpu = nullptr;
             lastError.clear();
@@ -1143,7 +1143,11 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t lastIdleDumpCycle = 0;
         uint64_t totalInstructions = 0;
-        uint64_t eeCycleCarry = 0;
+        // EE cycles reported to the IOP so far.  The IOP clock is derived from
+        // this instead of being advanced by a per-call cycle count, so guest
+        // callbacks run synchronously for an EE RPC consume the IOP's share of
+        // emulated time instead of adding to it (see runEeCycles).
+        uint64_t eeCyclesSeen = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -1183,11 +1187,17 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
-        m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        // The IOP runs at 1/8 of the EE clock, so the IOP cycle counter is
+        // derived from the EE cycles seen rather than from a sum of per-call
+        // advances.  Guest callbacks dispatched synchronously for an EE RPC
+        // (callFunction) also advance totalCycles; those instructions are the
+        // IOP's share of the same emulated time, not extra time, so they must
+        // consume this budget.  Adding them on top made the IOP (and the SPU2
+        // clocked from it) run ahead of EE/wall time, stretching the audio.
+        m_impl->eeCyclesSeen += eeCycles;
+        const uint64_t target = m_impl->eeCyclesSeen / 8u;
+        if (target > m_impl->totalCycles)
+            m_impl->runCycles(target - m_impl->totalCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
