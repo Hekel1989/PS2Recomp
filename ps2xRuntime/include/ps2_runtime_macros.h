@@ -590,7 +590,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store8(rdram, ctx, _addr, (val));                               \
         else                                                                         \
         {                                                                            \
-            ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
+            if (ps2EeWatchEnabled())                                     \
+                ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
             FAST_WRITE8(_addr, (val));                                               \
         }                                                                            \
     } while (0)
@@ -603,7 +604,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store16(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
-            ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
+            if (ps2EeWatchEnabled())                                       \
+                ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
             FAST_WRITE16(_addr, (val));                                                \
         }                                                                              \
     } while (0)
@@ -616,7 +618,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store32(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
-            ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
+            if (ps2EeWatchEnabled())                                       \
+                ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
             FAST_WRITE32(_addr, (val));                                                \
         }                                                                              \
     } while (0)
@@ -629,7 +632,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store64(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
-            ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
+            if (ps2EeWatchEnabled())                                       \
+                ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
             FAST_WRITE64(_addr, (val));                                                \
         }                                                                              \
     } while (0)
@@ -645,7 +649,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         {                                                                            \
             const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); \
             const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); \
-            ps2TraceGuestWrite(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);        \
+            if (ps2EeWatchEnabled())                                    \
+                ps2TraceGuestWrite(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);    \
             FAST_WRITE128(_addr, _value);                                            \
         }                                                                            \
     } while (0)

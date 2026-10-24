@@ -241,6 +241,44 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+// Diagnostic write watchpoint over guest RAM: PS2X_EE_WATCH=<hexlo>[-<hexhi>].
+// Logs every guest write touching the range with pc/ra/value.
+struct Ps2EeWatchConfig
+{
+    bool enabled;
+    uint32_t low;
+    uint32_t high;
+};
+
+inline const Ps2EeWatchConfig &ps2EeWatchConfig()
+{
+    static const Ps2EeWatchConfig config = [] {
+        Ps2EeWatchConfig value{false, 0u, 0u};
+        const char *env = std::getenv("PS2X_EE_WATCH");
+        if (env != nullptr)
+        {
+            char *end = nullptr;
+            value.low = static_cast<uint32_t>(std::strtoul(env, &end, 16));
+            value.high = value.low + 4u;
+            if (end != nullptr && *end == '-')
+            {
+                value.high = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) + 1u;
+            }
+            value.enabled = true;
+        }
+        return value;
+    }();
+    return config;
+}
+
+// SUIKO(perf): generated stores call this before ps2TraceGuestWrite(); inlining
+// the disarmed case keeps the diagnostic out of the hot store path (the
+// out-of-line call cost ~1.5% of the title CPU on the Legion).
+inline bool ps2EeWatchEnabled()
+{
+    return ps2EeWatchConfig().enabled;
+}
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -251,31 +289,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
 {
     (void)rdram;
     (void)valueHi;
-    // Diagnostic write watchpoint over guest RAM: PS2X_EE_WATCH=<hexlo>[-<hexhi>].
-    // Logs every guest write touching the range with pc/ra/value. When the
-    // variable is unset the only cost is one cached bool and two comparisons.
-    struct EeWatchConfig
-    {
-        bool enabled;
-        uint32_t low;
-        uint32_t high;
-    };
-    static const EeWatchConfig watch = [] {
-        EeWatchConfig config{false, 0u, 0u};
-        const char *env = std::getenv("PS2X_EE_WATCH");
-        if (env != nullptr)
-        {
-            char *end = nullptr;
-            config.low = static_cast<uint32_t>(std::strtoul(env, &end, 16));
-            config.high = config.low + 4u;
-            if (end != nullptr && *end == '-')
-            {
-                config.high = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) + 1u;
-            }
-            config.enabled = true;
-        }
-        return config;
-    }();
+    const Ps2EeWatchConfig &watch = ps2EeWatchConfig();
     if (watch.enabled)
     {
         const uint32_t writeSize = size != 0u ? size : 4u;
