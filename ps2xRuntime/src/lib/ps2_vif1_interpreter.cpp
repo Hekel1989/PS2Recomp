@@ -1,6 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +66,21 @@ namespace
             {
                 payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
                 const uint64_t availableBytes = sizeBytes - offset;
+                // SUIKO(gs-xfer-trace): log every IMAGE GIFtag seen in a VIF1
+                // DIRECT payload, whether or not its data is present, so a
+                // font/CLUT upload can be spotted even when the parser later
+                // loses track of it.
+                static const bool s_xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+                static int s_imgTagBudget = 2000;
+                if (s_xferTrace && s_imgTagBudget-- > 0)
+                {
+                    std::fprintf(stderr, "[gs-xfer] VIF1 IMAGE tag: nloop=0x%x present=0x%llx deficit=0x%llx\n",
+                                 nloop,
+                                 static_cast<unsigned long long>(availableBytes / 16ull),
+                                 payloadBytes > availableBytes
+                                     ? static_cast<unsigned long long>((payloadBytes - availableBytes) / 16ull)
+                                     : 0ull);
+                }
                 if (payloadBytes > availableBytes)
                 {
                     return static_cast<uint32_t>((payloadBytes - availableBytes) / 16ull);
@@ -219,6 +235,17 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         vif0_regs.num = num;
         if (irq)
             vif0_regs.stat |= (1u << 11);
+
+        // SUIKO(gs-xfer-trace): log the VIF0 command stream so uploads sent
+        // via VIF0 (e.g. font/CLUT DIRECTs) can be spotted even though VIF0
+        // DIRECT is not forwarded to the GIF today.
+        {
+            static const bool s_vif0Trace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+            static int s_vif0Budget = 20000;
+            if (s_vif0Trace && s_vif0Budget-- > 0)
+                std::fprintf(stderr, "[gs-vif0] cmd=%02x num=%u imm=%u pos=%u/%u\n", opcode, num, imm, pos - 4u,
+                             sizeBytes);
+        }
 
         if (opcode == VIF_NOP)
         {
@@ -383,6 +410,12 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else
         {
+            // SUIKO(gs-xfer-trace): VIF0 stops here on DIRECT/DIRECTHL/unknown
+            // opcodes; everything after this point in the chunk is dropped.
+            static const bool s_vif0Trace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+            static int s_vif0BreakBudget = 2000;
+            if (s_vif0Trace && s_vif0BreakBudget-- > 0)
+                std::fprintf(stderr, "[gs-vif0] BREAK at cmd=%02x pos=%u/%u\n", opcode, pos - 4u, sizeBytes);
             break;
         }
     }
@@ -416,6 +449,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     uint32_t pos = 0;
 
+    // SUIKO(gs-xfer-trace): compact per-command stream so IMAGE-tag data
+    // placement can be reconstructed across DMA-chunk boundaries.
+    const bool xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+    if (xferTrace)
+    {
+        static int s_chunkBudget = 20000;
+        if (s_chunkBudget-- > 0)
+            std::fprintf(stderr, "[gs-vif] chunk size=%u pending=%u\n", sizeBytes, m_vif1PendingPath2ImageQwc);
+    }
+
     while (pos + 4 <= sizeBytes)
     {
         if (m_vif1PendingPath2ImageQwc != 0u)
@@ -427,6 +470,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
 
             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+            if (xferTrace)
+                std::fprintf(stderr, "[gs-vif]   cont-consume qw=%u of pending %u\n", chunkQw,
+                             m_vif1PendingPath2ImageQwc);
             std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
             const uint64_t imageTag =
                 static_cast<uint64_t>(chunkQw & 0x7FFFu) |
@@ -458,6 +504,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
+
+        if (xferTrace)
+        {
+            static int s_cmdBudget = 200000;
+            // Skip the flood of zero-fill NOPs (the game's unwritten command
+            // buffers) unless an IMAGE transfer is waiting for data.
+            if ((opcode != 0u || imm != 0u || num != 0u || m_vif1PendingPath2ImageQwc != 0u) &&
+                s_cmdBudget-- > 0)
+                std::fprintf(stderr, "[gs-vif]   cmd=%02x num=%u imm=%u pos=%u/%u pending=%u\n", opcode, num, imm,
+                             pos - 4u, sizeBytes, m_vif1PendingPath2ImageQwc);
+        }
 
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
@@ -641,11 +698,30 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             s_dumpNextChunkHead = true;
                     }
                 }
+                // SUIKO(gs-xfer-trace): log the DIRECT packet head so IMAGE
+                // uploads carried this way can be traced to their source bytes.
+                if (xferTrace)
+                {
+                    static int s_directBudget = 4000;
+                    if (s_directBudget-- > 0)
+                    {
+                        const uint8_t *d = data + pos;
+                        char hex[65] = {};
+                        const uint32_t dump = std::min<uint32_t>(qwCount * 16u, 32u);
+                        for (uint32_t i = 0; i < dump; ++i)
+                            std::snprintf(hex + i * 2, 3, "%02x", d[i]);
+                        std::fprintf(stderr, "[gs-xfer] VIF1 %s imm=%u qw=0x%x src=0x%08x head=%s\n",
+                                     directHl ? "DIRECTHL" : "DIRECT", imm, qwCount, pos, hex);
+                    }
+                }
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
                 if (pendingImageQw != 0u)
                 {
+                    if (xferTrace)
+                        std::fprintf(stderr, "[gs-vif]   set-pending=%u truncated=%d\n", pendingImageQw,
+                                     truncated ? 1 : 0);
                     m_vif1PendingPath2ImageQwc = pendingImageQw;
                     m_vif1PendingPath2DirectHl = directHl;
                 }

@@ -763,6 +763,20 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
                 imageBytes = sizeBytes - offset;
+            // SUIKO(gs-xfer-trace): an IMAGE GIFtag whose payload is not fully
+            // present in this packet (tag-only packet, or a payload cut at the
+            // packet end). The hardware keeps the transfer open and consumes
+            // the next qwords on the path as image data; note it so the
+            // follow-up data can be matched to the tag that opened it.
+            static const bool s_xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+            if (s_xferTrace && imageBytes < nloop * 16u)
+            {
+                RUNTIME_LOG("[gs-xfer] IMAGE tag short: nloop=0x" << std::hex << nloop
+                                                                  << " present=0x" << (imageBytes / 16u)
+                                                                  << " deficit=0x" << (nloop - imageBytes / 16u)
+                                                                  << " packetQw=0x" << (sizeBytes / 16u)
+                                                                  << std::dec << std::endl);
+            }
             processImageData(data + offset, imageBytes);
             offset += imageBytes;
         }
@@ -1668,6 +1682,44 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    // SUIKO(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every IMAGE transfer the
+    // runtime performs -- native fast-path chains and generic GIF IMAGE tags
+    // both funnel through here -- with the full transfer setup, the payload
+    // qword count and an FNV-1a-64 hash of the payload bytes, so uploads can
+    // be matched against what the reference game writes into VRAM.
+    static const bool s_xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+    if (s_xferTrace && data && sizeBytes != 0u)
+    {
+        uint64_t hash = 14695981039346656037ull;
+        for (uint32_t i = 0; i < sizeBytes; ++i)
+        {
+            hash ^= data[i];
+            hash *= 1099511628211ull;
+        }
+        char hex[65] = {};
+        const uint32_t dumpBytes = sizeBytes < 32u ? sizeBytes : 32u;
+        for (uint32_t i = 0; i < dumpBytes; ++i)
+            std::snprintf(hex + i * 2, 3, "%02x", data[i]);
+        RUNTIME_LOG("[gs-xfer]"
+                    << " DBP=0x" << std::hex << m_bitbltbuf.dbp
+                    << " DBW=0x" << static_cast<unsigned>(m_bitbltbuf.dbw)
+                    << " DPSM=0x" << static_cast<unsigned>(m_bitbltbuf.dpsm)
+                    << " SBP=0x" << std::hex << m_bitbltbuf.sbp
+                    << " SBW=0x" << static_cast<unsigned>(m_bitbltbuf.sbw)
+                    << " SPSM=0x" << static_cast<unsigned>(m_bitbltbuf.spsm)
+                    << " DSAX=0x" << m_trxpos.dsax
+                    << " DSAY=0x" << m_trxpos.dsay
+                    << " SSAX=0x" << m_trxpos.ssax
+                    << " SSAY=0x" << m_trxpos.ssay
+                    << " RRW=0x" << m_trxreg.rrw
+                    << " RRH=0x" << m_trxreg.rrh
+                    << " DIR=" << m_trxdir
+                    << " qw=0x" << (sizeBytes / 16u)
+                    << " bytes=0x" << sizeBytes
+                    << " fnv=0x" << hash
+                    << " data=" << hex
+                    << std::dec << std::endl);
+    }
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }

@@ -2706,6 +2706,8 @@ void PS2Runtime::run()
                 const auto eeSnapshot = m_eeScheduler->snapshot();
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
+                                               << " vsync=" << std::dec
+                                               << gs.vsyncTick.load(std::memory_order_relaxed)
                                                << " pc=0x" << std::hex << dbgPc
                                                << " ra=0x" << dbgRa
                                                << " sp=0x" << dbgSp

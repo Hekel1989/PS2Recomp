@@ -2235,6 +2235,30 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     if (!data || sizeBytes < 16)
         return;
 
+    // SUIKO(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every tagged packet as it
+    // enters the GIF arbiter, with the submitting path (p2 = VIF1
+    // DIRECT/DIRECTHL, p3 = GIF DMA) and the leading GIFtag header, so each
+    // IMAGE data burst seen by the GS frontend can be attributed to the DMA
+    // path that delivered it.
+    {
+        static const bool s_xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+        static int s_xferBudget = 20000;
+        if (s_xferTrace && s_xferBudget-- > 0)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data, sizeof(tagLo));
+            std::fprintf(stderr,
+                         "[gs-xfer] submit p%u qw=0x%x nloop=0x%x flg=%u nreg=0x%x hl=%d cont=%d\n",
+                         pathId == GifPathId::Path2 ? 2u : (pathId == GifPathId::Path3 ? 3u : 1u),
+                         sizeBytes / 16u,
+                         static_cast<unsigned>(tagLo & 0x7FFFull),
+                         static_cast<unsigned>((tagLo >> 58u) & 3ull),
+                         static_cast<unsigned>((tagLo >> 60u) & 0xFull),
+                         path2DirectHl ? 1 : 0,
+                         directContinuation ? 1 : 0);
+        }
+    }
+
     if (pathId == GifPathId::Path3)
     {
         if (m_path3Masked)
@@ -2388,6 +2412,21 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     if (!decodeSetupPayload(setupPayload, setupRegs))
         return false;
 
+    // SUIKO(gs-xfer-trace): the chain looks like an IMAGE upload setup from
+    // here on; if a later structural check rejects it, the upload is silently
+    // handed to the generic walker instead. Log such near-misses and the
+    // accepted chain's source addresses so image uploads can be traced
+    // end-to-end with PS2X_GS_XFER_TRACE=1.
+    static const bool s_xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
+    auto rejectFastPath = [&](const char *why) -> bool
+    {
+        if (s_xferTrace)
+        {
+            std::fprintf(stderr, "[gs-xfer] fast path rejected chain tadr=0x%08x: %s\n", tadr, why);
+        }
+        return false;
+    };
+
     uint32_t imageTagDmaAddr = setupPayloadAddr + 5u * 16u;
     DmaTagView imageTagDma{};
     if (!loadDmaTagAt(imageTagDmaAddr, imageTagDma) ||
@@ -2395,24 +2434,24 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
         imageTagDma.qwc != 1u ||
         imageTagDma.irq)
     {
-        return false;
+        return rejectFastPath("image-tag DMA tag");
     }
 
     const uint8_t *imageGifTag = nullptr;
     if (!resolveContiguous(imageTagDmaAddr + 16u, 16u, imageGifTag))
-        return false;
+        return rejectFastPath("image GIFtag not resolvable");
 
     const uint64_t imageTagLo = loadScalar<uint64_t>(imageGifTag, 0u, 16u, "native gif image tag", imageTagDmaAddr + 16u);
     if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE)
-        return false;
+        return rejectFastPath("second GIFtag is not IMAGE");
 
     const uint32_t imageQwc = gifTagNloop(imageTagLo);
     if (imageQwc == 0u)
-        return false;
+        return rejectFastPath("IMAGE GIFtag NLOOP=0");
 
     const uint64_t imageBytes64 = static_cast<uint64_t>(imageQwc) * 16ull;
     if (imageBytes64 > 0xFFFFFFFFull)
-        return false;
+        return rejectFastPath("IMAGE size overflow");
     const uint32_t imageBytes = static_cast<uint32_t>(imageBytes64);
 
     const uint32_t payloadTagAddr = imageTagDmaAddr + 32u;
@@ -2421,7 +2460,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
         payloadTag.qwc != imageQwc ||
         payloadTag.irq)
     {
-        return false;
+        return rejectFastPath("payload DMA tag qwc/id mismatch");
     }
 
     uint32_t imageDataAddr = 0u;
@@ -2437,7 +2476,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
             terminalTag.irq ||
             (terminalTag.id != 0u && terminalTag.id != 7u))
         {
-            return false;
+            return rejectFastPath("terminal tag after CONT/REFE payload");
         }
         finalTadr = (terminalTag.id == 0u) ? (terminalTagAddr + 16u) : terminalTagAddr;
         lastTagUpper = terminalTag.upper;
@@ -2449,12 +2488,27 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     }
     else
     {
-        return false;
+        return rejectFastPath("payload DMA tag id");
     }
 
     const uint8_t *imageData = nullptr;
     if (!resolveContiguous(imageDataAddr, imageBytes, imageData))
-        return false;
+        return rejectFastPath("payload not resolvable");
+
+    if (s_xferTrace)
+    {
+        const uint32_t dbp = static_cast<uint32_t>(setupRegs[0] & 0x3FFFull);
+        const uint32_t dbw = static_cast<uint32_t>((setupRegs[0] >> 16u) & 0xFFull);
+        const uint32_t dpsm = static_cast<uint32_t>((setupRegs[0] >> 24u) & 0x3Full);
+        std::fprintf(stderr,
+                     "[gs-xfer] fast path accepted chain tadr=0x%08x imageQwc=%u payloadSrc=0x%08x"
+                     " DBP=0x%x DBW=0x%x DPSM=0x%x DSAX=0x%x DSAY=0x%x RRW=0x%x RRH=0x%x\n",
+                     tadr, imageQwc, imageDataAddr, dbp, dbw, dpsm,
+                     static_cast<uint32_t>(setupRegs[1] & 0xFFFFull),
+                     static_cast<uint32_t>((setupRegs[1] >> 16u) & 0xFFFFull),
+                     static_cast<uint32_t>(setupRegs[2] & 0xFFFull),
+                     static_cast<uint32_t>((setupRegs[2] >> 32u) & 0xFFFull));
+    }
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
