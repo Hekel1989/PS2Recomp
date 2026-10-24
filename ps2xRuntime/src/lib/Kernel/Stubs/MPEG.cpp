@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ee_time.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -1103,7 +1104,22 @@ namespace ps2_stubs
                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
             }
 
-            if (!playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k))
+            // SUIKO(movie-audio): a long software video decode blocks the EE
+            // executor while the wall-clock pacing keeps advancing the
+            // IOP/SPU2.  The game's SIF audio producer is blocked for the same
+            // interval, so the 24 KiB IOP ring laps and the pump resyncs with
+            // a ~40 ms tear at a complex frame.  Charge the excess over the
+            // normal decode cost as host-only time: the guest (and the audio
+            // hardware) pauses, and the output cushion absorbs the pause.
+            const auto decodeStart = std::chrono::steady_clock::now();
+            const bool decoded = playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k);
+            const auto decodeEnd = std::chrono::steady_clock::now();
+            const auto decodeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(decodeEnd - decodeStart);
+            constexpr auto kFreeDecodeTime = std::chrono::milliseconds(2);
+            if (decodeNs > kFreeDecodeTime)
+                ps2x::time::noteHostStall(decodeNs - kFreeDecodeTime);
+
+            if (!decoded)
             {
                 playback.decoder.reset();
                 playback.waitingForVideoSequenceHeader = true;
