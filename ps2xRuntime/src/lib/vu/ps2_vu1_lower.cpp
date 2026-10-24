@@ -5,6 +5,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -89,6 +90,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         int16_t imm = IMM11(instr);
         uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
         addr &= (dataSize - 1);
+        if (std::getenv("PS2X_VU1_TRACE") != nullptr && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
+            std::fprintf(stderr, "[vu1:store] ISW pc=0x%x addr=0x%x vi=%u mask=0x%x\n",
+                         m_state.pc, addr, it, dest);
         if (addr + 16 <= dataSize)
         {
             float tmp[4];
@@ -105,6 +109,12 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         int16_t imm = IMM11(instr);
         uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[it] + imm)) * 16u;
         addr &= (dataSize - 1);
+        // SUIKO(diag-vu1-store-trace): the transition renderer is suspected of
+        // never storing the packet it later kicks; show stores to the two
+        // packet slots it uses.
+        if (std::getenv("PS2X_VU1_TRACE") != nullptr && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
+            std::fprintf(stderr, "[vu1:store] SQ pc=0x%x addr=0x%x vf=%u mask=0x%x\n",
+                         m_state.pc, addr, is, dest);
         if (addr + 16 <= dataSize)
         {
             uint32_t words[4]{};
