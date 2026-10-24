@@ -2154,7 +2154,12 @@ namespace ps2_stubs
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
             {
-                const uint32_t limitedBytes = std::min(byteCount, 8u * 1024u);
+                // SUIKO(movie-audio): one packet per call. Two packets let
+                // the callback write the next packet into the ring slot the
+                // SIF pump has not read yet, so the pump sees a torn page
+                // (and resyncs with a ~40 ms skip). One packet gives the
+                // pump a chance to run between callbacks.
+                const uint32_t limitedBytes = std::min(byteCount, 4u * 1024u);
                 if (limitedBytes != 0u)
                 {
                     consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, limitedBytes, callbackEvents);
@@ -2243,7 +2248,7 @@ namespace ps2_stubs
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
             {
-                const uint32_t limitedBytes = std::min(availableBytes, 8u * 1024u);
+                const uint32_t limitedBytes = std::min(availableBytes, 4u * 1024u);
                 if (limitedBytes != 0u)
                 {
                     consumed = appendGuestRingBytes(
