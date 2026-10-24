@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2_runtime.h"
+#include "runtime/ee_fiber.h"
 
 #include <array>
 #include <atomic>
@@ -9,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -406,6 +408,14 @@ private:
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     void sampleHostPacing(uint64_t nowWallNs) noexcept;
+    void beginTransfer(uint32_t reason) noexcept;
+    void endTransfer() noexcept;
+    void dispatchOnFiber(PS2Runtime::RecompiledFunction function, R5900Context &context);
+    static void fiberEntryThunk(void *argument);
+    [[nodiscard]] ps2x::ee::Fiber &acquireFiber(int threadId);
+    void releaseFiber(int threadId) noexcept;
+    [[noreturn]] void switchToDispatcher(uint32_t reason);
+    void traceSwitch(int toThreadId) noexcept;
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
@@ -470,6 +480,30 @@ private:
     uint64_t m_paceStalledNs = 0u;
     uint64_t m_paceDescheduledNs = 0u;
     bool m_paceInitialized = false;
+    // Diagnostic: PS2X_EE_SWITCH_STATS=1 counts EeDispatcherTransfer throws by
+    // reason and measures the throw-to-catch host time.  Inert when unset.
+    uint64_t m_transferStartNs = 0u;
+    uint32_t m_transferReason = 0u;
+    bool m_transferActive = false;
+    uint64_t m_switchCounts[4]{};
+    uint64_t m_switchNs[4]{};
+    uint64_t m_switchLastCounts[4]{};
+    uint64_t m_switchLastNs[4]{};
+    uint64_t m_switchLastGuestNs = 0u;
+    // Fiber dispatcher.  m_currentFiber is non-null only while recompiled
+    // code runs; transfer sites switch back to the dispatcher instead of
+    // throwing.  A fiber is never resumed: dispatcher re-entry is at the saved
+    // guest context, exactly like the exception path.
+    ps2x::ee::Fiber *m_currentFiber = nullptr;
+    uint32_t m_dispatchReason = 0u;
+    int m_pendingFiberFree = 0;
+    std::exception_ptr m_fiberException;
+    PS2Runtime::RecompiledFunction m_fiberFunction = nullptr;
+    R5900Context *m_fiberContext = nullptr;
+    std::unordered_map<int, std::unique_ptr<ps2x::ee::Fiber>> m_fibers;
+    int m_traceFromId = 0;
+    uint32_t m_traceReason = 0xFFu;
+    uint64_t m_traceCount = 0u;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};

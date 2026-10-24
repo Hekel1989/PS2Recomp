@@ -86,7 +86,7 @@ namespace ps2_syscalls
                                                  bool deleteThread)
         {
             EeScheduler &ee = runtime->eeScheduler();
-            const auto handlers = runtime->takeEeExitHandlers(tid);
+            auto handlers = runtime->takeEeExitHandlers(tid);
             std::vector<GuestInvocation> invocations;
             invocations.reserve(handlers.size());
             for (const PS2Runtime::EeExitHandlerRegistration &handler : handlers)
@@ -104,6 +104,10 @@ namespace ps2_syscalls
                 SET_GPR_U32(&invocation.context, 31, 0u);
                 invocations.push_back(std::move(invocation));
             }
+            // The host stack is abandoned at the transfer below (fiber path),
+            // so release this vector's storage explicitly; its destructor is
+            // not guaranteed to run.
+            std::vector<PS2Runtime::EeExitHandlerRegistration>().swap(handlers);
             if (invocations.empty())
             {
                 ee.exitCurrent(deleteThread);

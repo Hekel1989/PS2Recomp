@@ -192,6 +192,47 @@ namespace
         return enabled;
     }
 
+    // Diagnostic: PS2X_EE_SWITCH_STATS=1 counts dispatcher transfers by reason
+    // and measures how long the throw-to-catch unwind takes.  Used to decide
+    // whether a fiber switch is worth implementing; no clock is read when unset.
+    bool eeSwitchStatsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_SWITCH_STATS") != nullptr;
+        return enabled;
+    }
+
+    constexpr uint32_t kTransferBlock = 0u;
+    constexpr uint32_t kTransferYield = 1u;
+    constexpr uint32_t kTransferExit = 2u;
+    constexpr uint32_t kTransferInvocation = 3u;
+    constexpr uint32_t kDispatchReturn = 4u;
+    constexpr uint32_t kTraceStart = 5u;
+    constexpr uint32_t kDispatchNone = 0xFFu;
+    constexpr uint64_t kSwitchTraceLimit = 500000u;
+    constexpr const char *kTransferNames[6] = {"block", "yield", "exit", "inv", "return", "start"};
+    constexpr std::size_t kFiberStackBytes = 1u * 1024u * 1024u;
+
+    // Developer switch: PS2X_EE_FIBERS=0 forces the old exception-based
+    // transfer path for A/B and regression testing.  Enabled by default.
+    bool eeFibersEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_EE_FIBERS");
+            return value == nullptr || value[0] != '0' || value[1] != '\0';
+        }();
+        return enabled;
+    }
+
+    // Diagnostic: PS2X_EE_SWITCH_TRACE=1 logs one line per transfer decision
+    // ("vsync=... from=... to=... reason=...").  Capped to keep a runaway
+    // movie trace finite; the cap is far above a menu/title comparison window.
+    bool eeSwitchTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_SWITCH_TRACE") != nullptr;
+        return enabled;
+    }
+
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
     {
@@ -226,6 +267,8 @@ EeScheduler::EeScheduler(PS2Runtime &runtime)
 EeScheduler::~EeScheduler()
 {
     requestStop();
+    m_currentFiber = nullptr;
+    m_fibers.clear();
 }
 
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
@@ -267,6 +310,27 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_snapshotPublishCountdown = 0u;
     m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
     m_paceInitialized = false;
+    m_transferStartNs = 0u;
+    m_transferReason = 0u;
+    m_transferActive = false;
+    for (uint32_t reason = 0u; reason < 4u; ++reason)
+    {
+        m_switchCounts[reason] = 0u;
+        m_switchNs[reason] = 0u;
+        m_switchLastCounts[reason] = 0u;
+        m_switchLastNs[reason] = 0u;
+    }
+    m_switchLastGuestNs = 0u;
+    m_currentFiber = nullptr;
+    m_dispatchReason = kDispatchReturn;
+    m_pendingFiberFree = 0;
+    m_fiberException = nullptr;
+    m_fiberFunction = nullptr;
+    m_fiberContext = nullptr;
+    m_fibers.clear();
+    m_traceFromId = 0;
+    m_traceReason = kTraceStart;
+    m_traceCount = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -372,6 +436,7 @@ void EeScheduler::run()
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
+                traceSwitch(0);
                 waitForEvent();
                 continue;
             }
@@ -392,6 +457,8 @@ void EeScheduler::run()
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
                 }
                 owner->invocations.push_back(std::move(invocation));
+                m_traceReason = kTransferInvocation;
+                traceSwitch(owner->id);
             }
         }
 
@@ -407,6 +474,7 @@ void EeScheduler::run()
             }
             catch (const EeDispatcherTransfer &)
             {
+                endTransfer();
             }
             if (m_currentThreadId == 0)
             {
@@ -453,6 +521,7 @@ void EeScheduler::run()
                     }
                     catch (const EeDispatcherTransfer &)
                     {
+                        endTransfer();
                     }
                 }
                 continue;
@@ -474,6 +543,9 @@ void EeScheduler::run()
                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
             }
             running->invocations.push_back(std::move(invocation));
+            m_traceFromId = running->id;
+            m_traceReason = kTransferInvocation;
+            traceSwitch(running->id);
             continue;
         }
 
@@ -518,12 +590,20 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
-            function(m_rdram, &context, &m_runtime);
+            if (eeFibersEnabled())
+            {
+                dispatchOnFiber(function, context);
+            }
+            else
+            {
+                function(m_rdram, &context, &m_runtime);
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            endTransfer();
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -693,6 +773,149 @@ void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
     m_paceAdvanceNs += base + repay;
 }
 
+void EeScheduler::beginTransfer(uint32_t reason) noexcept
+{
+    if (!eeSwitchStatsEnabled())
+    {
+        return;
+    }
+    m_transferReason = reason;
+    m_transferStartNs = steadyNowNs();
+    m_transferActive = true;
+}
+
+void EeScheduler::endTransfer() noexcept
+{
+    if (!m_transferActive)
+    {
+        return;
+    }
+    m_transferActive = false;
+    const uint64_t elapsed = steadyNowNs() - m_transferStartNs;
+    m_switchCounts[m_transferReason] += 1u;
+    m_switchNs[m_transferReason] += elapsed;
+}
+
+void EeScheduler::fiberEntryThunk(void *argument)
+{
+    auto *self = static_cast<EeScheduler *>(argument);
+    try
+    {
+        self->m_fiberFunction(self->m_rdram, self->m_fiberContext, &self->m_runtime);
+    }
+    catch (...)
+    {
+        // Preserve both guest exceptions (which the old path let propagate to
+        // the dispatcher) and any stray EeDispatcherTransfer for the caller.
+        self->m_fiberException = std::current_exception();
+    }
+}
+
+ps2x::ee::Fiber &EeScheduler::acquireFiber(int threadId)
+{
+    auto it = m_fibers.find(threadId);
+    if (it == m_fibers.end())
+    {
+        it = m_fibers.emplace(threadId, std::make_unique<ps2x::ee::Fiber>("ee", kFiberStackBytes)).first;
+    }
+    return *it->second;
+}
+
+void EeScheduler::releaseFiber(int threadId) noexcept
+{
+    const auto it = m_fibers.find(threadId);
+    if (it != m_fibers.end() && m_currentFiber == it->second.get())
+    {
+        return;
+    }
+    m_fibers.erase(threadId);
+}
+
+void EeScheduler::dispatchOnFiber(PS2Runtime::RecompiledFunction function, R5900Context &context)
+{
+    ps2x::ee::Fiber &fiber = acquireFiber(m_currentThreadId);
+    m_fiberFunction = function;
+    m_fiberContext = &context;
+    m_fiberException = nullptr;
+    m_dispatchReason = kDispatchReturn;
+    m_currentFiber = &fiber;
+    fiber.prepare(&EeScheduler::fiberEntryThunk, this);
+    fiber.switchIn();
+    m_currentFiber = nullptr;
+    if (m_dispatchReason != kDispatchReturn)
+    {
+        endTransfer();
+    }
+    if (m_pendingFiberFree != 0)
+    {
+        const int id = m_pendingFiberFree;
+        m_pendingFiberFree = 0;
+        releaseFiber(id);
+    }
+    if (m_fiberException)
+    {
+        std::exception_ptr exception = m_fiberException;
+        m_fiberException = nullptr;
+        std::rethrow_exception(exception);
+    }
+}
+
+[[noreturn]] void EeScheduler::switchToDispatcher(uint32_t reason)
+{
+    // The dispatcher itself (a completion/onComplete callback) still uses the
+    // exception path; it has no guest fiber to abandon and its stack frames
+    // must unwind normally.
+    if (m_currentThreadId != 0 && m_traceFromId == 0)
+    {
+        m_traceFromId = m_currentThreadId;
+    }
+    m_traceReason = reason;
+    if (m_currentFiber == nullptr)
+    {
+        beginTransfer(reason);
+        throw EeDispatcherTransfer{};
+    }
+    beginTransfer(reason);
+    m_dispatchReason = reason;
+    m_currentFiber->switchOut();
+}
+
+void EeScheduler::traceSwitch(int toThreadId) noexcept
+{
+    if (m_traceReason == kDispatchNone)
+    {
+        return;
+    }
+    if (!eeSwitchTraceEnabled())
+    {
+        m_traceReason = kDispatchNone;
+        m_traceFromId = 0;
+        return;
+    }
+    if (m_traceCount >= kSwitchTraceLimit)
+    {
+        if (m_traceCount == kSwitchTraceLimit)
+        {
+            std::fprintf(stderr, "[ee-switch-trace] truncated after %llu switches\n",
+                         static_cast<unsigned long long>(kSwitchTraceLimit));
+        }
+        ++m_traceCount;
+        m_traceReason = kDispatchNone;
+        m_traceFromId = 0;
+        return;
+    }
+    const char *reason = m_traceReason < 6u ? kTransferNames[m_traceReason] : "?";
+    std::fprintf(stderr,
+                 "[ee-switch-trace] vsync=%llu from=%d to=%d reason=%s\n",
+                 static_cast<unsigned long long>(m_vsyncTick),
+                 m_traceFromId,
+                 toThreadId,
+                 reason);
+    ++m_traceCount;
+    m_traceReason = kDispatchNone;
+    m_traceFromId = 0;
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     // Sample at most once per kPaceSamplePeriodNs: a CPU-time clock_gettime()
@@ -752,6 +975,52 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
                       << " pc=0x" << std::hex
                       << (running != nullptr ? running->activeContext().pc : 0u)
                       << std::dec << std::endl;
+        }
+    }
+    if (eeSwitchStatsEnabled())
+    {
+        static auto nextSwitchTrace = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextSwitchTrace)
+        {
+            nextSwitchTrace = now + std::chrono::seconds(1);
+            const uint64_t guestDelta = m_paceGuestCpuNs - m_switchLastGuestNs;
+            m_switchLastGuestNs = m_paceGuestCpuNs;
+            uint64_t totalCount = 0u;
+            uint64_t totalNs = 0u;
+            std::cerr << "[ee-switch] vsync=" << m_vsyncTick;
+            for (uint32_t reason = 0u; reason < 4u; ++reason)
+            {
+                const uint64_t count = m_switchCounts[reason] - m_switchLastCounts[reason];
+                const uint64_t ns = m_switchNs[reason] - m_switchLastNs[reason];
+                m_switchLastCounts[reason] = m_switchCounts[reason];
+                m_switchLastNs[reason] = m_switchNs[reason];
+                totalCount += count;
+                totalNs += ns;
+                std::cerr << ' ' << kTransferNames[reason] << '=' << count
+                          << " " << kTransferNames[reason] << "Us="
+                          << (count != 0u ? ns / count / 1000u : 0u);
+            }
+            std::cerr << " n=" << totalCount
+                      << " guardUs=" << (totalCount != 0u ? totalNs / totalCount / 1000u : 0u)
+                      << " savedMs=" << (totalNs / 1000000u)
+                      << " guestMs=" << (guestDelta / 1000000u)
+                      << " pct=" << (guestDelta != 0u ? (totalNs * 100u / guestDelta) : 0u);
+            static const bool fiberStats = std::getenv("PS2X_EE_FIBER_STATS") != nullptr;
+            if (fiberStats)
+            {
+                std::size_t peak = 0u;
+                for (const auto &[id, fiber] : m_fibers)
+                {
+                    (void)id;
+                    if (fiber)
+                    {
+                        peak = std::max(peak, fiber->peakStackBytes());
+                    }
+                }
+                std::cerr << " fiberPeakKb=" << (peak / 1024u);
+            }
+            std::cerr << std::endl;
         }
     }
 }
@@ -828,6 +1097,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
         ownedStack = it->second.stack;
     }
     m_threads.erase(it);
+    releaseFiber(id);
     publishSnapshot();
     return KE_OK;
 }
@@ -871,18 +1141,25 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     assert(exiting != nullptr);
     const int id = exiting->id;
     const uint32_t ownedStack = deleteThreadRecord && exiting->ownsStack ? exiting->stack : 0u;
+    m_traceFromId = id;
     makeDormant(*exiting);
     m_currentThreadId = 0;
     if (deleteThreadRecord && id != kMainThreadId)
     {
         m_threads.erase(id);
+        // The fiber currently holds this host stack; the dispatcher frees it
+        // after the switch, never from inside the fiber.
+        if (m_currentFiber != nullptr)
+        {
+            m_pendingFiberFree = id;
+        }
     }
     if (ownedStack != 0u)
     {
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    switchToDispatcher(kTransferExit);
 }
 
 int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSafe)
@@ -1173,13 +1450,14 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     {
         GuestThread *self = currentThread();
         assert(self != nullptr);
+        m_traceFromId = self->id;
         enqueueReady(*self, true);
         m_currentThreadId = 0;
     }
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    switchToDispatcher(kTransferYield);
 }
 
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
@@ -1541,7 +1819,8 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     }
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    m_traceFromId = owner->id;
+    switchToDispatcher(kTransferInvocation);
 }
 
 [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
@@ -1560,7 +1839,8 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         owner->invocations.push_back(std::move(*it));
     }
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    m_traceFromId = owner->id;
+    switchToDispatcher(kTransferInvocation);
 }
 
 bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
@@ -2164,6 +2444,7 @@ void EeScheduler::makeRunning(GuestThread &item)
     item.status = EeThreadStatus::Running;
     m_currentThreadId = item.id;
     renewTimeSlice();
+    traceSwitch(item.id);
 }
 
 void EeScheduler::makeDormant(GuestThread &item)
@@ -2242,9 +2523,10 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     }
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
+    m_traceFromId = self->id;
     m_currentThreadId = 0;
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    switchToDispatcher(kTransferBlock);
 }
 
 void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
