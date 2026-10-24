@@ -660,6 +660,19 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                            << " nreg=0x" << ((tagLo >> 60) & 0xFu)
                                            << " taghi=0x" << tagHi
                                            << std::dec << std::endl);
+            // SUIKO(diag): dump first payload qwords to decode A_D format.
+            static int s_adDumpBudget = 24;
+            if (sizeBytes <= 0x1c0u && s_adDumpBudget-- > 0)
+            {
+                const uint32_t qwords = (sizeBytes - 16) / 16;
+                for (uint32_t q = 0; q < qwords && q < 6; ++q)
+                {
+                    RUNTIME_LOG("[gs-pkt-payload] q" << q << " lo=0x" << std::hex
+                                                     << loadLE64(data + 16 + q * 16)
+                                                     << " hi=0x" << loadLE64(data + 24 + q * 16)
+                                                     << std::dec << std::endl);
+                }
+            }
         }
     }
 

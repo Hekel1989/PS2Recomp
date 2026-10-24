@@ -1147,6 +1147,19 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         throw std::runtime_error("Unaligned 64-bit write at address: 0x" + std::to_string(address));
     }
 
+    // SUIKO(diag): dump raw GIF_AD page writes (0x12000000-0x120000FF).
+    if ((address & 0xFFFFFF00u) == 0x12000000u)
+    {
+        static const bool s_diagAd = std::getenv("PS2X_DIAG_AD") != nullptr;
+        static std::atomic<unsigned> s_adBudget{2000u};
+        if (s_diagAd && s_adBudget.load(std::memory_order_relaxed) > 0u)
+        {
+            s_adBudget.fetch_sub(1, std::memory_order_relaxed);
+            fprintf(stderr, "[ad-dbg] w64 0x%08x = 0x%016llx\n", address,
+                    (unsigned long long)value);
+        }
+    }
+
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
