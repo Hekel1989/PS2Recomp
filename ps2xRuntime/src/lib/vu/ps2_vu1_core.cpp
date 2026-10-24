@@ -1,4 +1,5 @@
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_inventory.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -1184,6 +1186,8 @@ void VU1Interpreter::finishXgkick()
                      m_xgkick.totalBytes, m_xgkick.totalBytes / 16u,
                      static_cast<unsigned long long>(tagLo), static_cast<unsigned long long>(tagHi));
     }
+    if (VU1InventoryRecorder *inventory = VU1InventoryRecorder::instance())
+        inventory->onXgkick(m_xgkick.totalBytes);
     if (m_xgkickCapture != nullptr)
     {
         m_xgkickCapture->emplace_back(m_xgkick.packet.data(),
@@ -2052,6 +2056,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     uint32_t traceInsns = 0;
     const char *stopReason = "budget";
     const uint32_t traceStartPc = m_state.pc;
+    const uint64_t runStartCycle = m_cycle;
+    VU1InventoryRecorder *inventory =
+        (m_unit == Unit::VU1 && !vu1DiffEnabled()) ? VU1InventoryRecorder::instance() : nullptr;
+    if (inventory != nullptr)
+    {
+        const uint64_t generation = memory != nullptr ? memory->getVU1CodeGeneration() : 0u;
+        const uint64_t vsync = memory != nullptr
+                                   ? memory->gs().vsyncTick.load(std::memory_order_relaxed)
+                                   : 0u;
+        inventory->beginRun(vuCode, codeSize, generation, m_state.pc, m_cycle, vsync);
+    }
+    const auto inventoryHostStart = std::chrono::steady_clock::now();
     if (trace)
     {
         std::fprintf(stderr, "[vu1:run] begin pc=0x%x top=0x%x itop=0x%x budget=%u\n",
@@ -2077,6 +2093,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         const uint64_t readyCycle = calculatePairReadyCycle(decoded);
         if (readyCycle > m_cycle)
         {
+            if (inventory != nullptr)
+                inventory->onStall(readyCycle - m_cycle);
             if (readyCycle >= budgetEnd)
                 advanceTo(budgetEnd);
             else
@@ -2169,6 +2187,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             execUpper(decoded.upper);
             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+        }
+
+        if (inventory != nullptr)
+        {
+            inventory->onPair(m_state.pc, decoded.lower, decoded.upper,
+                              decoded.iBit, decoded.eBit, decoded.dBit,
+                              decoded.tBit, decoded.mBit, m_state.branchPending,
+                              m_state.branchTarget);
         }
 
         m_viBranchBackupValid = false;
@@ -2293,6 +2319,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                      m_xgkick.active ? "pending" : "idle");
     }
     m_state.cycles = m_cycle;
+    if (inventory != nullptr)
+    {
+        const auto inventoryHostEnd = std::chrono::steady_clock::now();
+        const uint64_t hostNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                inventoryHostEnd - inventoryHostStart)
+                .count());
+        inventory->endRun(m_state.pc, m_cycle, traceInsns, hostNs);
+    }
     if (trace && m_activeVuData && m_activeVuDataSize >= 0x1e10u && m_state.pc == 0x200u)
     {
         uint64_t lo = 0, hi = 0;

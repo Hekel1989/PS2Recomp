@@ -1548,6 +1548,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 else if (mode == 1)
                 {
                     uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    const uint32_t chainStartTadr = tagAddr;
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
@@ -1803,7 +1804,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     {
                         PendingTransfer pt;
                         pt.fromScratchpad = false;
-                        pt.srcAddr = 0;
+                        pt.srcAddr = chainStartTadr;
                         pt.qwc = 0;
                         pt.chainData = std::move(chainBuf);
                         if (channelBase == 0x1000A000)
@@ -2117,7 +2118,13 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
+            const uint32_t previousSrcAddr = m_vif1ChunkSrcAddr;
+            const uint32_t previousSrcKind = m_vif1ChunkSrcKind;
+            m_vif1ChunkSrcAddr = p.srcAddr;
+            m_vif1ChunkSrcKind = 2u;
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            m_vif1ChunkSrcAddr = previousSrcAddr;
+            m_vif1ChunkSrcKind = previousSrcKind;
         }
         else if (p.qwc > 0)
         {

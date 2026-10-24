@@ -7,6 +7,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_gs_host_hooks.h"
 #include "runtime/ps2_present_hooks.h"
+#include "runtime/ps2_vu1_inventory.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -796,6 +797,9 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
+        // SUIKO(vu1-inventory): create the capture/JSON even when the phase
+        // runs no VU1 microprogram at all (the menu does not).
+        (void)VU1InventoryRecorder::instance();
 
         if (!syncCoreSubsystems())
         {

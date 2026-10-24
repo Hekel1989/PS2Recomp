@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu1_inventory.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -450,7 +451,13 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     if (requestedEnd > static_cast<uint64_t>(PS2_RAM_SIZE))
         sizeBytes = PS2_RAM_SIZE - srcPhys;
 
+    const uint32_t previousSrcAddr = m_vif1ChunkSrcAddr;
+    const uint32_t previousSrcKind = m_vif1ChunkSrcKind;
+    m_vif1ChunkSrcAddr = srcPhys;
+    m_vif1ChunkSrcKind = 1u;
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+    m_vif1ChunkSrcAddr = previousSrcAddr;
+    m_vif1ChunkSrcKind = previousSrcKind;
 }
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
@@ -757,6 +764,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                              destAddr, mpgBytes, vu1TraceHash(data + pos, present),
                              present < mpgBytes ? " STREAM-UNDERRUN" : "");
             }
+            const uint32_t presentBytes =
+                std::min(mpgBytes, pos < sizeBytes ? sizeBytes - pos : 0u);
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;
@@ -767,6 +776,24 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
                 }
+            }
+            if (VU1InventoryRecorder *inventory = VU1InventoryRecorder::instance())
+            {
+                uint32_t srcAddr = 0u;
+                uint32_t srcOff = 0u;
+                if (m_vif1ChunkSrcKind == 1u)
+                    srcAddr = m_vif1ChunkSrcAddr + pos;
+                else if (m_vif1ChunkSrcKind == 2u)
+                {
+                    srcAddr = m_vif1ChunkSrcAddr;
+                    srcOff = pos;
+                }
+                inventory->onMpg(destAddr, presentBytes != 0u ? data + pos : nullptr,
+                                 presentBytes, mpgBytes,
+                                 m_vu1Code, PS2_VU1_CODE_SIZE,
+                                 gs().vsyncTick.load(std::memory_order_relaxed),
+                                 srcAddr, srcOff, m_vif1ChunkSrcKind,
+                                 presentBytes >= mpgBytes);
             }
             pos += mpgBytes;
             if (pos > sizeBytes)
