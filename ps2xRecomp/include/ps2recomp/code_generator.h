@@ -71,6 +71,7 @@ namespace ps2recomp
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;
+        bool m_coverage = false;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
 

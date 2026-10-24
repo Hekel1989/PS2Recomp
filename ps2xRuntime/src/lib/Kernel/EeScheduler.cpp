@@ -1,5 +1,6 @@
 #include "runtime/ee_scheduler.h"
 
+#include "ps2_coverage.h"
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_host_hooks.h"
@@ -413,6 +414,10 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+
+    // Coverage dump: no-op (one relaxed load) unless the recompiled code has
+    // hit a coverage marker at least once.
+    ps2CoveragePeriodicFlush();
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))

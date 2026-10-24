@@ -198,6 +198,10 @@ namespace ps2recomp
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;
+        // general.coverage: emit a first-hit marker at each function entry and
+        // each resumable entry point; the runtime dumps the hit set to
+        // $PS2X_COVERAGE_OUT.  Off by default, zero cost when off.
+        bool coverage = false;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;

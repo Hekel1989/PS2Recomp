@@ -1028,6 +1028,7 @@ namespace ps2recomp
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->m_coverage = m_config.coverage;
 
             fs::create_directories(m_config.outputPath);
 

@@ -570,6 +570,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        ps2CoverageFlush();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)

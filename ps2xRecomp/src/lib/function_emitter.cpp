@@ -84,6 +84,11 @@ namespace ps2recomp
         }
 
         ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        if (cg.m_coverage)
+        {
+            ss << "    ps2CoverageHit(0x" << std::hex << function.start << "u);\n"
+               << std::dec;
+        }
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
@@ -114,6 +119,12 @@ namespace ps2recomp
             {
                 constantRegisters.clear();
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
+                if (cg.m_coverage && inst.address != function.start &&
+                    std::binary_search(resumeTargets.begin(), resumeTargets.end(), inst.address))
+                {
+                    ss << "    ps2CoverageHit(0x" << std::hex << inst.address << "u);\n"
+                       << std::dec;
+                }
             }
 
             if (cg.m_emitInstructionComments)
@@ -150,6 +161,12 @@ namespace ps2recomp
                     if (hasDecodedDelaySlot && internalTargets.contains(delaySlot->address))
                     {
                         ss << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
+                        if (cg.m_coverage && delaySlot->address != function.start &&
+                            std::binary_search(resumeTargets.begin(), resumeTargets.end(), delaySlot->address))
+                        {
+                            ss << "    ps2CoverageHit(0x" << std::hex << delaySlot->address << "u);\n"
+                               << std::dec;
+                        }
                     }
 
                     if (gifDmaKickPlan.valid &&
