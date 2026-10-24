@@ -461,7 +461,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        // SUIKO(font-upload): continuation of a DIRECT that was cut at the
+        // previous chunk's end: the raw bytes at this chunk's start continue the
+        // GIF IMAGE transfer that is still waiting for data.
+        if (m_vif1PendingPath2ImageQwc != 0u && !m_vif1PendingPath2FromNextDirect)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
@@ -521,6 +524,70 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         vif1_regs.num = num;
         if (irq)
             vif1_regs.stat |= (1u << 11); // INT
+
+        // SUIKO(font-upload): an over-declaring IMAGE tag left the GIF path
+        // waiting for qwords. On hardware the next DIRECT/DIRECTHL's payload
+        // supplies them; the VIF command word itself never reaches the GIF
+        // path. Feed that payload as the continuation instead of submitting it
+        // as a fresh GIF packet. A non-NOP, non-DIRECT command in between means
+        // the data arrives through a path we do not model here (e.g. VU FIFO
+        // writes), so abandon the continuation rather than corrupting the next
+        // packet.
+        if (m_vif1PendingPath2ImageQwc != 0u && m_vif1PendingPath2FromNextDirect)
+        {
+            if (opcode == VIF_NOP)
+            {
+                // padding between the tag and its data; keep waiting
+            }
+            else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
+            {
+                uint32_t qwCount = imm;
+                if (qwCount == 0u)
+                    qwCount = 65536u;
+                const uint32_t availableQw = (sizeBytes - pos) / 16u;
+                const bool contTruncated = qwCount > availableQw;
+                if (contTruncated)
+                    qwCount = availableQw;
+                const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
+                if (chunkQw != 0u)
+                {
+                    if (xferTrace)
+                        std::fprintf(stderr, "[gs-vif]   cont-direct-consume qw=%u of pending %u\n", chunkQw,
+                                     m_vif1PendingPath2ImageQwc);
+                    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+                    const uint64_t imageTag =
+                        static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+                        ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+                        (static_cast<uint64_t>(kGifFmtImage) << 58);
+                    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+                    std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+                    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()),
+                                    true, opcode == VIF_DIRECTHL, true);
+                    pos += chunkQw * 16u;
+                    m_vif1PendingPath2ImageQwc -= chunkQw;
+                }
+                if (m_vif1PendingPath2ImageQwc == 0u)
+                {
+                    m_vif1PendingPath2DirectHl = false;
+                    m_vif1PendingPath2FromNextDirect = false;
+                    // Skip any leftover payload qwords in this DIRECT.
+                    pos += (qwCount - chunkQw) * 16u;
+                }
+                else if (contTruncated)
+                {
+                    // The data DIRECT itself was cut at the chunk end; the
+                    // remainder continues as raw bytes at the next chunk's start.
+                    m_vif1PendingPath2FromNextDirect = false;
+                }
+                continue;
+            }
+            else
+            {
+                m_vif1PendingPath2ImageQwc = 0u;
+                m_vif1PendingPath2DirectHl = false;
+                m_vif1PendingPath2FromNextDirect = false;
+            }
+        }
 
         if (opcode == VIF_NOP)
         {
@@ -724,6 +791,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                      truncated ? 1 : 0);
                     m_vif1PendingPath2ImageQwc = pendingImageQw;
                     m_vif1PendingPath2DirectHl = directHl;
+                    // Over-declaring tag inside a complete DIRECT: the missing
+                    // qwords arrive as the next DIRECT/DIRECTHL's payload. A
+                    // DIRECT truncated at the chunk end continues with raw
+                    // bytes at the next chunk's start instead.
+                    m_vif1PendingPath2FromNextDirect = !truncated;
                 }
             }
 

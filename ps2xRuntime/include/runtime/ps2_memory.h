@@ -409,6 +409,12 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    // True when the pending IMAGE deficit was declared by an over-declaring
+    // (non-truncated) GIFtag: the remaining data arrives as the payload of the
+    // next DIRECT/DIRECTHL command, so the VIF command word must be skipped
+    // before consuming. False for a DIRECT cut at a DMA-chunk boundary, whose
+    // continuation bytes are raw at the next chunk's start.
+    bool m_vif1PendingPath2FromNextDirect = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
