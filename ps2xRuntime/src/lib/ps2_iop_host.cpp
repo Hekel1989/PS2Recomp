@@ -289,7 +289,7 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
 {
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
-    const PS2VfsMounts mounts{paths.hostRoot, paths.cdRoot, paths.mcRoot};
+    const PS2VfsMounts mounts{paths.hostRoot, paths.cdRoot, paths.mcRoot, paths.cdImage};
     std::filesystem::path hostPath;
     if (!m_runtime.vfs().resolveHostPath(path, mounts, hostPath))
         return {};

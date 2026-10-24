@@ -20,6 +20,10 @@ struct PS2VfsMounts
     std::filesystem::path hostRoot;
     std::filesystem::path cdRoot;
     std::filesystem::path memoryCard0Root;
+    // Optional read-only ISO 9660 disc image. When set, cdrom0: paths are
+    // looked up inside the image first and only fall back to cdRoot when the
+    // file is not on the disc (keeps extracted overrides working).
+    std::filesystem::path cdImage;
 };
 
 struct PS2VfsStat

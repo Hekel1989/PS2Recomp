@@ -6,7 +6,7 @@ namespace ps2_syscalls
     static PS2VfsMounts currentVfsMounts()
     {
         const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
-        return {paths.hostRoot, paths.cdRoot, paths.mcRoot};
+        return {paths.hostRoot, paths.cdRoot, paths.mcRoot, paths.cdImage};
     }
 
     struct VagAccumEntry

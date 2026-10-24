@@ -1,5 +1,6 @@
 #include "runtime/ps2_vfs.h"
 
+#include "ps2x/iop/iso9660.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_rom_device.h"
 
@@ -8,6 +9,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <utility>
 
@@ -105,6 +107,90 @@ namespace
         size_t m_position = 0u;
     };
 
+    bool readStreamRange(std::ifstream &stream, void *destination, uint64_t offset, size_t count)
+    {
+        if ((!destination && count != 0u) || !stream.is_open())
+            return false;
+        stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!stream.good())
+            return false;
+        stream.read(static_cast<char *>(destination), static_cast<std::streamsize>(count));
+        const bool ok = stream.gcount() == static_cast<std::streamsize>(count);
+        stream.clear();
+        return ok;
+    }
+
+    // Read-only view of one file inside a raw ISO 9660 image: the stream stays
+    // open on the image and every access is clamped to [base, base + size).
+    // Offsets are 64-bit end to end so files >= 1 GB (SD.BIN) work.
+    class IsoOpenFile final : public IPS2OpenFile
+    {
+    public:
+        IsoOpenFile(std::ifstream image, uint64_t base, uint64_t size)
+            : m_image(std::move(image)), m_base(base), m_size(size)
+        {
+        }
+
+        int64_t read(void *destination, size_t size) override
+        {
+            if (!m_image.is_open())
+                return -1;
+            const uint64_t available = m_position < m_size ? m_size - m_position : 0u;
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(size, available));
+            if (count == 0u)
+                return 0;
+            if (!readStreamRange(m_image, destination, m_base + m_position, count))
+                return -1;
+            m_position += count;
+            return static_cast<int64_t>(count);
+        }
+
+        int64_t write(const void *, size_t) override
+        {
+            return -1;
+        }
+
+        int64_t seek(int64_t offset, int whence) override
+        {
+            int64_t base = 0;
+            if (whence == SEEK_CUR)
+                base = static_cast<int64_t>(m_position);
+            else if (whence == SEEK_END)
+                base = static_cast<int64_t>(m_size);
+            else if (whence != SEEK_SET)
+                return -1;
+
+            const int64_t position = base + offset;
+            if (position < 0 || static_cast<uint64_t>(position) > m_size)
+                return -1;
+            m_position = static_cast<uint64_t>(position);
+            return position;
+        }
+
+    private:
+        std::ifstream m_image;
+        uint64_t m_base = 0u;
+        uint64_t m_size = 0u;
+        uint64_t m_position = 0u;
+    };
+
+    // Looks up one cdrom0: path (device prefix already stripped) inside the
+    // mounted ISO image. Returns false when no image is mounted or the path is
+    // not on the disc.
+    bool lookupInCdImage(const std::filesystem::path &imagePath, std::string_view isoPath,
+                         ps2x::iop::iso9660::Entry &entry)
+    {
+        if (imagePath.empty())
+            return false;
+        std::ifstream image(imagePath, std::ios::binary);
+        if (!image.is_open())
+            return false;
+        return ps2x::iop::iso9660::lookup(
+            [&image](void *destination, uint64_t offset, size_t count)
+            { return readStreamRange(image, destination, offset, count); },
+            isoPath, entry);
+    }
+
     const char *hostMode(uint32_t flags)
     {
         const bool read = (flags & PS2_FIO_O_RDONLY) != 0u || (flags & PS2_FIO_O_RDWR) == PS2_FIO_O_RDWR;
@@ -173,28 +259,52 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
     }
     else
     {
-        std::filesystem::path hostPath;
-        if (!resolveHostPath(path, mounts, hostPath))
-            return -1;
-
-        std::error_code existsError;
-        const bool exists = std::filesystem::exists(hostPath, existsError);
-        if (existsError || (exists && (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)) == (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)))
+        // cdrom0: prefers the ISO image; the extracted cdRoot folder stays the
+        // fallback for files that are not on the disc (extracted overrides).
+        if (parsed.device == ps2x::iop::Ps2PathDevice::Cdrom && !mounts.cdImage.empty())
         {
-            return -1;
+            const uint32_t access = flags & PS2_FIO_O_RDWR;
+            if (access == PS2_FIO_O_RDONLY && (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC)) == 0u)
+            {
+                std::ifstream image(mounts.cdImage, std::ios::binary);
+                if (image.is_open())
+                {
+                    ps2x::iop::iso9660::Entry entry;
+                    const bool found = ps2x::iop::iso9660::lookup(
+                        [&image](void *destination, uint64_t offset, size_t count)
+                        { return readStreamRange(image, destination, offset, count); },
+                        parsed.path, entry);
+                    if (found && !entry.isDirectory)
+                        file = std::make_unique<IsoOpenFile>(std::move(image), entry.byteOffset, entry.sizeBytes);
+                }
+            }
         }
 
-        FILE *stream = std::fopen(hostPath.string().c_str(), hostMode(flags));
-        const uint32_t access = flags & PS2_FIO_O_RDWR;
-        if (!stream && !exists && (flags & PS2_FIO_O_CREAT) != 0u &&
-            access == PS2_FIO_O_RDWR &&
-            (flags & (PS2_FIO_O_TRUNC | PS2_FIO_O_APPEND)) == 0u)
+        if (!file)
         {
-            stream = std::fopen(hostPath.string().c_str(), "w+b");
+            std::filesystem::path hostPath;
+            if (!resolveHostPath(path, mounts, hostPath))
+                return -1;
+
+            std::error_code existsError;
+            const bool exists = std::filesystem::exists(hostPath, existsError);
+            if (existsError || (exists && (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)) == (PS2_FIO_O_CREAT | PS2_FIO_O_EXCL)))
+            {
+                return -1;
+            }
+
+            FILE *stream = std::fopen(hostPath.string().c_str(), hostMode(flags));
+            const uint32_t access = flags & PS2_FIO_O_RDWR;
+            if (!stream && !exists && (flags & PS2_FIO_O_CREAT) != 0u &&
+                access == PS2_FIO_O_RDWR &&
+                (flags & (PS2_FIO_O_TRUNC | PS2_FIO_O_APPEND)) == 0u)
+            {
+                stream = std::fopen(hostPath.string().c_str(), "w+b");
+            }
+            if (!stream)
+                return -1;
+            file = std::make_unique<HostOpenFile>(stream);
         }
-        if (!stream)
-            return -1;
-        file = std::make_unique<HostOpenFile>(stream);
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -244,6 +354,18 @@ bool PS2Vfs::stat(std::string_view path, const PS2VfsMounts &mounts, const PS2Ro
             return false;
         result.readOnly = true;
         return true;
+    }
+    // Same precedence as open(): ISO image first for cdrom0:, then cdRoot.
+    if (parsed.device == ps2x::iop::Ps2PathDevice::Cdrom && !mounts.cdImage.empty())
+    {
+        ps2x::iop::iso9660::Entry entry;
+        if (lookupInCdImage(mounts.cdImage, parsed.path, entry))
+        {
+            result.directory = entry.isDirectory;
+            result.size = entry.isDirectory ? 0u : entry.sizeBytes;
+            result.readOnly = true;
+            return true;
+        }
     }
 
     std::filesystem::path hostPath;

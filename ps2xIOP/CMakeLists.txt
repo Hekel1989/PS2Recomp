@@ -5,6 +5,7 @@ project(ps2xIOP LANGUAGES CXX)
 option(PS2X_IOP_BUILD_TESTS "Build ps2xIOP emulator smoke tests" OFF)
 
 add_library(ps2_iop STATIC
+    src/iso9660.cpp
     src/ps2_path.cpp
     src/iop_module_manager.cpp
     src/iop_subsystem.cpp

@@ -4,6 +4,7 @@
 #include "../core/iop_kernel.h"
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
+#include "ps2x/iop/iso9660.h"
 #include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
@@ -606,68 +607,8 @@ namespace ps2x::iop::detail
         // hardware. When an archive exists only inside the ISO image (not as an
         // extracted file under the disc root), the host-directory virtual ISO
         // cannot answer the search and callers end up using an uninitialized
-        // LSN. Parse the actual ISO9660 tree from the image instead.
-
-        static uint32_t readLe32At(const uint8_t *source)
-        {
-            return static_cast<uint32_t>(source[0]) |
-                   (static_cast<uint32_t>(source[1]) << 8u) |
-                   (static_cast<uint32_t>(source[2]) << 16u) |
-                   (static_cast<uint32_t>(source[3]) << 24u);
-        }
-
-        static std::string iso9660Component(std::string_view raw)
-        {
-            // ISO9660 names on PS2 discs look like "SD.BIN;1". Drop the version
-            // suffix and any trailing dot, then upper-case for comparison.
-            const size_t version = raw.find(';');
-            std::string name(raw.substr(0, version));
-            while (!name.empty() && name.back() == '.')
-                name.pop_back();
-            for (char &c : name)
-                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            return name;
-        }
-
-        bool findInImageDirectory(uint64_t handle, uint32_t dirLsn, uint32_t dirBytes,
-                                  const std::string &wanted, bool &isDirectory,
-                                  uint32_t &lsn, uint32_t &size)
-        {
-            std::array<uint8_t, kSectorSize> sector;
-            const uint32_t sectors = std::min<uint32_t>(alignSectors(dirBytes), 8192u);
-            for (uint32_t sectorIndex = 0u; sectorIndex < sectors; ++sectorIndex)
-            {
-                size_t bytesRead = 0u;
-                if (!host.readHostFile(handle, static_cast<uint64_t>(dirLsn + sectorIndex) * kSectorSize,
-                                       sector.data(), kSectorSize, bytesRead) ||
-                    bytesRead != kSectorSize)
-                    return false;
-                size_t offset = 0u;
-                while (offset + 34u <= kSectorSize)
-                {
-                    const uint8_t recordLength = sector[offset];
-                    if (recordLength == 0u)
-                        break;  // zero padding until the next sector
-                    if (recordLength < 34u || offset + recordLength > kSectorSize)
-                        break;
-                    const uint8_t nameLength = sector[offset + 32u];
-                    if (nameLength > 1u && offset + 33u + nameLength <= offset + recordLength)
-                    {
-                        const std::string_view raw(
-                            reinterpret_cast<const char *>(sector.data() + offset + 33u), nameLength);
-                        if (iso9660Component(raw) == wanted)
-                        {
-                            lsn = readLe32At(sector.data() + offset + 2u);
-                            size = readLe32At(sector.data() + offset + 10u);
-                            isDirectory = (sector[offset + 25u] & 0x02u) != 0u;
-                            return true;
-                        }
-                    }
-                    offset += recordLength;
-                }
-            }
-            return false;
-        }
+        // LSN. Parse the actual ISO9660 tree from the image instead
+        // (ps2x::iop::iso9660, shared with the EE-side cdrom0: VFS backend).
 
         bool searchFileInImage(uint32_t resultAddress, std::string_view guestPath)
         {
@@ -678,74 +619,24 @@ namespace ps2x::iop::detail
             if (handle == 0u)
                 return false;
 
-            // Split the PS2 path into components, dropping the device prefix.
-            if (const size_t colon = guestPath.find(':'); colon != std::string_view::npos)
-                guestPath.remove_prefix(colon + 1u);
-            std::vector<std::string> components;
-            size_t begin = 0u;
-            while (begin < guestPath.size())
-            {
-                const size_t end = guestPath.find_first_of("\\/", begin);
-                const size_t length = (end == std::string_view::npos) ? guestPath.size() - begin : end - begin;
-                const std::string_view component(guestPath.data() + begin, length);
-                begin = (end == std::string_view::npos) ? guestPath.size() + 1u : end + 1u;
-                if (!component.empty())
-                    components.push_back(iso9660Component(component));
-            }
-
-            bool found = false;
-            uint32_t lsn = 0u;
-            uint32_t size = 0u;
-            std::string leaf;
-            std::array<uint8_t, kSectorSize> sector;
-            do
-            {
-                if (components.empty())
-                    break;
-                size_t bytesRead = 0u;
-                if (!host.readHostFile(handle, static_cast<uint64_t>(kPrimaryVolumeDescriptorLsn) * kSectorSize,
-                                       sector.data(), kSectorSize, bytesRead) ||
-                    bytesRead != kSectorSize || sector[0u] != 1u ||
-                    std::memcmp(sector.data() + 1u, "CD001", 5u) != 0)
-                    break;
-                uint32_t dirLsn = readLe32At(sector.data() + 158u);  // root directory record
-                uint32_t dirSize = readLe32At(sector.data() + 166u);
-                for (size_t index = 0u; index < components.size(); ++index)
+            iso9660::Entry entry;
+            const bool found = iso9660::lookup(
+                [&](void *destination, uint64_t byteOffset, size_t byteCount)
                 {
-                    bool isDirectory = false;
-                    if (!findInImageDirectory(handle, dirLsn, dirSize, components[index],
-                                              isDirectory, lsn, size))
-                    {
-                        found = false;
-                        break;
-                    }
-                    leaf = components[index];
-                    if (index + 1u < components.size())
-                    {
-                        if (!isDirectory)
-                        {
-                            found = false;
-                            break;
-                        }
-                        dirLsn = lsn;
-                        dirSize = size;
-                        found = false;
-                    }
-                    else
-                    {
-                        found = true;
-                    }
-                }
-            } while (false);
+                    size_t bytesRead = 0u;
+                    return host.readHostFile(handle, byteOffset, destination, byteCount, bytesRead) &&
+                           bytesRead == byteCount;
+                },
+                guestPath, entry);
             host.closeHostFile(handle);
 
             if (!found)
                 return false;
 
             std::array<uint8_t, 32u> result{};
-            writeLe32(result.data(), lsn);
-            writeLe32(result.data() + 4u, size);
-            std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
+            writeLe32(result.data(), static_cast<uint32_t>(entry.byteOffset / iso9660::kSectorSize));
+            writeLe32(result.data() + 4u, static_cast<uint32_t>(entry.sizeBytes));
+            std::memcpy(result.data() + 8u, entry.name.data(), std::min<size_t>(16u, entry.name.size()));
             return memory.writeRam(resultAddress, result.data(), result.size());
         }
 
