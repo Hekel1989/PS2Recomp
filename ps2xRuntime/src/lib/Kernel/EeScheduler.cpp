@@ -3,12 +3,14 @@
 #include "ps2_coverage.h"
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ee_time.h"
 #include "runtime/ps2_gs_host_hooks.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -18,6 +20,26 @@ namespace
     // SUIKO(dmac-dstat-mask): DMAC channels 0..9 and their D_STAT register.
     constexpr uint32_t kDmacChannelCount = 10u;
     constexpr uint32_t kDStatAddress = 0x1000E010u;
+
+    // Emulated-time pacing (see EeScheduler::sampleHostPacing): sample the
+    // wall/CPU/stall clocks at this interval.  One clock_gettime() per sample
+    // is cheap (a few hundred per second); sampling per dispatch was
+    // measurable on the menu (~13% of the frame budget).
+    constexpr uint64_t kPaceSamplePeriodNs = 2000000ull; // 2 ms
+    // Excluded host time may be repaid at most 2x the guest CPU time: a host
+    // that keeps up still reaches real time, while a stalled guest runs in slow
+    // motion instead of lightning through VBlank/timer deadlines.
+    constexpr uint64_t kPaceCatchUpNumerator = 2ull;
+    constexpr uint64_t kPaceCatchUpDenominator = 1ull;
+    // Never carry more than this much excluded host time.  A long stall
+    // (boot in a debugger, minutes of CPU starvation) should not turn into a
+    // minute-long fast-forward once the host recovers.
+    constexpr uint64_t kPaceMaxDebtNs = 2000000000ull; // 2 s
+
+    // Host-only work and guest waits reported by the executor thread.  Both are
+    // written and read on the same thread, so no atomics are needed.
+    thread_local uint64_t t_hostStallNs = 0u;
+    thread_local uint64_t t_guestWaitNs = 0u;
 
     // Diagnostic: PS2X_EE_SCHED=1 logs scheduler thread dispatches and guest
     // invocation push/pop with pc/sp/ra, enough to spot stack aliasing between
@@ -127,12 +149,41 @@ namespace
                static_cast<uint64_t>(remainder.count()) * EeScheduler::kEeClockHz / kNanosecondsPerSecond;
     }
 
+    // CPU time consumed by the executor thread.  Unlike steady_clock, this
+    // does not advance while the OS has descheduled the thread, so host load
+    // cannot inflate emulated time.
+    uint64_t threadCpuNowNs()
+    {
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+        timespec ts{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        {
+            return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+                   static_cast<uint64_t>(ts.tv_nsec);
+        }
+#endif
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
     uint64_t steadyNowNs()
     {
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
+    }
+
+    // Diagnostic: PS2X_EE_TIME_TRACE=1 prints once a second how emulated pace
+    // (wall time minus reported host stalls) and unrepaid stall debt relate to
+    // the guest clock.  Used to tell "the guest is executing" from "the guest
+    // clock ran ahead while the host rendered".
+    bool eeTimeTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_TIME_TRACE") != nullptr;
+        return enabled;
     }
 
     template <typename Map>
@@ -150,6 +201,14 @@ namespace
             candidate = (candidate == std::numeric_limits<int>::max()) ? 1 : candidate + 1;
         } while (candidate != first);
         return 0;
+    }
+}
+
+void ps2x::time::noteHostStall(std::chrono::nanoseconds duration) noexcept
+{
+    if (duration.count() > 0)
+    {
+        t_hostStallNs += static_cast<uint64_t>(duration.count());
     }
 }
 
@@ -193,8 +252,12 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
-    m_hostClockAnchor = std::chrono::steady_clock::now();
     m_hostAnchorCycle = m_eeCycle;
+    m_paceLastWallNs = m_paceLastCpuNs = m_paceLastStallNs = m_paceLastWaitNs = 0u;
+    m_paceAdvanceNs = 0u;
+    m_paceDebtNs = 0u;
+    m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
+    m_paceInitialized = false;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -543,32 +606,100 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
-void EeScheduler::accountCycles(uint32_t cycles) noexcept
+void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
 {
-    uint64_t elapsed = std::max<uint64_t>(1u, cycles);
-
-    // Wall-clock coupling: floor EE time at the host clock before charging.
-    // The per-dispatch charges alone advance m_eeCycle far slower than real
-    // time while threads busy-poll, so host-paced deadlines (VBlank above all)
-    // would never be reached by EE time.  The floor only pulls m_eeCycle
-    // forward, never back, so EE time stays monotonic and consistent with the
-    // event deadlines derived from it; the "both deadlines" rule in
-    // processDueDeadlines still keeps events from firing before real time.
-    if (m_hostClockAnchor == std::chrono::steady_clock::time_point{})
+    const uint64_t cpuNow = threadCpuNowNs();
+    if (!m_paceInitialized)
     {
         // Lazy anchor for executors that never call reset() (syscall tests).
-        m_hostClockAnchor = std::chrono::steady_clock::now();
-        m_hostAnchorCycle = m_eeCycle;
+        m_paceLastWallNs = nowWallNs;
+        m_paceLastCpuNs = cpuNow;
+        m_paceLastStallNs = t_hostStallNs;
+        m_paceLastWaitNs = t_guestWaitNs;
+        m_paceAdvanceNs = 0u;
+        m_paceDebtNs = 0u;
+        m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
+        m_paceInitialized = true;
+        return;
     }
-    m_eeCycle += elapsed;
-    const uint64_t wallCycle = m_hostAnchorCycle +
-        hostDurationToEeCycles(std::chrono::steady_clock::now() - m_hostClockAnchor);
-    if (wallCycle > m_eeCycle)
+
+    const uint64_t wallDelta = nowWallNs - m_paceLastWallNs;
+    const uint64_t cpuDelta = cpuNow - m_paceLastCpuNs;
+    const uint64_t stallDelta = t_hostStallNs - m_paceLastStallNs;
+    const uint64_t waitDelta = t_guestWaitNs - m_paceLastWaitNs;
+    m_paceLastWallNs = nowWallNs;
+    m_paceLastCpuNs = cpuNow;
+    m_paceLastStallNs = t_hostStallNs;
+    m_paceLastWaitNs = t_guestWaitNs;
+
+    // Time the executor spent off-CPU without being blocked in a guest wait is
+    // host contention/scheduling, not emulated time: under `taskset -c 0-1`
+    // plus a PNG per vsync this was tens of ms per frame and let the guest
+    // clock run ~9x its execution rate, which is what froze the post-skip
+    // transition.  Guest waits (DelayThread/WaitVSync/semaphore sleeps) do
+    // count, so idle threads still reach their timer deadlines.
+    const uint64_t notOnCpu = wallDelta > cpuDelta ? wallDelta - cpuDelta : 0u;
+    const uint64_t descheduled = notOnCpu > waitDelta ? notOnCpu - waitDelta : 0u;
+
+    // Time spent in explicitly reported host-only work is excluded from the
+    // guest clock.  Everything else keeps the old behaviour: wall time while
+    // the host keeps up, so VBlank count and IOP/SPU audio stay real-time.
+    const uint64_t excluded = std::min(wallDelta, stallDelta + descheduled);
+    const uint64_t base = wallDelta - excluded;
+    m_paceStalledNs += std::min(wallDelta, stallDelta);
+    m_paceDescheduledNs += descheduled;
+    m_paceWaitNs += waitDelta;
+
+    // Guest CPU time is what pays for catching up excluded host time.  A host
+    // stall blocks the guest, so it must not create a burst of due VBlanks and
+    // timers; the missed emulated time is replayed at up to
+    // kPaceCatchUpNumerator/Denominator times the guest's own execution rate.
+    // A normally running guest (CPU time close to wall time) repays a snapshot
+    // within a few frames; a guest that barely executes (snapshot every vsync,
+    // heavy CPU starvation) runs in slow motion instead of skipping ahead.
+    const uint64_t hostCpu = std::min(cpuDelta, stallDelta);
+    const uint64_t guestCpu = cpuDelta - hostCpu;
+    m_paceGuestCpuNs += guestCpu;
+    if (excluded >= kPaceMaxDebtNs - m_paceDebtNs)
     {
-        // Bound one catch-up step to one frame period so a host-side stall
-        // (module load, OS suspend) is spread over the following checkpoints
-        // instead of landing as one huge timer/IOP advance burst.
-        const uint64_t catchUp = std::min<uint64_t>(wallCycle - m_eeCycle, kVBlankPeriodCycles);
+        m_paceDebtNs = kPaceMaxDebtNs;
+    }
+    else
+    {
+        m_paceDebtNs += excluded;
+    }
+    const uint64_t allowance =
+        (guestCpu / kPaceCatchUpDenominator) * kPaceCatchUpNumerator +
+        (guestCpu % kPaceCatchUpDenominator) * kPaceCatchUpNumerator / kPaceCatchUpDenominator;
+    uint64_t repay = allowance > base ? allowance - base : 0u;
+    repay = std::min(repay, m_paceDebtNs);
+    m_paceDebtNs -= repay;
+    m_paceAdvanceNs += base + repay;
+}
+
+void EeScheduler::accountCycles(uint32_t cycles) noexcept
+{
+    // Sample at most once per kPaceSamplePeriodNs: a CPU-time clock_gettime()
+    // is a syscall (not vDSO), and paying it per dispatch cost ~13% of the
+    // menu frame budget in the first version of this fix.  The sample interval
+    // is far below a VBlank period, so pacing stays smooth.
+    const uint64_t nowWall = steadyNowNs();
+    if (!m_paceInitialized || nowWall - m_paceLastWallNs >= kPaceSamplePeriodNs)
+    {
+        sampleHostPacing(nowWall);
+    }
+
+    uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+    m_eeCycle += elapsed;
+
+    // Wall-clock floor from the pacing sample, capped to one VBlank period per
+    // call so a large backlog is spread over checkpoints instead of landing as
+    // one timer/IOP burst.
+    const uint64_t target = m_hostAnchorCycle +
+        hostDurationToEeCycles(std::chrono::nanoseconds(m_paceAdvanceNs));
+    if (target > m_eeCycle)
+    {
+        const uint64_t catchUp = std::min<uint64_t>(target - m_eeCycle, kVBlankPeriodCycles);
         m_eeCycle += catchUp;
         elapsed += catchUp;
     }
@@ -578,6 +709,28 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
+    }
+
+    if (eeTimeTraceEnabled())
+    {
+        static auto nextTrace = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextTrace)
+        {
+            nextTrace = now + std::chrono::seconds(1);
+            const GuestThread *running = currentThread();
+            std::cerr << "[ee-time] vsync=" << m_vsyncTick
+                      << " eeCycle=" << m_eeCycle
+                      << " paceMs=" << (m_paceAdvanceNs / 1000000ull)
+                      << " debtMs=" << (m_paceDebtNs / 1000000ull)
+                      << " guestMs=" << (m_paceGuestCpuNs / 1000000ull)
+                      << " waitMs=" << (m_paceWaitNs / 1000000ull)
+                      << " stallMs=" << (m_paceStalledNs / 1000000ull)
+                      << " deschedMs=" << (m_paceDescheduledNs / 1000000ull)
+                      << " pc=0x" << std::hex
+                      << (running != nullptr ? running->activeContext().pc : 0u)
+                      << std::dec << std::endl;
+        }
     }
 }
 
@@ -2430,8 +2583,13 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        const auto waitStart = std::chrono::steady_clock::now();
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
+        t_guestWaitNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - waitStart)
+                .count());
         return;
     }
 
@@ -2461,9 +2619,14 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    const auto waitStart = std::chrono::steady_clock::now();
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
+    t_guestWaitNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - waitStart)
+            .count());
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
@@ -2500,25 +2663,22 @@ void EeScheduler::updateNextDeadline()
         return;
     }
     // An event fires when both its EE deadline and its host deadline have
-    // passed, so the next checkpoint must be due on both clocks.  Publish the
-    // earliest both-due estimate: each event's EE deadline lifted to its host
-    // deadline when the host clock is the later of the two.
+    // passed.  The checkpoint trigger only needs the earliest EE deadline;
+    // the host deadline stays a separate lower bound, because EE time is paced
+    // by wall time minus reported host stalls and is not a linear function of
+    // host wall time (a stalled guest runs in slow motion).
     const ScheduledEvent *best = nullptr;
-    uint64_t bestCycle = 0u;
     for (const ScheduledEvent &item : m_deadlines)
     {
-        const auto hostGap = item.hostDeadline - m_hostClockAnchor;
-        const uint64_t hostEe = m_hostAnchorCycle +
-            hostDurationToEeCycles(std::max(hostGap, decltype(hostGap)::zero()));
-        const uint64_t due = std::max(item.deadlineCycle, hostEe);
-        if (best == nullptr || due < bestCycle ||
-            (due == bestCycle && item.sequence < best->sequence))
+        if (best == nullptr || item.deadlineCycle < best->deadlineCycle ||
+            (item.deadlineCycle == best->deadlineCycle &&
+             (item.hostDeadline < best->hostDeadline ||
+              (item.hostDeadline == best->hostDeadline && item.sequence < best->sequence))))
         {
             best = &item;
-            bestCycle = due;
         }
     }
-    m_nextDeadlineCycle.store(bestCycle, std::memory_order_release);
+    m_nextDeadlineCycle.store(best->deadlineCycle, std::memory_order_release);
     m_nextDeadlineHostNs.store(static_cast<uint64_t>(
                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        best->hostDeadline.time_since_epoch())

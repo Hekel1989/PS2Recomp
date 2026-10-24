@@ -399,6 +399,7 @@ private:
     void waitForEvent();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
+    void sampleHostPacing(uint64_t nowWallNs) noexcept;
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
@@ -439,15 +440,30 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
-    // Wall-clock anchor for EE time.  The per-dispatch charges under-count
-    // real time (a dispatch costs kGuestDispatchCycles no matter what it
-    // did), so every checkpoint floors m_eeCycle at
-    // m_hostAnchorCycle + elapsed_host_time * kEeClockHz.  The floor only
-    // pulls m_eeCycle forward, never back, so EE time stays monotonic while
-    // host-paced events (VBlank, alarms, thread delays) fire on time even
-    // while guest threads busy-poll.
-    std::chrono::steady_clock::time_point m_hostClockAnchor{};
+    // Emulated-time pacing.  EE time follows host wall time while the host
+    // keeps up (audio and VBlank stay real-time) but must not count host-only
+    // work (PNG encoding, VRAM dumps): that work blocks the guest, so charging
+    // it would advance VBlank/timer deadlines while the guest executes almost
+    // nothing.  accountCycles() samples wall time, executor CPU time, explicitly
+    // noted host-stall time and guest wait time every kPaceSamplePeriodNs, then
+    // advances m_paceAdvanceNs by (wall - host stalls - time the executor spent
+    // descheduled outside a guest wait).  Guest waits still count, so idle
+    // threads reach their VBlank/timer deadlines.  Excluded time is repaid
+    // later, but only out of a bounded multiple of guest CPU time, so a stalled
+    // guest runs in slow motion instead of skipping ahead.
     uint64_t m_hostAnchorCycle = 0u;
+    uint64_t m_paceLastWallNs = 0u;
+    uint64_t m_paceLastCpuNs = 0u;
+    uint64_t m_paceLastStallNs = 0u;
+    uint64_t m_paceLastWaitNs = 0u;
+    uint64_t m_paceAdvanceNs = 0u;
+    uint64_t m_paceDebtNs = 0u;
+    // Cumulative components for PS2X_EE_TIME_TRACE.
+    uint64_t m_paceGuestCpuNs = 0u;
+    uint64_t m_paceWaitNs = 0u;
+    uint64_t m_paceStalledNs = 0u;
+    uint64_t m_paceDescheduledNs = 0u;
+    bool m_paceInitialized = false;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
