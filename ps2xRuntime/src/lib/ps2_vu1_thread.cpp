@@ -123,6 +123,8 @@ namespace ps2x
         : m_memory(memory), m_vu1(vu1), m_gs(gs), m_mode(mode), m_fbrst(std::move(fbrst))
     {
         m_statsEnabled = envSet("PS2X_VU1_THREAD_STATS");
+        m_predictor = std::make_unique<PS2Memory>();
+        m_predictor->initializeVif1Predictor(m_memory);
 #if defined(__x86_64__) || defined(_M_X64)
         m_creatorMxcsr = _mm_getcsr();
 #if defined(__GNUC__) || defined(__clang__)
@@ -132,9 +134,6 @@ namespace ps2x
         if (m_mode == Mode::Verify)
         {
             m_shadow = std::make_unique<Shadow>();
-            // PS2Memory's constructor clears the process-wide scratchpad
-            // pointer; the real memory still owns it.
-            ps2SetScratchpadHostPtr(m_memory.getScratchpad());
             Shadow &shadow = *m_shadow;
             shadow.memory.initializeVif1Shadow(m_memory);
             shadow.vu1.reset();
@@ -170,6 +169,9 @@ namespace ps2x
                                  PS2_VU1_DATA_SIZE, m_gs, &s.memory, top, itop, 65536);
                 });
         }
+        // PS2Memory's constructor clears the process-wide scratchpad pointer;
+        // the real memory still owns it.
+        ps2SetScratchpadHostPtr(m_memory.getScratchpad());
         std::fprintf(stderr, "[vu1-thread] mode=%s\n", m_mode == Mode::Verify ? "verify" : "threaded");
         m_worker = std::thread([this] { workerMain(); });
     }
@@ -219,20 +221,10 @@ namespace ps2x
         for (;;)
         {
             Work *work = nullptr;
-            for (int spin = 0; spin < kWorkerSpins; ++spin)
-            {
-                {
-                    std::unique_lock<std::mutex> lock(m_queueMutex, std::try_to_lock);
-                    if (lock.owns_lock() && !m_queue.empty())
-                    {
-                        work = m_queue.front();
-                        m_queue.pop_front();
-                        break;
-                    }
-                }
+            // Spin on the push counter, not the mutex: a contended glibc mutex
+            // puts the game thread to sleep instead of spinning.
+            for (int spin = 0; spin < kWorkerSpins && m_pushed.load(std::memory_order_acquire) == m_taken; ++spin)
                 cpuRelax();
-            }
-            if (work == nullptr)
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 if (m_queue.empty() && !m_stop)
@@ -245,6 +237,7 @@ namespace ps2x
                     break; // stopping
                 work = m_queue.front();
                 m_queue.pop_front();
+                ++m_taken;
             }
 
             t_work = work;
@@ -297,7 +290,6 @@ namespace ps2x
         work->chunks.clear();
         work->opCount = 0u;
         work->fbrst = 0u;
-        work->mayChangeMask = false;
         work->done.store(false, std::memory_order_relaxed);
         return work;
     }
@@ -364,22 +356,6 @@ namespace ps2x
         chunk.srcKind = srcKind;
         m_building->bytes.insert(m_building->bytes.end(), data, data + sizeBytes);
         m_building->chunks.push_back(chunk);
-        // Every VIFcode sits at a 4-byte offset of its chunk, so a chunk with
-        // no word whose opcode field is MSKPATH3 (0x06) cannot change the
-        // PATH3 mask.  Payload words can match too; that only costs a fence.
-        if (!m_building->mayChangeMask)
-        {
-            for (uint32_t offset = 0; offset + 4u <= sizeBytes; offset += 4u)
-            {
-                uint32_t word = 0u;
-                std::memcpy(&word, data + offset, sizeof(word));
-                if ((word & 0x7F000000u) == 0x06000000u)
-                {
-                    m_building->mayChangeMask = true;
-                    break;
-                }
-            }
-        }
     }
 
     void Vu1Thread::endKick()
@@ -394,8 +370,8 @@ namespace ps2x
             return;
         }
         work->sequence = m_nextSequence++;
-        if (work->mayChangeMask)
-            ++m_outstandingMaskWork;
+        for (const Chunk &chunk : work->chunks)
+            m_predictor->processVIF1Data(work->bytes.data() + chunk.offset, chunk.size);
         if (m_shadow)
             shadowKick(*work);
 
@@ -405,6 +381,7 @@ namespace ps2x
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             m_queue.push_back(work);
+            m_pushed.fetch_add(1u, std::memory_order_release);
         }
         if (m_workerSleeping.load())
             m_queueCv.notify_one();
@@ -556,7 +533,7 @@ namespace ps2x
 
     void Vu1Thread::waitFor(Work &work, Vu1SyncReason reason)
     {
-        const uint64_t start = m_statsEnabled ? nowNs() : 0u;
+        const uint64_t start = nowNs();
         bool done = false;
         for (int spin = 0; spin < kWaitSpins; ++spin)
         {
@@ -574,11 +551,14 @@ namespace ps2x
             m_doneCv.wait(lock, [&work] { return work.done.load(); });
             m_eeWaiting.store(false);
         }
+        const uint64_t waited = nowNs() - start;
+        if (m_waitObserver)
+            m_waitObserver(waited);
         if (m_statsEnabled)
         {
             const size_t index = static_cast<size_t>(reason);
             ++m_stats.waits[index];
-            m_stats.waitNs[index] += nowNs() - start;
+            m_stats.waitNs[index] += waited;
         }
     }
 
@@ -598,8 +578,6 @@ namespace ps2x
                 replay(work->ops[i]);
             if (m_statsEnabled)
                 m_stats.ops += work->opCount;
-            if (work->mayChangeMask && m_outstandingMaskWork > 0u)
-                --m_outstandingMaskWork;
             releaseWork(work);
         }
         else
@@ -714,19 +692,43 @@ namespace ps2x
             replayLog(false, Vu1SyncReason::Count);
     }
 
-    void Vu1Thread::beforeGifStatusRead()
+    bool Vu1Thread::path3MaskForRead()
     {
-        if (t_onWorker || m_replaying)
+        if (m_serialForGood)
+            return m_memory.m_path3Masked;
+        const bool masked = m_predictor->m_path3Masked;
+        if (m_shadow && !m_verifyFailed && m_shadow->memory.m_path3Masked != masked)
+            verifyFailure("predicted PATH3 mask at a GIF_STAT read");
+        return masked;
+    }
+
+    void Vu1Thread::checkPredictor(Vu1SyncReason reason)
+    {
+        // After a full fence the real VIF1 state is the serial one; the parse
+        // predictor must agree.  Cheap enough to check at every fence.
+        if (!m_log.empty() || m_replaying || m_serialForGood)
             return;
-        if (m_outstandingMaskWork != 0u)
+        const PS2Memory &p = *m_predictor;
+        const PS2Memory &r = m_memory;
+        if (std::memcmp(&p.vif1_regs, &r.vif1_regs, sizeof(r.vif1_regs)) == 0 &&
+            p.m_path3Masked == r.m_path3Masked &&
+            p.m_vif1PendingPath2ImageQwc == r.m_vif1PendingPath2ImageQwc &&
+            p.m_vif1PendingPath2DirectHl == r.m_vif1PendingPath2DirectHl &&
+            p.m_vif1PendingPath2FromNextDirect == r.m_vif1PendingPath2FromNextDirect)
+            return;
+        if (!m_predictorDriftLogged)
         {
-            sync(Vu1SyncReason::GifStatus);
-            return;
+            m_predictorDriftLogged = true;
+            std::fprintf(stderr, "[vu1-thread] VIF1 parse predictor drifted from the real state at a %s fence\n",
+                         reasonName(reason));
         }
-        // No queued stream can change the mask: the replayed state is the
-        // serial one.  Verify mode checks that claim.
-        if (m_shadow && !m_verifyFailed && m_shadow->memory.m_path3Masked != m_memory.m_path3Masked)
-            verifyFailure("PATH3 mask at an unfenced GIF_STAT read");
+        if (m_shadow)
+            verifyFailure("VIF1 parse predictor drifted");
+        m_predictor->vif1_regs = r.vif1_regs;
+        m_predictor->m_path3Masked = r.m_path3Masked;
+        m_predictor->m_vif1PendingPath2ImageQwc = r.m_vif1PendingPath2ImageQwc;
+        m_predictor->m_vif1PendingPath2DirectHl = r.m_vif1PendingPath2DirectHl;
+        m_predictor->m_vif1PendingPath2FromNextDirect = r.m_vif1PendingPath2FromNextDirect;
     }
 
     void Vu1Thread::sync(Vu1SyncReason reason)
@@ -737,6 +739,7 @@ namespace ps2x
             ++m_stats.fences[static_cast<size_t>(reason)];
         if (!m_log.empty())
             replayLog(true, reason);
+        checkPredictor(reason);
         if (m_shadow)
             compareState(reason);
     }
@@ -876,6 +879,7 @@ namespace ps2x
 
     void Vu1Thread::mirrorVif1Register(uint32_t address, uint32_t value)
     {
+        m_predictor->writeIORegister(address, value);
         if (m_shadow)
             m_shadow->memory.writeIORegister(address, value);
     }

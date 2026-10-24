@@ -86,7 +86,6 @@ log.  It runs before:
 | VIF1 register read/write (`0x10003C00-0x10003DFF`) | VIF1 state is worker-owned; `FBRST` also resets the PATH3 mask |
 | VU1 code/data access (`0x11008000-0x1100FFFF`) | VU1 memory is worker-owned |
 | GS `CSR` / `SIGLBLID` read or write | SIGNAL/FINISH/LABEL in replayed packets update them |
-| `GIF_STAT` read | `M3P` mirrors the PATH3 mask |
 | GIF fast paths and HLE stubs that call the GS directly | they bypass the ordered sink |
 | a kick with `FBRST.DE1/TE1` set (and every later kick) | D/T stops write `VPU-STAT`; those kicks run serially |
 | reset, shutdown | the worker's state is torn down |
@@ -95,10 +94,30 @@ log.  It runs before:
 memory without synchronisation; their VU1 memory is a snapshot of a moving
 target with the thread on, as their EE RAM always was.
 
+`GIF_STAT` needs no fence either.  Its only worker-dependent bit, M3P, mirrors
+the PATH3 mask, and the mask depends only on the VIF1 command stream, never on
+VU1.  So the game thread runs a *parse predictor*: a copy of the VIF1/PATH3
+state with no VU memory, no VU1 callbacks and no GIF output, through which
+every kick is walked (UNPACK and MPG payloads are skipped, so it costs little).
+Its mask is the serial mask at once.  At every full fence the predictor is
+compared with the real VIF1 state and a drift is logged (and resynced); verify
+mode also checks every predicted value against the shadow.  One game
+reads GIF_STAT 1-3 times a frame for its own flag bit while MSKPATH3 streams are
+queued, and an earlier fence there cost 150-230 ms/s of game-thread waiting in
+the story scenes.
+
 `VPU-STAT` needs no fence: VU1 only sets its D/T bits when `FBRST.DE1/TE1`
 enabled them at the kick, so while they have never been enabled the serial
 runtime's update at each kick is a no-op.  The first kick with them enabled
 switches the runtime to the serial path for good.
+
+## Fence waits and the guest clock
+
+The guest clock advances with the game thread's CPU time; time off the CPU
+outside a guest wait counts as OS descheduling, and long descheduling becomes
+slow-motion debt.  A fence wait stands in for VU1 work the serial runtime ran on
+this thread, so it is reported as emulated time
+(`ps2x::time::noteEmulatedWait`) and shows up in `waitMs`.
 
 ## Verification (`PS2X_VU1_THREAD=verify`)
 

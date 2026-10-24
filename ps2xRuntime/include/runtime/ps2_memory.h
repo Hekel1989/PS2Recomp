@@ -356,6 +356,9 @@ public:
     // The VU1 thread's verification shadow: VU1 code/data only, copied from
     // `real` along with the VIF1/PATH3 state.
     bool initializeVif1Shadow(const PS2Memory &real);
+    // The VU1 thread's parse predictor: VIF1/PATH3 state only, no VU memory,
+    // so processVIF1Data walks commands without writing or running anything.
+    void initializeVif1Predictor(const PS2Memory &real);
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);

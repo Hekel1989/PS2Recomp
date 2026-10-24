@@ -574,6 +574,17 @@ bool PS2Memory::initializeVif1Shadow(const PS2Memory &real)
     return true;
 }
 
+void PS2Memory::initializeVif1Predictor(const PS2Memory &real)
+{
+    gs_regs.vsyncTick.store(0u);
+    gs_regs.csr.store(0u);
+    vif1_regs = real.vif1_regs;
+    m_path3Masked = real.m_path3Masked;
+    m_vif1PendingPath2ImageQwc = real.m_vif1PendingPath2ImageQwc;
+    m_vif1PendingPath2DirectHl = real.m_vif1PendingPath2DirectHl;
+    m_vif1PendingPath2FromNextDirect = real.m_vif1PendingPath2FromNextDirect;
+}
+
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
@@ -2888,8 +2899,6 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     {
         if (address >= 0x10003C00u && address < 0x10003E00u)
             m_vu1Thread->sync(ps2x::Vu1SyncReason::Vif1Register);
-        else if (address == 0x10003020u) // GIF_STAT.M3P mirrors the PATH3 mask
-            m_vu1Thread->beforeGifStatusRead();
     }
 
     size_t timerIndex = 0u;
@@ -2963,7 +2972,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         // effective PATH3 mask controlled by the VIF1 MSKPATH3 command.
         stat = (stat & ~0xFu) |
                (mode & 0x1u) |
-               (m_path3Masked ? 0x2u : 0u) |
+               ((m_vu1Thread ? m_vu1Thread->path3MaskForRead() : m_path3Masked) ? 0x2u : 0u) |
                (mode & 0x4u) |
                (ctrl & 0x8u);
         return stat;
