@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include "runtime/ps2_gs_host_hooks.h"
 
 namespace
 {
@@ -1907,6 +1908,36 @@ namespace
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
+        }
+
+        // SUIKO(gs-phase5b): these register writes bypass the GIF arbiter, so
+        // an external GS backend never sees them. Mirror them as a minimal A+D
+        // GIF packet (GIFtag NLOOP=pairCount, FLG=PACKED, NREG=1, REGS=0x0E,
+        // EOP, then one {value, reg} qword per pair -- the same shape
+        // sceGsResetGraph synthesizes) on path 2 (the GIF DMA slot).
+        const auto &gsHooks = Ps2GsHostHooks::hooks();
+        if (pairCount > 0u && pairCount <= 0x7FFFu && (gsHooks.gifPacket || gsHooks.gifConsume))
+        {
+            std::vector<uint64_t> pkt((pairCount + 1u) * 2u, 0u);
+            uint64_t *q = pkt.data();
+            q[0] = static_cast<uint64_t>(pairCount & 0x7FFFu) |
+                   (static_cast<uint64_t>(1u) << 15) |  // EOP
+                   (static_cast<uint64_t>(1u) << 60);   // NREG = 1
+            q[1] = 0x0Eull;                             // REGS: A+D
+            for (size_t i = 0; i < pairCount; ++i)
+            {
+                q[2 + i * 2u] = pairs[i].value;
+                q[3 + i * 2u] = pairs[i].reg;
+            }
+            const uint32_t qwords = static_cast<uint32_t>(pairCount + 1u);
+            if (gsHooks.gifPacket)
+            {
+                gsHooks.gifPacket(2u, reinterpret_cast<const uint8_t *>(q), qwords, false);
+            }
+            if (gsHooks.gifConsume)
+            {
+                gsHooks.gifConsume(2u, qwords);
+            }
         }
     }
 

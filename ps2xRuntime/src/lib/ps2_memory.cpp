@@ -1969,7 +1969,7 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
-void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
+void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl, bool directContinuation)
 {
     if (!data || sizeBytes < 16)
         return;
@@ -1985,7 +1985,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     }
 
     if (m_gifArbiter)
-        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl, directContinuation);
     else if (m_gifPacketCallback)
         m_gifPacketCallback(data, sizeBytes);
 
@@ -2198,6 +2198,30 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+
+    // SUIKO(gs-phase5b): this fast path consumes the GIF DMA chain before the
+    // arbiter, so the arbiter's gifPacket hook never sees it. Feed the host GS
+    // the PATH2 (GIF DMA) byte stream this chain represents: the A+D setup
+    // packet (GIFtag + 4 A+D qwords), the IMAGE GIFtag, then the image
+    // payload -- assembled contiguously, exactly what the hardware would have
+    // delivered on the GIF DMA path.
+    if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.gifPacket || gsHooks.gifConsume)
+    {
+        const uint32_t chainQwords = 6u + imageQwc;
+        std::vector<uint8_t> chain(static_cast<std::size_t>(chainQwords) * 16u);
+        std::memcpy(chain.data(), setupPayload, 5u * 16u);
+        std::memcpy(chain.data() + 5u * 16u, imageGifTag, 16u);
+        std::memcpy(chain.data() + 6u * 16u, imageData, static_cast<std::size_t>(imageQwc) * 16u);
+        if (gsHooks.gifPacket)
+        {
+            gsHooks.gifPacket(2u, chain.data(), chainQwords, false);
+        }
+        if (gsHooks.gifConsume)
+        {
+            gsHooks.gifConsume(2u, chainQwords);
+        }
+    }
+
     gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes);
 
     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
@@ -2275,6 +2299,19 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
         return false;
     if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
         return false;
+
+    // SUIKO(gs-phase5b): mirror the consumed packet to the host GS (see the
+    // image-upload fast path above for why the arbiter hook misses these).
+    // validatePackedGifPacket guarantees a complete PACKED packet, so it can
+    // be handed to the GS unchanged.
+    if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.gifPacket)
+    {
+        gsHooks.gifPacket(2u, payload, payloadBytes / 16u, false);
+    }
+    if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.gifConsume)
+    {
+        gsHooks.gifConsume(2u, payloadBytes / 16u);
+    }
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;

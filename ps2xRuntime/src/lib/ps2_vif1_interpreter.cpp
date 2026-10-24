@@ -320,7 +320,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 (static_cast<uint64_t>(kGifFmtImage) << 58);
             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
             std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+            // SUIKO(gs-phase5b): directContinuation=true tells the host GS hook
+            // that the GIFtag above is synthesized for the runtime's own
+            // frontend; the raw data after it continues the DIRECT packet that
+            // was split at the DMA-chunk boundary (see ps2_gs_host_hooks.h).
+            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true,
+                            m_vif1PendingPath2DirectHl, true);
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
