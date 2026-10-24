@@ -1936,6 +1936,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                      m_xgkick.active ? "pending" : "idle");
     }
     m_state.cycles = m_cycle;
+    if (trace && m_activeVuData && m_activeVuDataSize >= 0x1e10u && m_state.pc == 0x200u)
+    {
+        uint64_t lo = 0, hi = 0;
+        std::memcpy(&lo, m_activeVuData + 0x1e00u, 8u);
+        std::memcpy(&hi, m_activeVuData + 0x1e08u, 8u);
+        std::fprintf(stderr, "[vu1:dump] after pc=0x200 q1e0=%016llx %016llx\n",
+                     static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+    }
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }
