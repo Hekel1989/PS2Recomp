@@ -25,6 +25,12 @@ namespace ps2_stubs
 {
     namespace
     {
+        bool mpegTraceEnabled()
+        {
+            static const bool enabled = std::getenv("PS2X_MPEG_TRACE") != nullptr;
+            return enabled;
+        }
+
         struct MpegDecodedFrame
         {
             int width = 0;
@@ -1166,6 +1172,21 @@ namespace ps2_stubs
             event.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
             event.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
             event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
+            if (mpegTraceEnabled())
+            {
+                static uint32_t s_streamEvents = 0u;
+                if (s_streamEvents < 64u || (s_streamEvents % 512u) == 0u)
+                {
+                    std::cerr << "[mpeg-trace] str-event #" << s_streamEvents
+                              << " type=" << streamType
+                              << " addr=0x" << std::hex << dataAddr
+                              << " len=0x" << len
+                              << " cb=" << std::dec << event.callbacks.size()
+                              << std::hex << " pts=0x" << event.pts
+                              << std::dec << std::endl;
+                }
+                ++s_streamEvents;
+            }
             if (!event.callbacks.empty())
             {
                 callbackEvents.push_back(std::move(event));
@@ -1587,7 +1608,21 @@ namespace ps2_stubs
         {
             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
             {
+                if (mpegTraceEnabled() && callback.func != 0u)
+                {
+                    std::cerr << "[mpeg-trace] str-callback skipped func=0x" << std::hex << callback.func
+                              << std::dec << " (no function)" << std::endl;
+                }
                 return;
+            }
+            if (mpegTraceEnabled())
+            {
+                std::cerr << "[mpeg-trace] str-callback dispatch func=0x" << std::hex << callback.func
+                          << " type=" << std::dec << event.streamType
+                          << " addr=0x" << std::hex << event.dataAddr
+                          << " len=0x" << event.len
+                          << " data=0x" << callback.data
+                          << std::dec << std::endl;
             }
 
             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
@@ -1944,6 +1979,15 @@ namespace ps2_stubs
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
         g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
             MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+        if (mpegTraceEnabled())
+        {
+            std::cerr << "[mpeg-trace] AddStrCallback mpeg=0x" << std::hex << mpegAddr
+                      << " type=" << std::dec << streamType
+                      << " streamId=" << streamId
+                      << " func=0x" << std::hex << callbackFunc
+                      << " data=0x" << callbackData
+                      << std::dec << std::endl;
+        }
         setReturnU32(ctx, 0u);
     }
 
