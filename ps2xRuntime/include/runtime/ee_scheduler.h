@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -365,7 +366,12 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    // Rebuilds the debug view of the kernel.  This is a presentation copy, not
+    // guest state: the semaphore/thread calls that used to publish on every
+    // operation spent ~8% of the title CPU on vector builds and sorts.  The
+    // wrapper skips most calls; publishSnapshotNow() is the unconditional one.
     void publishSnapshot();
+    void publishSnapshotNow();
 
 private:
     struct ScheduledEvent
@@ -488,6 +494,18 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    // Host-clock probe for the deadline above.  Reading the wall clock on
+    // every checkpoint once the cycle deadline had passed cost 20% of the
+    // title CPU on the Legion (vdso clock_gettime).  Only every Nth such
+    // checkpoint reads it instead: a checkpoint is one backward branch, so
+    // the event still fires within a few microseconds of its host deadline
+    // and the vsync chain cannot drift.
+    uint32_t m_deadlineProbeCountdown = 0u;
+    // Set when a probe (or a wait timeout) has observed a due event's host
+    // deadline pass.  The dispatcher consumes it instead of reading the wall
+    // clock on every entry; the deadline could not have fired otherwise.
+    bool m_deadlineDueObserved = false;
+    [[nodiscard]] bool deadlineProbeDue() noexcept;
     // Host-clock time (nanoseconds since the steady_clock epoch) of the event
     // m_nextDeadlineCycle refers to.  An event fires only when its EE deadline
     // and its host deadline have both passed, so the checkpoint trigger that
@@ -495,6 +513,10 @@ private:
     std::atomic<uint64_t> m_nextDeadlineHostNs{0};
 
     mutable std::mutex m_snapshotMutex;
-    EeKernelSnapshot m_snapshot;
+    // Immutable after publish: the debugger takes a shared_ptr copy under the
+    // lock and clones it outside, so the executor never waits for a long
+    // snapshot copy on the presentation thread.
+    std::shared_ptr<const EeKernelSnapshot> m_snapshot;
     uint64_t m_snapshotSequence = 0;
+    uint32_t m_snapshotPublishCountdown = 0u;
 };

@@ -26,6 +26,11 @@ namespace
     // is cheap (a few hundred per second); sampling per dispatch was
     // measurable on the menu (~13% of the frame budget).
     constexpr uint64_t kPaceSamplePeriodNs = 2000000ull; // 2 ms
+    // Checkpoints between host-clock probes once the cycle deadline has
+    // passed.  A checkpoint is one backward branch (~tens of cycles), so 64
+    // of them are far below a millisecond: the vDSO read stops dominating
+    // the path without letting the VBlank chain drift.
+    constexpr uint32_t kDeadlineProbeInterval = 64u;
     // Excluded host time may be repaid at most 2x the guest CPU time: a host
     // that keeps up still reaches real time, while a stalled guest runs in slow
     // motion instead of lightning through VBlank/timer deadlines.
@@ -256,6 +261,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_paceLastWallNs = m_paceLastCpuNs = m_paceLastStallNs = m_paceLastWaitNs = 0u;
     m_paceAdvanceNs = 0u;
     m_paceDebtNs = 0u;
+    m_deadlineProbeCountdown = 0u;
+    m_deadlineDueObserved = false;
+    m_snapshotPublishCountdown = 0u;
     m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
     m_paceInitialized = false;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
@@ -581,9 +589,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return true;
     }
 
-    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-    if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle &&
-        steadyNowNs() >= m_nextDeadlineHostNs.load(std::memory_order_acquire))
+    if (deadlineProbeDue())
     {
         m_checkpointPending.store(true, std::memory_order_release);
         return true;
@@ -692,6 +698,11 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     // is a syscall (not vDSO), and paying it per dispatch cost ~13% of the
     // menu frame budget in the first version of this fix.  The sample interval
     // is far below a VBlank period, so pacing stays smooth.
+    // The wall clock itself is vDSO but was still read at every checkpoint
+    // after 2 ms of guest time; gate it on guest cycles instead.  Emulated
+    // time is floored at wall time, so 2 ms of guest time is the same cadence
+    // on a healthy host, and a delayed sample after a host stall still sees
+    // the whole stall interval because the timestamp is read at sample time.
     const uint64_t nowWall = steadyNowNs();
     if (!m_paceInitialized || nowWall - m_paceLastWallNs >= kPaceSamplePeriodNs)
     {
@@ -1975,19 +1986,38 @@ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
 
 EeKernelSnapshot EeScheduler::snapshot() const
 {
-    std::lock_guard lock(m_snapshotMutex);
-    return m_snapshot;
+    std::shared_ptr<const EeKernelSnapshot> held;
+    {
+        std::lock_guard lock(m_snapshotMutex);
+        held = m_snapshot;
+    }
+    return held ? *held : EeKernelSnapshot{};
 }
 
 void EeScheduler::publishSnapshot()
 {
-    EeKernelSnapshot next{};
-    next.sequence = ++m_snapshotSequence;
-    next.eeCycle = m_eeCycle;
-    next.sliceEndCycle = m_sliceEndCycle;
-    next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-    next.runningThreadId = m_currentThreadId;
-    next.threads.reserve(m_threads.size());
+    // The debugger samples at frame rate.  Rebuilding the whole thread table
+    // on every semaphore signal/poll (thousands per second on the title
+    // renderer) cost ~8% of the title CPU on the Legion; one publish per 32
+    // operations is still far fresher than the panel can show.
+    if (m_snapshotPublishCountdown != 0u)
+    {
+        --m_snapshotPublishCountdown;
+        return;
+    }
+    m_snapshotPublishCountdown = 31u;
+    publishSnapshotNow();
+}
+
+void EeScheduler::publishSnapshotNow()
+{
+    auto next = std::make_shared<EeKernelSnapshot>();
+    next->sequence = ++m_snapshotSequence;
+    next->eeCycle = m_eeCycle;
+    next->sliceEndCycle = m_sliceEndCycle;
+    next->nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    next->runningThreadId = m_currentThreadId;
+    next->threads.reserve(m_threads.size());
     for (const auto &[id, item] : m_threads)
     {
         if (id < 0)
@@ -2013,30 +2043,30 @@ void EeScheduler::publishSnapshot()
         snapshot.suspendCount = item.suspendCount;
         snapshot.wakeupCount = item.wakeupCount;
         snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
-        next.threads.push_back(snapshot);
+        next->threads.push_back(snapshot);
     }
-    std::sort(next.threads.begin(), next.threads.end(), [](const auto &left, const auto &right)
+    std::sort(next->threads.begin(), next->threads.end(), [](const auto &left, const auto &right)
               { return left.id < right.id; });
-    next.semaphores.reserve(m_semaphores.size());
+    next->semaphores.reserve(m_semaphores.size());
     for (const auto &[id, item] : m_semaphores)
     {
-        next.semaphores.push_back(EeSemaphoreSnapshot{id,
+        next->semaphores.push_back(EeSemaphoreSnapshot{id,
                                                       item.count,
                                                       item.maxCount,
                                                       static_cast<uint32_t>(item.waiters.size())});
     }
-    std::sort(next.semaphores.begin(), next.semaphores.end(), [](const auto &left, const auto &right)
+    std::sort(next->semaphores.begin(), next->semaphores.end(), [](const auto &left, const auto &right)
               { return left.id < right.id; });
-    next.eventFlags.reserve(m_eventFlags.size());
+    next->eventFlags.reserve(m_eventFlags.size());
     for (const auto &[id, item] : m_eventFlags)
     {
-        next.eventFlags.push_back(EeEventFlagSnapshot{id,
+        next->eventFlags.push_back(EeEventFlagSnapshot{id,
                                                       item.bits,
                                                       item.initBits,
                                                       item.attr,
                                                       static_cast<uint32_t>(item.waiters.size())});
     }
-    std::sort(next.eventFlags.begin(), next.eventFlags.end(), [](const auto &left, const auto &right)
+    std::sort(next->eventFlags.begin(), next->eventFlags.end(), [](const auto &left, const auto &right)
               { return left.id < right.id; });
     {
         std::lock_guard lock(m_snapshotMutex);
@@ -2290,17 +2320,40 @@ void EeScheduler::processPendingEvents()
 
     {
         std::lock_guard lock(m_eventMutex);
-        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-        const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle &&
-                                   steadyNowNs() >= m_nextDeadlineHostNs.load(std::memory_order_acquire);
+        const bool cycleEventDue = deadlineProbeDue();
         const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
         m_checkpointPending.store(pendingWork, std::memory_order_release);
     }
     applyPendingPreemption();
 }
 
+bool EeScheduler::deadlineProbeDue() noexcept
+{
+    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    if (nextEventCycle == 0u || m_eeCycle < nextEventCycle)
+        return false;
+    if (m_deadlineProbeCountdown != 0u)
+    {
+        --m_deadlineProbeCountdown;
+        return false;
+    }
+    m_deadlineProbeCountdown = kDeadlineProbeInterval;
+    if (steadyNowNs() < m_nextDeadlineHostNs.load(std::memory_order_acquire))
+        return false;
+    m_deadlineDueObserved = true;
+    return true;
+}
+
 void EeScheduler::processDueDeadlines()
 {
+    // Most dispatches reach this with no deadline even close: avoid the mutex,
+    // vector allocation and wall-clock read.  Only a checkpoint probe (or a
+    // wait timeout) can have observed the host deadline pass; consume that
+    // observation rather than re-reading the clock here.
+    if (!m_deadlineDueObserved)
+        return;
+    m_deadlineDueObserved = false;
+
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -2639,6 +2692,10 @@ void EeScheduler::waitForEvent()
             .count());
     if (!signaled)
     {
+        // Re-arm the checkpoint probe: the host clock has advanced past a
+        // deadline that was still ahead at the last probe.
+        m_deadlineProbeCountdown = 0u;
+        m_deadlineDueObserved = true;
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
         lock.unlock();
         uint64_t remaining = elapsed;
