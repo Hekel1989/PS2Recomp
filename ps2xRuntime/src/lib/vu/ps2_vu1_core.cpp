@@ -20,6 +20,15 @@ namespace
     {
         return static_cast<uint8_t>(1u << (3u - component));
     }
+
+    // --- SUIKO(vu1-trace): PS2X_VU1_TRACE=1 -----------------------------------
+    // Log every VU1 microprogram run (start PC, executed instruction count,
+    // stop reason) and every XGKICK (source address, packet size, first GIFtag).
+    bool vu1TraceEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_VU1_TRACE") != nullptr;
+        return s_enabled;
+    }
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -919,6 +928,19 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    if (vu1TraceEnabled())
+    {
+        uint64_t tagLo = 0;
+        uint64_t tagHi = 0;
+        if (m_xgkick.totalBytes >= 16u)
+        {
+            std::memcpy(&tagLo, m_xgkick.packet.data(), sizeof(tagLo));
+            std::memcpy(&tagHi, m_xgkick.packet.data() + 8, sizeof(tagHi));
+        }
+        std::fprintf(stderr, "[vu1:xgkick] submit bytes=%u qwords=%u tag=0x%016llx_%016llx\n",
+                     m_xgkick.totalBytes, m_xgkick.totalBytes / 16u,
+                     static_cast<unsigned long long>(tagLo), static_cast<unsigned long long>(tagHi));
+    }
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -932,6 +954,11 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+    if (vu1TraceEnabled())
+    {
+        std::fprintf(stderr, "[vu1:xgkick] start qword=0x%x byte=0x%x pc=0x%x\n",
+                     qwordAddress, sourceAddress, m_state.pc);
+    }
     m_xgkick = {};
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
@@ -1633,15 +1660,28 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+    const bool trace = vu1TraceEnabled();
+    uint32_t traceInsns = 0;
+    const char *stopReason = "budget";
+    const uint32_t traceStartPc = m_state.pc;
+    if (trace)
+    {
+        std::fprintf(stderr, "[vu1:run] begin pc=0x%x top=0x%x itop=0x%x budget=%u\n",
+                     m_state.pc, m_state.top, m_state.itop, maxCycles);
+    }
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
+        {
+            stopReason = "pc-out-of-range";
             break;
+        }
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
+            stopReason = "reserved";
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
             break;
         }
@@ -1820,8 +1860,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         advanceOneCycle();
+        ++traceInsns;
         if (programEnded)
+        {
+            stopReason = m_state.stoppedByD ? "d-bit" : m_state.stoppedByT ? "t-bit" : "e-bit";
             break;
+        }
     }
 
     if (programEnded)
@@ -1831,6 +1875,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_state.haltAfterDelaySlot = false;
         m_pendingHaltD = false;
         m_pendingHaltT = false;
+    }
+    if (trace)
+    {
+        std::fprintf(stderr, "[vu1:run] end pc=0x%x insns=%u cycles=%llu reason=%s xgkick=%s\n",
+                     m_state.pc, traceInsns,
+                     static_cast<unsigned long long>(m_cycle), stopReason,
+                     m_xgkick.active ? "pending" : "idle");
     }
     m_state.cycles = m_cycle;
     if (useVuRounding && previousRoundingMode != -1)

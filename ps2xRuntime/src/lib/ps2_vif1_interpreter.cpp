@@ -99,6 +99,26 @@ namespace
         return 0u;
     }
 
+    // --- SUIKO(vu1-trace): PS2X_VU1_TRACE=1 -----------------------------------
+    // Log every VIF1 command that touches VU1: MPG (microcode load),
+    // MSCAL/MSCALF/MSCNT (microprogram start).
+    bool vu1TraceEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_VU1_TRACE") != nullptr;
+        return s_enabled;
+    }
+
+    uint32_t vu1TraceHash(const uint8_t *data, uint32_t size)
+    {
+        uint32_t h = 0x811C9DC5u;
+        for (uint32_t i = 0; i < size; ++i)
+        {
+            h ^= data[i];
+            h *= 0x01000193u;
+        }
+        return h;
+    }
+
     // --- SUIKO(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
     // Log VIF1 DIRECT/DIRECTHL payloads whose GIFtags declare more data than
     // the DIRECT carries (the GIF FIFO would expect the remainder from later
@@ -659,6 +679,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (vu1TraceEnabled())
+            {
+                std::fprintf(stderr, "[vu1:vif] %s start=0x%x top=0x%x itop=0x%x\n",
+                             opcode == VIF_MSCALF ? "MSCALF" : "MSCAL", startPC, runTop, runItop);
+            }
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
@@ -677,6 +702,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (vu1TraceEnabled())
+            {
+                std::fprintf(stderr, "[vu1:vif] MSCNT top=0x%x itop=0x%x\n", runTop, runItop);
+            }
             if (m_vu1MscntCallback)
                 m_vu1MscntCallback(runTop, runItop);
             continue;
@@ -712,6 +741,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t destAddr = (uint32_t)imm * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            if (vu1TraceEnabled())
+            {
+                const uint32_t present = std::min(mpgBytes, pos < sizeBytes ? sizeBytes - pos : 0u);
+                std::fprintf(stderr, "[vu1:vif] MPG dest=0x%x bytes=%u hash=0x%08x%s\n",
+                             destAddr, mpgBytes, vu1TraceHash(data + pos, present),
+                             present < mpgBytes ? " STREAM-UNDERRUN" : "");
+            }
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;

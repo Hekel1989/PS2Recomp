@@ -2637,6 +2637,27 @@ void PS2Runtime::run()
                     out.write(reinterpret_cast<const char *>(vram), static_cast<std::streamsize>(PS2_GS_VRAM_SIZE));
                     RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
                 }
+                // SUIKO(vu1-trace): VU1 micro/data memory, same names as the
+                // PCSX2 savestate members, for byte comparison with the
+                // reference timeline captures.
+                {
+                    const uint8_t *vu1Code = m_memory.getVU1Code();
+                    const uint8_t *vu1Data = m_memory.getVU1Data();
+                    if (vu1Code != nullptr)
+                    {
+                        const std::string name = "vu1MicroMem_" + tag + ".bin";
+                        std::ofstream out(name, std::ios::binary);
+                        out.write(reinterpret_cast<const char *>(vu1Code), PS2_VU1_CODE_SIZE);
+                        RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
+                    }
+                    if (vu1Data != nullptr)
+                    {
+                        const std::string name = "vu1Memory_" + tag + ".bin";
+                        std::ofstream out(name, std::ios::binary);
+                        out.write(reinterpret_cast<const char *>(vu1Data), PS2_VU1_DATA_SIZE);
+                        RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
+                    }
+                }
                 {
                     const GSDebugSnapshot snap = m_gs.getDebugSnapshot();
                     const GSRegisters &gs = m_memory.gs();
