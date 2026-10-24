@@ -1,11 +1,14 @@
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
+#include <cstdlib>
 
 namespace ps2_syscalls
 {
     namespace
     {
+        std::string formatRpcTraceBytes(const uint8_t *bytes, uint32_t count);
+
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
@@ -26,6 +29,20 @@ namespace ps2_syscalls
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             pushSifRpcDebugEventLocked(event);
+
+            static const bool s_trace = std::getenv("PS2X_SIF_RPC_TRACE") != nullptr;
+            if (s_trace)
+            {
+                std::cerr << "[sif-rpc] " << (event.op ? event.op : "?")
+                          << " sid=0x" << std::hex << event.sid
+                          << " num=0x" << event.rpcNum
+                          << " mode=0x" << event.mode
+                          << " flags=0x" << event.flags
+                          << " send=0x" << event.sendBuf << "/0x" << event.sendSize
+                          << " recv=0x" << event.recvBuf << "/0x" << event.recvSize
+                          << " recvData=" << formatRpcTraceBytes(event.recvPreview, event.recvPreviewSize)
+                          << std::dec << std::endl;
+            }
         }
 
         void fillRpcDebugPreview(const uint8_t *rdram, uint32_t addr, uint32_t size, uint8_t *preview, uint32_t &previewSize)
