@@ -565,12 +565,26 @@ void VU1Interpreter::commitReadyPipelines()
                 typeNext = std::min(typeNext, write.readyCycle);
                 continue;
             }
-            for (uint32_t component = 0; component < 4u; ++component)
+            // SUIKO(perf): the common case is a full-lane write that is still
+            // the latest for its register -- copy the whole vector at once
+            // instead of four lane/sequence tests and four scalar stores.
+            // This loop was ~19% of the VU1 AOT benchmark.
+            const std::array<uint64_t, 4> &latest = m_vfLatestWrite[write.reg];
+            if (write.laneMask == 0x0Fu &&
+                latest[0] == write.sequence && latest[1] == write.sequence &&
+                latest[2] == write.sequence && latest[3] == write.sequence)
             {
-                if ((write.laneMask & laneForComponent(component)) != 0u &&
-                    m_vfLatestWrite[write.reg][component] == write.sequence)
+                std::memcpy(m_state.vf[write.reg], write.value.data(), sizeof(write.value));
+            }
+            else
+            {
+                for (uint32_t component = 0; component < 4u; ++component)
                 {
-                    m_state.vf[write.reg][component] = write.value[component];
+                    if ((write.laneMask & laneForComponent(component)) != 0u &&
+                        m_vfLatestWrite[write.reg][component] == write.sequence)
+                    {
+                        m_state.vf[write.reg][component] = write.value[component];
+                    }
                 }
             }
             write = {};
