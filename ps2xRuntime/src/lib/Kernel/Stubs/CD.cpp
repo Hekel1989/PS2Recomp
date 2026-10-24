@@ -39,6 +39,23 @@ namespace ps2_stubs
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
         }
 
+        // On real hardware every libcd command is a synchronous SIF RPC: the
+        // calling thread blocks on the RPC completion semaphore until the
+        // IOP's cdvdstub answers (~1 ms). An HLE stub that returns instantly
+        // lets a high-priority thread polling these functions spin forever
+        // and starve lower-priority threads, because the EE scheduler is
+        // strictly priority-preemptive. Block the caller for a round trip of
+        // EE time so the threads that produce what the poller waits for get
+        // scheduled, exactly like the real RPC wait does.
+        constexpr uint64_t kCdRpcRoundtripCycles = 294912ull; // ~1 ms of EE time
+
+        [[noreturn]] void cdRpcRoundtrip(PS2Runtime *runtime, int32_t result)
+        {
+            runtime->eeScheduler().delayCurrentThread(
+                kCdRpcRoundtripCycles,
+                [result](R5900Context &ctx) { setReturnS32(&ctx, result); });
+        }
+
         uint32_t dvdStreamSectorsPerSecond(uint8_t spindleControl)
         {
             switch (spindleControl)
@@ -403,13 +420,13 @@ namespace ps2_stubs
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         cdCallTrace("sceCdSync", 0, ctx->pc);
-        setReturnS32(ctx, 0); // 0 = completed/not busy
+        cdRpcRoundtrip(runtime, 0); // 0 = completed/not busy
     }
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         cdCallTrace("sceCdGetError", g_lastCdError, ctx->pc);
-        setReturnS32(ctx, g_lastCdError);
+        cdRpcRoundtrip(runtime, g_lastCdError);
     }
 
     void sceCdRI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -430,7 +447,7 @@ namespace ps2_stubs
     void sceCdBreak(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         cdCallTrace("sceCdBreak", 1, ctx->pc);
-        setReturnS32(ctx, 1);
+        cdRpcRoundtrip(runtime, 1);
     }
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -455,7 +472,7 @@ namespace ps2_stubs
         // or an unusable disc state reports SCECdNotReady (0).
         const uint32_t ready = (g_cdDriveState == 2u || g_cdDriveState == 0x0au || g_cdDriveState == 0u) ? 2u : 0u;
         cdCallTrace("sceCdDiskReady", static_cast<int32_t>(ready), ctx->pc);
-        setReturnS32(ctx, static_cast<int32_t>(ready));
+        cdRpcRoundtrip(runtime, static_cast<int32_t>(ready));
     }
 
     void sceCdGetDiskType(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -538,7 +555,7 @@ namespace ps2_stubs
         // becomes SCECdStatPause and games poll sceCdStatus for it.
         g_cdDriveState = 0x0au;
         cdCallTrace("sceCdPause", 1, ctx->pc);
-        setReturnS32(ctx, 1);
+        cdRpcRoundtrip(runtime, 1);
     }
 
     void sceCdPosToInt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -745,20 +762,20 @@ namespace ps2_stubs
     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
-        setReturnS32(ctx, 1);
+        cdRpcRoundtrip(runtime, 1);
     }
 
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdDriveState = 2u; // SCECdStatSpin
         cdCallTrace("sceCdStandby", 1, ctx->pc);
-        setReturnS32(ctx, 1);
+        cdRpcRoundtrip(runtime, 1);
     }
 
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         cdCallTrace("sceCdStatus", static_cast<int32_t>(g_cdDriveState), ctx->pc);
-        setReturnS32(ctx, g_cdDriveState);
+        cdRpcRoundtrip(runtime, static_cast<int32_t>(g_cdDriveState));
     }
 
     void sceCdStInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -787,7 +804,7 @@ namespace ps2_stubs
     {
         g_cdDriveState = 0u; // SCECdStatStop
         cdCallTrace("sceCdStop", 1, ctx->pc);
-        setReturnS32(ctx, 1);
+        cdRpcRoundtrip(runtime, 1);
     }
 
     void sceCdStPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -1462,6 +1462,22 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
     blockCurrent(std::move(wait));
 }
 
+[[noreturn]] void EeScheduler::delayCurrentThread(uint64_t eeCycles, std::function<void(R5900Context &)> completion)
+{
+    assertExecutor();
+    // Internal one-shot waits use a dedicated external wait type and a unique
+    // token so concurrent delays never wake each other.
+    constexpr uint32_t kInternalDelayWaitType = 0x44656C00u;
+    const uint64_t cycles = std::max<uint64_t>(1u, eeCycles);
+    const uint64_t token = ++m_internalDelayToken;
+    scheduleEvent(m_eeCycle + cycles,
+                  std::chrono::steady_clock::now() + eeCyclesToHostDuration(cycles),
+                  EeEvent{EeEventType::ExternalWake, kInternalDelayWaitType, token});
+    blockCurrent(EeWaitState{EeWaitReason::External,
+                             EeExternalWait{kInternalDelayWaitType, token},
+                             std::move(completion)});
+}
+
 GuestThread *EeScheduler::thread(int id)
 {
     auto it = m_threads.find(id);

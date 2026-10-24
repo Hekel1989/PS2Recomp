@@ -341,6 +341,13 @@ public:
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
 
+    // Blocks the current thread for a short I/O latency (a round trip of a
+    // synchronous SIF RPC, a drive seek, ...) and resumes it when the
+    // deadline passes, paced by the host clock so the wait completes even
+    // when no other guest thread is runnable. The completion runs on resume
+    // and should set the guest return value.
+    [[noreturn]] void delayCurrentThread(uint64_t eeCycles, std::function<void(R5900Context &)> completion = {});
+
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
     [[nodiscard]] EeSemaphore *semaphore(int id);
@@ -441,6 +448,7 @@ private:
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
+    uint64_t m_internalDelayToken = 0;
     uint64_t m_vsyncTick = 0;
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;
