@@ -27,6 +27,15 @@ namespace ps2_stubs
         const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
         const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
         const uint32_t size = readStackU32(rdram, ctx, 20);
+        if (std::getenv("PS2X_SIF_SENDCMD_TRACE") != nullptr && size != 0u)
+        {
+            const uint8_t *probe = srcAddr != 0u ? getConstMemPtr(rdram, srcAddr) : nullptr;
+            std::printf("[sif-sendcmd] pc=0x%x ra=0x%x src=0x%x dst=0x%x size=0x%x data=%u,%u,%u,%u\n",
+                        ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u,
+                        srcAddr, dstAddr, size,
+                        probe ? probe[0] : 0u, probe ? probe[1] : 0u,
+                        probe ? probe[2] : 0u, probe ? probe[3] : 0u);
+        }
         if (size != 0u && srcAddr != 0u && dstAddr != 0u)
         {
             std::vector<uint8_t> payload(size);

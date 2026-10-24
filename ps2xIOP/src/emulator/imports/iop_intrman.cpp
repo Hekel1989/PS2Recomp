@@ -4,6 +4,9 @@
 #include "../core/iop_memory.h"
 #include "../services/iop_rpc.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace ps2x::iop::detail
 {
     IopIntrman::IopIntrman(IopMemory &memory) noexcept
@@ -100,6 +103,13 @@ namespace ps2x::iop::detail
         const auto handler = m_handlers.find(irq);
         if (handler == m_handlers.end() || handler->second.function == 0u)
             return false;
+
+        if (std::getenv("PS2X_IOP_INTR_TRACE") != nullptr)
+        {
+            std::printf("[iop-intr] irq=%d fn=0x%x arg=0x%x arg0=0x%x\n",
+                        irq, handler->second.function, handler->second.argument,
+                        handler->second.argument != 0u ? m_memory.read32(handler->second.argument) : 0u);
+        }
 
         (void)executor.executeGuestFunctionWithBudget(handler->second.function,
                                                       handler->second.argument,

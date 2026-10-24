@@ -115,6 +115,16 @@ namespace ps2x::iop::detail
             m_readCallback = std::move(callback);
         }
 
+        // Diagnostic watchpoint over the hardware register window (SIF/DMAC/
+        // timers/...). Invokes the callback with the aligned address and the
+        // value written, before the generic store.
+        void setHardwareWriteWatch(uint32_t low, uint32_t high, std::function<void(uint32_t, uint32_t)> callback)
+        {
+            m_hwWriteLow = low;
+            m_hwWriteHigh = high;
+            m_hwWriteCallback = std::move(callback);
+        }
+
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
     private:
@@ -137,6 +147,9 @@ namespace ps2x::iop::detail
         std::function<void(uint32_t, uint32_t)> m_readCallback;
         uint32_t m_readLow = 0;
         uint32_t m_readHigh = 0;
+        std::function<void(uint32_t, uint32_t)> m_hwWriteCallback;
+        uint32_t m_hwWriteLow = 0;
+        uint32_t m_hwWriteHigh = 0;
         IopSpu2Host *m_spu2Host = nullptr;
     };
 }

@@ -284,6 +284,8 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        if (m_hwWriteCallback && address >= m_hwWriteLow && address < m_hwWriteHigh)
+            m_hwWriteCallback(address, value);
         if (m_spu2Host != nullptr)
         {
             if (address >= Spu2Base && address < Spu2End)

@@ -154,6 +154,43 @@ namespace ps2x::iop::detail
                         });
                 }
             }
+            if (const char *hw = std::getenv("PS2X_IOP_HWWRITE_TRACE"); hw != nullptr)
+            {
+                uint32_t hwLo = 0u;
+                uint32_t hwHi = 0u;
+                if (std::sscanf(hw, "%x-%x", &hwLo, &hwHi) == 2)
+                {
+                    memory.setHardwareWriteWatch(
+                        hwLo, hwHi,
+                        [this](uint32_t addr, uint32_t value)
+                        {
+                            static const long budget = []
+                            {
+                                if (const char *b = std::getenv("PS2X_IOP_TRACEBUDGET"); b != nullptr)
+                                    return std::atol(b);
+                                return 4000L;
+                            }();
+                            static const uint64_t after = []
+                            {
+                                if (const char *a = std::getenv("PS2X_IOP_TRACEAFTER"); a != nullptr)
+                                    return std::strtoull(a, nullptr, 0);
+                                return 0ULL;
+                            }();
+                            static long budget2 = budget;
+                            if (totalCycles < after || budget2 == 0)
+                                return;
+                            if (budget2 > 0)
+                                --budget2;
+                            std::ostringstream out;
+                            out << "[IOP] hwwrite 0x" << std::hex << addr << " val=0x" << value;
+                            if (activeCpu != nullptr)
+                                out << " pc=0x" << activeCpu->pc << " ra=0x" << activeCpu->gpr[31];
+                            if (const IopThread *thread = kernel.currentThread(); thread != nullptr)
+                                out << " tid=" << std::dec << thread->id;
+                            log(LogLevel::Info, out.str());
+                        });
+                }
+            }
             if (const char *hw = std::getenv("PS2X_IOP_HWREAD_TRACE"); hw != nullptr)
             {
                 uint32_t hwLo = 0u;
@@ -457,6 +494,29 @@ namespace ps2x::iop::detail
             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
             if (target != 0u)
             {
+                if (std::getenv("PS2X_IOP_IMPORT_TRACE") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP] import " << call.library << ':' << call.ordinal
+                        << " -> 0x" << std::hex << target
+                        << " ra=0x" << cpu.gpr[31]
+                        << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5];
+                    if (iequals(call.library, "libsd") && call.ordinal == 10u)
+                    {
+                        const uint32_t frame = cpu.gpr[30];
+                        const uint32_t stream = read32(frame + 0x28u);
+                        out << " fp=0x" << frame << " stream=0x" << stream;
+                        if (stream != 0u && stream < IopMemory::RamSize)
+                        {
+                            out << " s0=0x" << read32(stream)
+                                << " s10=0x" << read32(stream + 0x10u)
+                                << " s48=0x" << read32(stream + 0x48u)
+                                << " s4b=0x" << static_cast<unsigned>(read8(stream + 0x4Bu))
+                                << " s6c=0x" << read32(stream + 0x6Cu);
+                        }
+                    }
+                    log(LogLevel::Info, out.str());
+                }
                 cpu.pc = target;
                 cpu.branchPending = false;
                 return ImportDisposition::JumpToGuest;
@@ -501,6 +561,7 @@ namespace ps2x::iop::detail
                     std::ostringstream out;
                     out << "[IOP] branch tid=" << std::dec
                         << (thread != nullptr ? thread->id : -1)
+                        << " cycle=" << totalCycles
                         << " 0x" << std::hex << from << " -> 0x" << to;
                     log(LogLevel::Info, out.str());
                 }
