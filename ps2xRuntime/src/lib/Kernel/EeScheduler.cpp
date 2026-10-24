@@ -5,12 +5,23 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
 namespace
 {
+    // Diagnostic: PS2X_EE_SCHED=1 logs scheduler thread dispatches and guest
+    // invocation push/pop with pc/sp/ra, enough to spot stack aliasing between
+    // invocation stacks and thread stacks.
+    bool schedTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_EE_SCHED") != nullptr;
+        return enabled;
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -234,6 +245,18 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                if (schedTraceEnabled())
+                {
+                    R5900Context &parent = running->activeContext();
+                    std::cerr << "[ee-sched] inv-pop tid=" << running->id
+                              << " kind=" << static_cast<int>(completed.kind)
+                              << " donepc=0x" << std::hex << completed.context.pc
+                              << " donesp=0x" << getRegU32(&completed.context, 29)
+                              << " parentpc=0x" << parent.pc
+                              << " parentsp=0x" << getRegU32(&parent, 29)
+                              << " parentra=0x" << getRegU32(&parent, 31)
+                              << std::dec << std::endl;
+                }
                 if (completed.onComplete)
                 {
                     try
@@ -290,6 +313,16 @@ void EeScheduler::run()
         if (checkpointDue(kGuestDispatchCycles))
         {
             continue;
+        }
+
+        if (schedTraceEnabled())
+        {
+            std::cerr << "[ee-sched] dispatch tid=" << running->id
+                      << " inv=" << running->invocations.size()
+                      << " pc=0x" << std::hex << context.pc
+                      << " sp=0x" << getRegU32(&context, 29)
+                      << " ra=0x" << getRegU32(&context, 31)
+                      << std::dec << std::endl;
         }
 
         try
@@ -1116,6 +1149,17 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         SET_GPR_U32(&invocation.context, 29, invocationStackTop());
     }
     invocation.sequence = ++m_invocationSequence;
+    if (schedTraceEnabled())
+    {
+        std::cerr << "[ee-sched] inv-push tid=" << owner->id
+                  << " depth=" << owner->invocations.size()
+                  << " kind=" << static_cast<int>(invocation.kind)
+                  << " pc=0x" << std::hex << invocation.context.pc
+                  << " sp=0x" << getRegU32(&invocation.context, 29)
+                  << " ra=0x" << getRegU32(&invocation.context, 31)
+                  << " a0=0x" << getRegU32(&invocation.context, 4)
+                  << std::dec << std::endl;
+    }
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
     throw EeDispatcherTransfer{};

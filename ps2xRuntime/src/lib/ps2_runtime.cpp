@@ -1393,6 +1393,28 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    // Diagnostic: log every dispatch whose target matches PS2X_EE_JMPWATCH=<hex>,
+    // so the caller of a mistrusted indirect target can be identified.
+    static const uint32_t jmpWatch = [] {
+        const char *env = std::getenv("PS2X_EE_JMPWATCH");
+        return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0xFFFFFFFFu;
+    }();
+    if (jmpWatch != 0xFFFFFFFFu && targetPc == jmpWatch)
+    {
+        std::cerr << "[ee-jmpwatch] kind=" << describeGuestBranchKind(kind)
+                  << " op=" << (debugName ? debugName : "<unknown>")
+                  << " source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " ra=0x" << getRegU32(ctx, 31)
+                  << " sp=0x" << getRegU32(ctx, 29)
+                  << " a0=0x" << getRegU32(ctx, 4)
+                  << " a1=0x" << getRegU32(ctx, 5)
+                  << " a2=0x" << getRegU32(ctx, 6)
+                  << " a3=0x" << getRegU32(ctx, 7)
+                  << " trace=" << formatDispatchHistory()
+                  << std::dec << std::endl;
+    }
+
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 

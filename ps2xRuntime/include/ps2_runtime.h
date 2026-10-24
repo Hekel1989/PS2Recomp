@@ -3,6 +3,8 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -246,10 +248,51 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
+    (void)valueHi;
+    // Diagnostic write watchpoint over guest RAM: PS2X_EE_WATCH=<hexlo>[-<hexhi>].
+    // Logs every guest write touching the range with pc/ra/value. When the
+    // variable is unset the only cost is one cached bool and two comparisons.
+    struct EeWatchConfig
+    {
+        bool enabled;
+        uint32_t low;
+        uint32_t high;
+    };
+    static const EeWatchConfig watch = [] {
+        EeWatchConfig config{false, 0u, 0u};
+        const char *env = std::getenv("PS2X_EE_WATCH");
+        if (env != nullptr)
+        {
+            char *end = nullptr;
+            config.low = static_cast<uint32_t>(std::strtoul(env, &end, 16));
+            config.high = config.low + 4u;
+            if (end != nullptr && *end == '-')
+            {
+                config.high = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) + 1u;
+            }
+            config.enabled = true;
+        }
+        return config;
+    }();
+    if (watch.enabled)
+    {
+        const uint32_t writeSize = size != 0u ? size : 4u;
+        if (guestAddr < watch.high && watch.low < guestAddr + writeSize)
+        {
+            std::cerr << "[ee-watch] " << op << " addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << writeSize
+                      << " value=0x" << std::hex << valueLo << std::dec;
+            if (ctx != nullptr)
+            {
+                std::cerr << " pc=0x" << std::hex << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31) << std::dec;
+            }
+            std::cerr << std::endl;
+        }
+    }
     (void)guestAddr;
     (void)size;
     (void)valueLo;
-    (void)valueHi;
     (void)op;
     (void)ctx;
     // TODO we dont need this anymore so on next release it will be deleted
