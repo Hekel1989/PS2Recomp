@@ -23,6 +23,11 @@ void ps2CoverageFlush(void);
  * the first ps2CoverageHit().  Called from the EE scheduler checkpoints. */
 void ps2CoveragePeriodicFlush(void);
 
+/* Current EE vsync tick, published by the scheduler.  Used by the optional
+ * first-hit trace ($PS2X_COVERAGE_TRACE / _FROM / _TO) and harmless when the
+ * trace is unset. */
+void ps2CoverageSetVSync(uint64_t tick);
+
 #ifdef __cplusplus
 }
 #endif

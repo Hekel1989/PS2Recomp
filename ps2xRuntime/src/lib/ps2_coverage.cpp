@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,6 +23,37 @@ namespace
     std::vector<uint32_t> g_hits;
     std::atomic<bool> g_active{false};
     std::atomic<uint64_t> g_nextFlushNs{0};
+    std::atomic<uint64_t> g_vsyncTick{0};
+
+    // Optional first-hit trace: PS2X_COVERAGE_TRACE=1 logs every newly hit
+    // address with the EE vsync, optionally restricted to a window with
+    // PS2X_COVERAGE_TRACE_FROM/_TO.  Unset = no output and no clock reads.
+    struct CoverageTraceConfig
+    {
+        bool enabled = false;
+        uint64_t from = 0;
+        uint64_t to = UINT64_MAX;
+    };
+
+    const CoverageTraceConfig &coverageTraceConfig()
+    {
+        static const CoverageTraceConfig config = []
+        {
+            CoverageTraceConfig parsed;
+            const char *env = std::getenv("PS2X_COVERAGE_TRACE");
+            parsed.enabled = env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+            if (const char *from = std::getenv("PS2X_COVERAGE_TRACE_FROM"); from != nullptr)
+            {
+                parsed.from = std::strtoull(from, nullptr, 10);
+            }
+            if (const char *to = std::getenv("PS2X_COVERAGE_TRACE_TO"); to != nullptr)
+            {
+                parsed.to = std::strtoull(to, nullptr, 10);
+            }
+            return parsed;
+        }();
+        return config;
+    }
 
     uint64_t steadyNowNs()
     {
@@ -56,6 +88,22 @@ void ps2CoverageHit(uint32_t address)
         g_hits.push_back(address & kRamMask);
     }
     g_active.store(true, std::memory_order_relaxed);
+
+    const CoverageTraceConfig &trace = coverageTraceConfig();
+    if (trace.enabled)
+    {
+        const uint64_t tick = g_vsyncTick.load(std::memory_order_relaxed);
+        if (tick >= trace.from && tick <= trace.to)
+        {
+            std::fprintf(stderr, "[coverage-hit] vsync=%llu addr=0x%06x\n",
+                         static_cast<unsigned long long>(tick), address & kRamMask);
+        }
+    }
+}
+
+void ps2CoverageSetVSync(uint64_t tick)
+{
+    g_vsyncTick.store(tick, std::memory_order_relaxed);
 }
 
 void ps2CoverageFlush()

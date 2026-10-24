@@ -2904,6 +2904,7 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+        ps2CoverageSetVSync(m_vsyncTick);
         if ((m_vsyncTick & 1u) != 0u)
         {
             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
