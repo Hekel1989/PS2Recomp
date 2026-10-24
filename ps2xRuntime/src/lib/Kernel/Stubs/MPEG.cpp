@@ -493,7 +493,6 @@ namespace ps2_stubs
         struct MpegPlaybackState
         {
             uint32_t picturesServed = 0u;
-            bool demuxSkipBypass = false;
             uint32_t width = 320u;
             uint32_t height = 240u;
             uint32_t decodeMode = 0u;
@@ -504,9 +503,6 @@ namespace ps2_stubs
             bool decoderFailed = false;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
-            uint64_t demuxFeedTick = 0u;
-            uint64_t demuxFeedCycle = 0u;
-            uint32_t demuxFeedTokens = 0u;
             std::vector<uint8_t> videoSequenceSyncBuffer;
             std::vector<uint8_t> pssBuffer;
             std::vector<uint32_t> pssGuestAddrs;
@@ -1429,51 +1425,6 @@ namespace ps2_stubs
             }
         }
 
-        uint32_t refillDemuxTokens(PS2Runtime *runtime, MpegPlaybackState &playback)
-        {
-            constexpr double kPssBytesPerSecond = 673685.0;
-            constexpr double kVsyncHz = 59.94;
-            constexpr double kIopClockHz = 36864000.0;
-            constexpr uint32_t kDemuxTokenCap = 80u * 1024u;
-            if (runtime == nullptr)
-                return kDemuxTokenCap;
-
-            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
-            const uint64_t cycle = runtime->iopDebugSnapshot().emulatorCycles;
-            // Cross during the intro means the player is skipping it.  The
-            // game drains the remaining PSS to EOF, so release the real-time
-            // metering for the rest of this stream (audio is not presented
-            // during the skip anyway).
-            if (!playback.demuxSkipBypass && playback.picturesServed > 4u &&
-                (runtime->lastPadButtons() & (1u << 14u)) == 0u)
-                playback.demuxSkipBypass = true;
-            if (playback.demuxSkipBypass)
-            {
-                playback.demuxFeedTick = tick;
-                playback.demuxFeedCycle = cycle;
-                playback.demuxFeedTokens = kDemuxTokenCap;
-                return playback.demuxFeedTokens;
-            }
-            if (playback.demuxFeedTick == 0u && playback.demuxFeedCycle == 0u)
-            {
-                playback.demuxFeedTick = tick;
-                playback.demuxFeedCycle = cycle;
-                playback.demuxFeedTokens = kDemuxTokenCap;
-                return playback.demuxFeedTokens;
-            }
-            const uint64_t tickDelta = tick - playback.demuxFeedTick;
-            const uint64_t cycleDelta = cycle - playback.demuxFeedCycle;
-            playback.demuxFeedTick = tick;
-            playback.demuxFeedCycle = cycle;
-            const double byTick = static_cast<double>(tickDelta) * (kPssBytesPerSecond / kVsyncHz);
-            const double byCycle = static_cast<double>(cycleDelta) * (kPssBytesPerSecond / kIopClockHz);
-            const uint64_t refill = static_cast<uint64_t>(std::max(byTick, byCycle));
-            playback.demuxFeedTokens = static_cast<uint32_t>(
-                std::min<uint64_t>(static_cast<uint64_t>(playback.demuxFeedTokens) + refill,
-                                   kDemuxTokenCap));
-            return playback.demuxFeedTokens;
-        }
-
         bool mpegDemuxBackpressured(const MpegPlaybackState &playback)
         {
             // Let EOF finalization drain any tail that is already in the guest
@@ -2200,16 +2151,15 @@ namespace ps2_stubs
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
             {
-                const uint32_t budget = refillDemuxTokens(runtime, playback);
-                const uint32_t limitedBytes = std::min(byteCount, budget);
+                const uint32_t limitedBytes = std::min(byteCount, 8u * 1024u);
                 if (limitedBytes != 0u)
                 {
                     consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, limitedBytes, callbackEvents);
-                    const uint32_t spent = static_cast<uint32_t>(std::min<size_t>(consumed, budget));
-                    playback.demuxFeedTokens -= spent;
                     recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
                 }
             }
+            if (runtime != nullptr)
+                runtime->setMovieAudioActive(!playback.streamEnded && playback.sawInput);
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
         }
@@ -2290,8 +2240,7 @@ namespace ps2_stubs
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
             {
-                const uint32_t budget = refillDemuxTokens(runtime, playback);
-                const uint32_t limitedBytes = std::min(availableBytes, budget);
+                const uint32_t limitedBytes = std::min(availableBytes, 8u * 1024u);
                 if (limitedBytes != 0u)
                 {
                     consumed = appendGuestRingBytes(
@@ -2303,11 +2252,11 @@ namespace ps2_stubs
                         ringBaseAddr,
                         ringSize,
                         callbackEvents);
-                    const uint32_t spent = static_cast<uint32_t>(std::min<size_t>(consumed, budget));
-                    playback.demuxFeedTokens -= spent;
                     recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
                 }
             }
+            if (runtime != nullptr)
+                runtime->setMovieAudioActive(!playback.streamEnded && playback.sawInput);
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
         }

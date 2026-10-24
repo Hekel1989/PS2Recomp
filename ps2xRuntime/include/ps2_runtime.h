@@ -516,12 +516,12 @@ public:
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
-    // SUIKO(movie-audio): last Digital pad button word served by scePadRead
-    // (active-low, port 0).  The movie audio feed uses a Cross press to stop
-    // metering the PSS stream so skipping the intro does not wait for the
-    // remaining track in real time.
-    void setLastPadButtons(uint16_t buttons) noexcept { m_lastPadButtons.store(buttons, std::memory_order_relaxed); }
-    [[nodiscard]] uint16_t lastPadButtons() const noexcept { return m_lastPadButtons.load(std::memory_order_relaxed); }
+    // SUIKO(movie-audio): true while an MPEG movie is being demuxed.  Host
+    // stall debt must not be replayed into the IOP/SPU2 clock while the movie
+    // is playing: the guest audio producer did not run for it, and replaying
+    // it drains the 24 KiB IOP ring (Fixed 36).
+    void setMovieAudioActive(bool active) noexcept { m_movieAudioActive.store(active, std::memory_order_relaxed); }
+    [[nodiscard]] bool movieAudioActive() const noexcept { return m_movieAudioActive.load(std::memory_order_relaxed); }
     inline PS2RomDevice &romDevice() { return m_romDevice; }
     inline const PS2RomDevice &romDevice() const { return m_romDevice; }
     inline PS2Vfs &vfs() { return m_vfs; }
@@ -566,7 +566,7 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
-    std::atomic<uint16_t> m_lastPadButtons{0xFFFFu};
+    std::atomic<bool> m_movieAudioActive{false};
     PS2RomDevice m_romDevice;
     PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};

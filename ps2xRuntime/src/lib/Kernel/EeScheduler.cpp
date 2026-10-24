@@ -668,6 +668,15 @@ void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
     {
         m_paceDebtNs += excluded;
     }
+    // SUIKO(movie-audio): during an MPEG movie, do not replay host-stall debt
+    // into guest time.  The audio producer is stalled for the same interval;
+    // replaying the debt advances VBlank/IOP/SPU2 while it is not producing,
+    // which drains the 24 KiB IOP ring and makes the AutoDMA repeat stale
+    // data.  The movie simply pauses for the host stall instead.
+    if (m_runtime.movieAudioActive())
+    {
+        m_paceDebtNs = 0u;
+    }
     const uint64_t allowance =
         (guestCpu / kPaceCatchUpDenominator) * kPaceCatchUpNumerator +
         (guestCpu % kPaceCatchUpDenominator) * kPaceCatchUpNumerator / kPaceCatchUpDenominator;
@@ -697,9 +706,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     // one timer/IOP burst.
     const uint64_t target = m_hostAnchorCycle +
         hostDurationToEeCycles(std::chrono::nanoseconds(m_paceAdvanceNs));
+    uint64_t catchUp = 0u;
     if (target > m_eeCycle)
     {
-        const uint64_t catchUp = std::min<uint64_t>(target - m_eeCycle, kVBlankPeriodCycles);
+        catchUp = std::min<uint64_t>(target - m_eeCycle, kVBlankPeriodCycles);
         m_eeCycle += catchUp;
         elapsed += catchUp;
     }
