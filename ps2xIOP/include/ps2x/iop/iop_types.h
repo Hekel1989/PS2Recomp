@@ -99,6 +99,12 @@ namespace ps2x::iop
         uint32_t resultAddress = 0;
         bool signalNowaitCompletion = false;
         bool signalCompletion = false;
+        // Semaphore the transport signals on completion instead of the one
+        // derived from the client struct. Services whose client protocol
+        // carries a per-call completion semaphore in the send buffer (e.g.
+        // FILEIO at send+0x00, signalled by the IOP's SIF reply on hardware)
+        // set this; negative keeps the transport default.
+        int32_t completionSemaId = -1;
         CallbackPolicy callbackPolicy = CallbackPolicy::RuntimeDefault;
         ServerDispatchPolicy serverDispatchPolicy = ServerDispatchPolicy::RuntimeDefault;
         uint32_t guestFunction = 0;

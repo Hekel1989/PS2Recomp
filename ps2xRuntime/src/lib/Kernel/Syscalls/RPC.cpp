@@ -564,6 +564,10 @@ namespace ps2_syscalls
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
+            if (iopResult.completionSemaId >= 0)
+            {
+                completionSemaphore = static_cast<uint32_t>(iopResult.completionSemaId);
+            }
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {
