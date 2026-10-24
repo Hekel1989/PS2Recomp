@@ -24,6 +24,42 @@ namespace
         return enabled;
     }
 
+    // Diagnostic: PS2X_EE_THREAD_DUMP_AT=<vsync>[,<vsync>...] prints every
+    // thread's PC and wait state when the vsync counter reaches each value.
+    // Runs on the scheduler thread, so it works with host presentation too.
+    struct EeThreadDumpConfig
+    {
+        std::array<uint64_t, 8> at{};
+        size_t count{0};
+    };
+
+    const EeThreadDumpConfig &eeThreadDumpConfig()
+    {
+        static const EeThreadDumpConfig config = [] {
+            EeThreadDumpConfig parsed;
+            const char *env = std::getenv("PS2X_EE_THREAD_DUMP_AT");
+            if (env != nullptr)
+            {
+                const char *p = env;
+                while (*p != '\0' && parsed.count < parsed.at.size())
+                {
+                    char *end = nullptr;
+                    const unsigned long long v = std::strtoull(p, &end, 10);
+                    if (end == p)
+                    {
+                        ++p;
+                        continue;
+                    }
+                    parsed.at[parsed.count++] = v;
+                    p = (*end == ',') ? end + 1 : end;
+                }
+                std::sort(parsed.at.begin(), parsed.at.begin() + parsed.count);
+            }
+            return parsed;
+        }();
+        return config;
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -197,6 +233,50 @@ void EeScheduler::run()
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
+        }
+
+        {
+            static size_t dumpNext = 0;
+            const EeThreadDumpConfig &dump = eeThreadDumpConfig();
+            while (dumpNext < dump.count && m_vsyncTick >= dump.at[dumpNext])
+            {
+                const uint64_t requested = dump.at[dumpNext++];
+                uint32_t sceneDepth = 0xFFFFFFFFu;
+                uint32_t sceneMode = 0xFFFFFFFFu;
+                uint8_t scriptFlags[2] = {0xFFu, 0xFFu};
+                if (m_rdram != nullptr)
+                {
+                    std::memcpy(&sceneDepth, m_rdram + 0x496D80u, sizeof(sceneDepth));
+                    const uint32_t modeIndex = std::min<uint32_t>(sceneDepth, 0x0Fu);
+                    std::memcpy(&sceneMode, m_rdram + 0x496D84u + modeIndex * 4u, sizeof(sceneMode));
+                    std::memcpy(scriptFlags, m_rdram + 0x67A7F2u, sizeof(scriptFlags));
+                }
+                std::cerr << "[ee-threads] vsync=" << m_vsyncTick << " requested=" << requested
+                          << " running=" << m_currentThreadId
+                          << " sceneDepth=" << sceneDepth
+                          << " sceneMode=" << sceneMode
+                          << " flag55=0x" << std::hex << static_cast<unsigned>(scriptFlags[0])
+                          << " flag5d=0x" << static_cast<unsigned>(scriptFlags[1])
+                          << std::dec << std::endl;
+                for (const auto &[id, item] : m_threads)
+                {
+                    if (id < 0)
+                    {
+                        continue;
+                    }
+                    const R5900Context &context = item.activeContext();
+                    std::cerr << "[ee-threads] tid=" << id
+                              << " status=" << static_cast<int>(item.status)
+                              << " wait=" << static_cast<int>(item.wait.reason)
+                              << " waitid=" << waitObjectId(item.wait)
+                              << " prio=" << item.currentPriority
+                              << " pc=0x" << std::hex << context.pc
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " sp=0x" << getRegU32(&context, 29)
+                              << " entry=0x" << item.entry
+                              << std::dec << std::endl;
+                }
+            }
         }
 
         if (m_currentThreadId == 0)

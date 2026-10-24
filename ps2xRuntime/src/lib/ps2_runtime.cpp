@@ -2815,6 +2815,61 @@ void PS2Runtime::run()
                 }
             }
         }
+        // Diagnostic: PS2X_EE_THREAD_DUMP_AT=<vsync>[,<vsync>...] prints the
+        // scheduler snapshot (every thread's PC and wait reason) when the EE
+        // vsync counter reaches each listed value. Useful when the screen is
+        // static and there is no obvious guest function to watch.
+        {
+            static const struct ThreadDumpConfig
+            {
+                std::array<uint64_t, 8> at{};
+                size_t count{0};
+            } threadDump = [] {
+                ThreadDumpConfig config;
+                const char *env = std::getenv("PS2X_EE_THREAD_DUMP_AT");
+                if (env != nullptr)
+                {
+                    const char *p = env;
+                    while (*p != '\0' && config.count < config.at.size())
+                    {
+                        char *end = nullptr;
+                        const unsigned long long v = std::strtoull(p, &end, 10);
+                        if (end == p)
+                        {
+                            ++p;
+                            continue;
+                        }
+                        config.at[config.count++] = v;
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                    std::sort(config.at.begin(), config.at.begin() + config.count);
+                }
+                return config;
+            }();
+            static size_t threadDumpNext = 0;
+            const uint64_t vsyncNow = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            while (threadDumpNext < threadDump.count && vsyncNow >= threadDump.at[threadDumpNext])
+            {
+                const uint64_t at = threadDump.at[threadDumpNext];
+                ++threadDumpNext;
+                const auto snap = m_eeScheduler->snapshot();
+                std::cerr << "[ee-threads] vsync=" << vsyncNow << " requested=" << at
+                          << " running=" << snap.runningThreadId << std::endl;
+                for (const auto &t : snap.threads)
+                {
+                    std::cerr << "[ee-threads] tid=" << t.id
+                              << " status=" << static_cast<int>(t.status)
+                              << " wait=" << static_cast<int>(t.waitReason)
+                              << " waitid=" << t.waitId
+                              << " prio=" << t.currentPriority
+                              << " pc=0x" << std::hex << t.pc
+                              << " ra=0x" << t.ra
+                              << " sp=0x" << t.sp
+                              << " entry=0x" << t.entry
+                              << std::dec << std::endl;
+                }
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
