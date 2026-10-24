@@ -1152,6 +1152,55 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    // Sparse function map for code that lives outside the generated dense
+    // table: runtime-copied code blobs (recompiled at their execution
+    // address). Addresses are normalized to physical (KSEG0/KSEG1 aliases of
+    // the same byte resolve to the same function), matching how the guest
+    // reaches the copied module through 0x80075000 / 0xA0075000 / 0x00075000.
+    std::mutex &sparseFunctionMutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> &sparseFunctionMap()
+    {
+        static std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> map;
+        return map;
+    }
+
+    uint32_t normalizeSparseAddress(uint32_t address)
+    {
+        // KSEG0 (0x8xxxxxxx) and KSEG1 (0xAxxxxxxx) map 1:1 onto physical RAM;
+        // KSEG2/3 are unmapped aliases of physical addresses and stay as-is.
+        const uint32_t segment = address & 0xE0000000u;
+        if (segment == 0x80000000u || segment == 0xA0000000u)
+        {
+            return address & 0x1FFFFFFFu;
+        }
+        return address;
+    }
+
+    PS2Runtime::RecompiledFunction lookupSparseFunction(uint32_t address)
+    {
+        const uint32_t normalized = normalizeSparseAddress(address);
+        std::lock_guard lock(sparseFunctionMutex());
+        const auto it = sparseFunctionMap().find(normalized);
+        return it == sparseFunctionMap().end() ? nullptr : it->second;
+    }
+}
+
+bool PS2Runtime::registerSparseFunction(uint32_t address, RecompiledFunction func)
+{
+    if ((address & 3u) != 0u || func == nullptr)
+    {
+        return false;
+    }
+
+    std::lock_guard lock(sparseFunctionMutex());
+    sparseFunctionMap()[normalizeSparseAddress(address)] = func;
+    return true;
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
@@ -1172,13 +1221,24 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 {
-    return replaceFunction(address, func);
+    uint32_t slot = 0u;
+    if (generatedFunctionTableSlot(address, slot))
+    {
+        g_ps2RecompiledFunctionTable[slot] = func;
+        return true;
+    }
+
+    return registerSparseFunction(address, func);
 }
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (generatedFunctionTableSlot(address, slot))
+    {
+        return g_ps2RecompiledFunctionTable[slot] != nullptr;
+    }
+    return lookupSparseFunction(address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1212,6 +1272,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         {
             return fn;
         }
+    }
+
+    if (RecompiledFunction sparseFn = lookupSparseFunction(address))
+    {
+        return sparseFn;
     }
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address

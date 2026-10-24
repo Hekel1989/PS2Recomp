@@ -405,8 +405,36 @@ namespace ps2_syscalls
 
         if (!runtime->hasFunction(handler))
         {
+            // Honest failure: the game installed a handler the runtime cannot
+            // execute (e.g. runtime-copied code that was not recompiled).
+            // Log once per (syscall, handler) so the gap is visible.
+            static std::mutex s_missingLogMutex;
+            static std::unordered_set<uint64_t> s_missingLogged;
+            const uint64_t key = (static_cast<uint64_t>(syscallNumber) << 32) | handler;
+            {
+                std::lock_guard lock(s_missingLogMutex);
+                if (s_missingLogged.insert(key).second)
+                {
+                    std::cerr << "[syscall-override] syscall 0x" << std::hex << syscallNumber
+                              << " handler 0x" << handler
+                              << " has no recompiled function; returning -1" << std::dec << std::endl;
+                }
+            }
             setReturnS32(ctx, KE_ERROR);
             return true;
+        }
+
+        // Log the first dispatch per syscall number so guest-installed handlers
+        // (the game's runtime-copied kernel service module) are visible.
+        static std::mutex s_dispatchLogMutex;
+        static std::unordered_set<uint32_t> s_dispatchLogged;
+        {
+            std::lock_guard lock(s_dispatchLogMutex);
+            if (s_dispatchLogged.insert(syscallNumber).second)
+            {
+                std::cerr << "[syscall-override] syscall 0x" << std::hex << syscallNumber
+                          << " -> guest handler 0x" << handler << std::dec << std::endl;
+            }
         }
 
         GuestInvocation invocation{};

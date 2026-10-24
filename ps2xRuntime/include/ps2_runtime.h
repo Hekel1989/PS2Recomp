@@ -379,6 +379,10 @@ public:
     bool replaceFunction(uint32_t address, RecompiledFunction func);
     // TODO remove this later need to update all tests
     bool registerFunction(uint32_t address, RecompiledFunction func);
+    // Registers a function outside the generated dense table (runtime-copied
+    // code blobs recompiled at their execution address). KSEG0/KSEG1 aliases of
+    // the same physical address resolve to the same function.
+    static bool registerSparseFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
     bool dispatchGuestBranch(uint8_t *rdram,
