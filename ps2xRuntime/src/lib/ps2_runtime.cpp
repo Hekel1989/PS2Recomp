@@ -2550,6 +2550,22 @@ void PS2Runtime::run()
         }
         EndDrawing();
 
+        // Diagnostic: PS2X_SCREENSHOT_EVERY=<N> saves the presented window every N frames
+        // as rt_frame_<n>.png in the current directory (raylib TakeScreenshot).
+        {
+            static const int screenshotEvery = [] {
+                const char *env = std::getenv("PS2X_SCREENSHOT_EVERY");
+                return env ? std::max(0, std::atoi(env)) : 0;
+            }();
+            static uint64_t presentedFrames = 0;
+            ++presentedFrames;
+            if (screenshotEvery > 0 && presentedFrames % static_cast<uint64_t>(screenshotEvery) == 0)
+            {
+                const std::string name = "rt_frame_" + std::to_string(presentedFrames) + ".png";
+                TakeScreenshot(name.c_str());
+            }
+        }
+
         if (WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
