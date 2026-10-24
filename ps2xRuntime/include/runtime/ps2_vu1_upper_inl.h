@@ -12,7 +12,19 @@
 #include <cstring>
 #include <limits>
 
+// The recompiler's instructions.h defines FT/FS/FD as macros; a file that
+// includes both (the tests do) must not have them expand inside the VU1
+// field helpers.
+#pragma push_macro("FT")
+#pragma push_macro("FS")
+#pragma push_macro("FD")
+#undef FT
+#undef FS
+#undef FD
 #include "../../src/lib/vu/ps2_vu1_detail.h"
+#pragma pop_macro("FD")
+#pragma pop_macro("FS")
+#pragma pop_macro("FT")
 
 #if defined(__GNUC__) || defined(__clang__)
 #define PS2X_VU1_INLINE inline __attribute__((always_inline))
