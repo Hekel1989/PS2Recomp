@@ -187,6 +187,30 @@ namespace ps2recomp
             }
         }
 
+        // Code after a `jr $ra` and its delay slot cannot be reached by falling
+        // through.  When the analyser folded a separate routine there (a leaf
+        // reached only through a function pointer, often one the game builds at
+        // run time from scene data), an indirect call to it needs an entry.  A
+        // resume entry gives it one without splitting the function.  NOP
+        // padding before the routine is skipped.
+        for (size_t i = 0; i < instructions.size(); ++i)
+        {
+            const Instruction &inst = instructions[i];
+            if (inst.opcode != OPCODE_SPECIAL || inst.function != SPECIAL_JR || inst.rs != 31)
+            {
+                continue;
+            }
+            size_t next = i + 2u;
+            while (next < instructions.size() && instructions[next].raw == 0u)
+            {
+                ++next;
+            }
+            if (next < instructions.size() && instructions[next].address == inst.address + 8u + 4u * (next - i - 2u))
+            {
+                queueResumeEntryTarget(instructions[next].address);
+            }
+        }
+
         if (hasIndirectRegisterJump)
         {
             bool needsIndirectFallback = false;
