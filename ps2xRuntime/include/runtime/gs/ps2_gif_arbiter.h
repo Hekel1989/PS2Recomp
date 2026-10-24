@@ -23,7 +23,9 @@ struct GifArbiterPacket
 class GifArbiter
 {
 public:
-    using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
+    // SUIKO(gs-phase5): the callback receives the packet's GifPathId so the
+    // consumer can route it to the right GS path (see ps2_gs_host_hooks.h).
+    using ProcessPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
 
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);

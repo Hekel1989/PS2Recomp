@@ -27,6 +27,17 @@ namespace Ps2GsHostHooks
         // Called once per VBlankStart, after the CSR FIELD bit update.
         // tick is the scheduler's vsync counter (1-based).
         std::function<void(uint64_t tick)> vsync;
+
+        // SUIKO(gs-phase5): Called for each complete tagged GIF packet as the
+        // GIF arbiter hands it to the GS frontend (drain), before the runtime's
+        // own frontend parses it. path is the effective GIF path in PCSX2's
+        // Transfer<n> slot semantics: 1 = PATH1 (VU1 XGKICK), 2 = PATH2 (GIF
+        // DMA), 3 = PATH3 (VIF1 DIRECT/DIRECTHL). Note PS2Recomp models VIF1
+        // DIRECT/DIRECTHL as Path2 and GIF DMA as Path3, so the arbiter's
+        // GifPathId is remapped to the hardware path here. data points at
+        // qwords * 16 bytes starting with the GIFtag and is only valid for the
+        // duration of the call. Fires on the game thread.
+        std::function<void(uint32_t path, const uint8_t *data, uint32_t qwords)> gifPacket;
     };
 
     inline Hooks &mutableHooks()

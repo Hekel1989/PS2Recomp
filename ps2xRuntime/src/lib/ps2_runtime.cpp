@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_gs_host_hooks.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -673,8 +674,24 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    // SUIKO(gs-phase5): hand each complete tagged GIF packet to the optional
+    // external GS backend (see runtime/ps2_gs_host_hooks.h) before the
+    // runtime's own frontend parses it. The hook's path follows PCSX2's
+    // Transfer<n> slot semantics: PS2Recomp models VIF1 DIRECT/DIRECTHL as
+    // Path2 and GIF DMA as Path3, swapped relative to the hardware paths.
+    m_gifArbiter.setProcessPacketFn([this](GifPathId pathId, const uint8_t *data, uint32_t size)
+                                    {
+                                        if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.gifPacket)
+                                        {
+                                            const uint32_t gsPath = pathId == GifPathId::Path1
+                                                                          ? 1u
+                                                                          : pathId == GifPathId::Path2
+                                                                                ? 3u // VIF1 DIRECT/DIRECTHL
+                                                                                : 2u; // GIF DMA
+                                            gsHooks.gifPacket(gsPath, data, size / 16u);
+                                        }
+                                        m_gs.processGIFPacket(data, size);
+                                    });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {

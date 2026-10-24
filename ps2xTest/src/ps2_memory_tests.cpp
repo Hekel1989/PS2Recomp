@@ -959,7 +959,7 @@ void register_ps2_memory_tests()
         tc.Run("GIF arbiter prioritizes PATH1 then PATH2 then PATH3", [](TestCase &t)
         {
             std::vector<uint8_t> order;
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
             {
                 if (data && sizeBytes > 0u)
                     order.push_back(data[0]);
@@ -986,7 +986,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             std::vector<uint8_t> firstBytes;
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
             {
                 if (data && sizeBytes > 0u)
                     firstBytes.push_back(data[0]);
@@ -2051,7 +2051,7 @@ void register_ps2_memory_tests()
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
             });
@@ -2119,7 +2119,7 @@ void register_ps2_memory_tests()
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
             });
@@ -2172,7 +2172,7 @@ void register_ps2_memory_tests()
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
             });

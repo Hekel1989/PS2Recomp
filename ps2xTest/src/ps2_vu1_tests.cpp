@@ -1379,7 +1379,7 @@ void register_ps2_vu1_tests()
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
             });
