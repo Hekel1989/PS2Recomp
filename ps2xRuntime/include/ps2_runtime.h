@@ -536,6 +536,26 @@ public:
     // it drains the 24 KiB IOP ring (Fixed 36).
     void setMovieAudioActive(bool active) noexcept { m_movieAudioActive.store(active, std::memory_order_relaxed); }
     [[nodiscard]] bool movieAudioActive() const noexcept { return m_movieAudioActive.load(std::memory_order_relaxed); }
+
+    // SUIKO(desched-repay): the game can leave the MPEG object alive for a
+    // while after the movie has been skipped/ended (it only calls
+    // sceMpegReset/Delete later).  Track when the demux/picture calls last
+    // ran so the pacing code can stop treating a stale "movie active" flag as
+    // a reason to discard debt.  Guest vsync ticks, not wall time, so a host
+    // stall or descheduling gap does not make a live movie look stale.
+    // Activity also re-arms the flag, so a movie replayed on an MPEG object
+    // after sceMpegReset (no new sceMpegCreate) is still treated as a movie.
+    void noteMovieAudioActivity(uint64_t vsyncTick) noexcept
+    {
+        m_movieAudioLastVSync.store(vsyncTick, std::memory_order_relaxed);
+        m_movieAudioActive.store(true, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool movieAudioActiveAt(uint64_t vsyncTick, uint64_t maxAgeTicks) const noexcept
+    {
+        const uint64_t last = m_movieAudioLastVSync.load(std::memory_order_relaxed);
+        return m_movieAudioActive.load(std::memory_order_relaxed) &&
+               vsyncTick >= last && vsyncTick - last <= maxAgeTicks;
+    }
     inline PS2RomDevice &romDevice() { return m_romDevice; }
     inline const PS2RomDevice &romDevice() const { return m_romDevice; }
     inline PS2Vfs &vfs() { return m_vfs; }
@@ -581,6 +601,7 @@ private:
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     std::atomic<bool> m_movieAudioActive{false};
+    std::atomic<uint64_t> m_movieAudioLastVSync{0u};
     PS2RomDevice m_romDevice;
     PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};

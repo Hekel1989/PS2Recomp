@@ -3,6 +3,7 @@
 #include "ps2_coverage.h"
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ee_pace.h"
 #include "runtime/ee_time.h"
 #include "runtime/ps2_gs_host_hooks.h"
 #include "runtime/ps2_diag_shares.h"
@@ -34,20 +35,29 @@ namespace
     // is cheap (a few hundred per second); sampling per dispatch was
     // measurable on the menu (~13% of the frame budget).
     constexpr uint64_t kPaceSamplePeriodNs = 2000000ull; // 2 ms
+    // A live movie demuxes or serves a picture every frame.  If neither has
+    // happened for this many guest vsyncs, the MPEG object is left over from a
+    // skipped/ended movie and must not suppress debt repayment any longer.
+    // Guest ticks, not wall time: excluded host stalls do not age the movie.
+    constexpr uint64_t kPaceMovieIdleTicks = 120u; // 2 s
     // Checkpoints between host-clock probes once the cycle deadline has
     // passed.  A checkpoint is one backward branch (~tens of cycles), so 64
     // of them are far below a millisecond: the vDSO read stops dominating
     // the path without letting the VBlank chain drift.
     constexpr uint32_t kDeadlineProbeInterval = 64u;
-    // Excluded host time may be repaid at most 2x the guest CPU time: a host
-    // that keeps up still reaches real time, while a stalled guest runs in slow
-    // motion instead of lightning through VBlank/timer deadlines.
-    constexpr uint64_t kPaceCatchUpNumerator = 2ull;
-    constexpr uint64_t kPaceCatchUpDenominator = 1ull;
-    // Never carry more than this much excluded host time.  A long stall
-    // (boot in a debugger, minutes of CPU starvation) should not turn into a
-    // minute-long fast-forward once the host recovers.
-    constexpr uint64_t kPaceMaxDebtNs = 2000000000ull; // 2 s
+
+    // Developer A/B switch: 0 keeps the old rule (all excluded time, including
+    // OS descheduling, goes through the slow-motion debt).  The default repays
+    // short descheduling immediately; see runtime/ee_pace.h.
+    bool descheduleRepayEnabled() noexcept
+    {
+        static const bool enabled = []()
+        {
+            const char *value = std::getenv("PS2X_EE_DESCHED_REPAY");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        return enabled;
+    }
 
     // Host-only work and guest waits reported by the executor thread.  Both are
     // written and read on the same thread, so no atomics are needed.
@@ -266,6 +276,11 @@ void ps2x::time::noteHostStall(std::chrono::nanoseconds duration) noexcept
     }
 }
 
+bool ps2x::time::descheduleRepayEnabled() noexcept
+{
+    return ::descheduleRepayEnabled();
+}
+
 EeScheduler::EeScheduler(PS2Runtime &runtime)
     : m_runtime(runtime)
 {
@@ -316,6 +331,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_deadlineDueObserved = false;
     m_snapshotPublishCountdown = 0u;
     m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
+    m_paceShortDeschedNs = m_paceMovieNs = 0u;
     m_paceInitialized = false;
     m_transferStartNs = 0u;
     m_transferReason = 0u;
@@ -740,6 +756,7 @@ void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
         m_paceAdvanceNs = 0u;
         m_paceDebtNs = 0u;
         m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
+        m_paceShortDeschedNs = m_paceMovieNs = 0u;
         m_paceInitialized = true;
         return;
     }
@@ -759,52 +776,29 @@ void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
     // clock run ~9x its execution rate, which is what froze the post-skip
     // transition.  Guest waits (DelayThread/WaitVSync/semaphore sleeps) do
     // count, so idle threads still reach their timer deadlines.
-    const uint64_t notOnCpu = wallDelta > cpuDelta ? wallDelta - cpuDelta : 0u;
-    const uint64_t descheduled = notOnCpu > waitDelta ? notOnCpu - waitDelta : 0u;
+    ps2x::time::PaceSample sample{};
+    sample.wallNs = wallDelta;
+    sample.cpuNs = cpuDelta;
+    sample.stallNs = stallDelta;
+    sample.waitNs = waitDelta;
+    const bool deschedRepay = ps2x::time::descheduleRepayEnabled();
+    sample.movieActive = deschedRepay
+                             ? m_runtime.movieAudioActiveAt(m_vsyncTick, kPaceMovieIdleTicks)
+                             : m_runtime.movieAudioActive();
+    sample.repayShortDesched = deschedRepay;
+    const ps2x::time::PaceStep step = ps2x::time::stepPace(sample, m_paceDebtNs);
 
-    // Time spent in explicitly reported host-only work is excluded from the
-    // guest clock.  Everything else keeps the old behaviour: wall time while
-    // the host keeps up, so VBlank count and IOP/SPU audio stay real-time.
-    const uint64_t excluded = std::min(wallDelta, stallDelta + descheduled);
-    const uint64_t base = wallDelta - excluded;
     m_paceStalledNs += std::min(wallDelta, stallDelta);
-    m_paceDescheduledNs += descheduled;
+    m_paceDescheduledNs += step.descheduledNs;
     m_paceWaitNs += waitDelta;
-
-    // Guest CPU time is what pays for catching up excluded host time.  A host
-    // stall blocks the guest, so it must not create a burst of due VBlanks and
-    // timers; the missed emulated time is replayed at up to
-    // kPaceCatchUpNumerator/Denominator times the guest's own execution rate.
-    // A normally running guest (CPU time close to wall time) repays a snapshot
-    // within a few frames; a guest that barely executes (snapshot every vsync,
-    // heavy CPU starvation) runs in slow motion instead of skipping ahead.
-    const uint64_t hostCpu = std::min(cpuDelta, stallDelta);
-    const uint64_t guestCpu = cpuDelta - hostCpu;
-    m_paceGuestCpuNs += guestCpu;
-    if (excluded >= kPaceMaxDebtNs - m_paceDebtNs)
+    m_paceGuestCpuNs += step.guestCpuNs;
+    m_paceShortDeschedNs += step.shortDeschedNs;
+    if (sample.movieActive)
     {
-        m_paceDebtNs = kPaceMaxDebtNs;
+        m_paceMovieNs += wallDelta;
     }
-    else
-    {
-        m_paceDebtNs += excluded;
-    }
-    // SUIKO(movie-audio): during an MPEG movie, do not replay host-stall debt
-    // into guest time.  The audio producer is stalled for the same interval;
-    // replaying the debt advances VBlank/IOP/SPU2 while it is not producing,
-    // which drains the 24 KiB IOP ring and makes the AutoDMA repeat stale
-    // data.  The movie simply pauses for the host stall instead.
-    if (m_runtime.movieAudioActive())
-    {
-        m_paceDebtNs = 0u;
-    }
-    const uint64_t allowance =
-        (guestCpu / kPaceCatchUpDenominator) * kPaceCatchUpNumerator +
-        (guestCpu % kPaceCatchUpDenominator) * kPaceCatchUpNumerator / kPaceCatchUpDenominator;
-    uint64_t repay = allowance > base ? allowance - base : 0u;
-    repay = std::min(repay, m_paceDebtNs);
-    m_paceDebtNs -= repay;
-    m_paceAdvanceNs += base + repay;
+    m_paceDebtNs = step.debtNs;
+    m_paceAdvanceNs += step.advanceNs;
 }
 
 void EeScheduler::beginTransfer(uint32_t reason) noexcept
@@ -1089,6 +1083,8 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
                       << " waitMs=" << (m_paceWaitNs / 1000000ull)
                       << " stallMs=" << (m_paceStalledNs / 1000000ull)
                       << " deschedMs=" << (m_paceDescheduledNs / 1000000ull)
+                      << " shortMs=" << (m_paceShortDeschedNs / 1000000ull)
+                      << " movieMs=" << (m_paceMovieNs / 1000000ull)
                       << " pc=0x" << std::hex
                       << (running != nullptr ? running->activeContext().pc : 0u)
                       << std::dec << std::endl;

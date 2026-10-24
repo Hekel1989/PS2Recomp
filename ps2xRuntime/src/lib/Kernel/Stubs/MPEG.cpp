@@ -2072,7 +2072,10 @@ namespace ps2_stubs
     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (runtime != nullptr)
+        {
             runtime->setMovieAudioActive(true);
+            runtime->noteMovieAudioActivity(runtime->eeScheduler().currentVSyncTick());
+        }
         const uint32_t param_1 = getRegU32(ctx, 4); // a0
         const uint32_t param_2 = getRegU32(ctx, 5); // a1
         const uint32_t param_3 = getRegU32(ctx, 6); // a2
@@ -2199,7 +2202,10 @@ namespace ps2_stubs
                 }
             }
             if (runtime != nullptr)
+            {
+                runtime->noteMovieAudioActivity(runtime->eeScheduler().currentVSyncTick());
                 runtime->setMovieAudioActive(!playback.streamEnded && playback.sawInput);
+            }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
         }
@@ -2296,7 +2302,10 @@ namespace ps2_stubs
                 }
             }
             if (runtime != nullptr)
+            {
+                runtime->noteMovieAudioActivity(runtime->eeScheduler().currentVSyncTick());
                 runtime->setMovieAudioActive(!playback.streamEnded && playback.sawInput);
+            }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
         }
@@ -2389,6 +2398,8 @@ namespace ps2_stubs
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        if (runtime != nullptr)
+            runtime->noteMovieAudioActivity(runtime->eeScheduler().currentVSyncTick());
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
@@ -2658,8 +2669,22 @@ namespace ps2_stubs
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
+        // SUIKO(desched-repay): the intro skip calls sceMpegReset, not
+        // sceMpegDelete.  Without this the movie-active flag stayed set for
+        // the rest of the run and the pacing code kept discarding its debt
+        // (the title never repaid OS descheduling; see docs/performance.md).
+        // Keep the old behaviour under the developer A/B switch.
         const uint32_t param_1 = getRegU32(ctx, 4);
+        const bool activeBefore = runtime != nullptr && runtime->movieAudioActive();
+        if (runtime != nullptr && ps2x::time::descheduleRepayEnabled())
+            runtime->setMovieAudioActive(false);
+        if (mpegTraceEnabled())
+        {
+            std::cerr << "[mpeg-trace] reset mpeg=0x" << std::hex << param_1
+                      << std::dec << " vsync="
+                      << (runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u)
+                      << " activeBefore=" << activeBefore << std::endl;
+        }
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);

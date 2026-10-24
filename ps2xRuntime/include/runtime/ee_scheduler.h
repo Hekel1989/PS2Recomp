@@ -479,6 +479,8 @@ private:
     uint64_t m_paceWaitNs = 0u;
     uint64_t m_paceStalledNs = 0u;
     uint64_t m_paceDescheduledNs = 0u;
+    uint64_t m_paceShortDeschedNs = 0u;
+    uint64_t m_paceMovieNs = 0u;
     bool m_paceInitialized = false;
     // Diagnostic: PS2X_EE_SWITCH_STATS=1 counts EeDispatcherTransfer throws by
     // reason and measures the throw-to-catch host time.  Inert when unset.

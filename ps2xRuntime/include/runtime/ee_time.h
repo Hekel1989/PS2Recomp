@@ -12,4 +12,10 @@ namespace ps2x::time
     // thread; the accounting is per-thread and only the executor's portion is
     // observed.
     void noteHostStall(std::chrono::nanoseconds duration) noexcept;
+
+    // Developer A/B switch for the short-descheduling repayment rule:
+    // PS2X_EE_DESCHED_REPAY=0 restores the old behaviour (all excluded time,
+    // including OS descheduling, goes through the slow-motion debt) on the
+    // same binary.  Env only; never a config file or menu setting.
+    bool descheduleRepayEnabled() noexcept;
 }
