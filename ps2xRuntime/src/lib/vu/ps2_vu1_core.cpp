@@ -860,7 +860,13 @@ void VU1Interpreter::progressXgkick()
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
-            reportReservedInstruction(false, 0xFFFFFFFBu);
+            // Not a VU instruction problem: the GIF packet is larger than the
+            // transfer buffer. Name it accurately instead of reporting the
+            // synthetic "reserved lower" sentinel.
+            RUNTIME_ERROR("[vu1:xgkick] packet too large src=0x" << std::hex
+                          << m_xgkick.sourceAddress << " copied=0x" << m_xgkick.copiedBytes
+                          << std::dec << " (GIF kick aborted)\n");
+            m_stopRequested = true;
             m_xgkick.active = false;
             return;
         }
@@ -892,14 +898,22 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
             else
             {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
+                RUNTIME_ERROR("[vu1:xgkick] unknown GIF format " << format
+                              << " src=0x" << std::hex << m_xgkick.sourceAddress
+                              << std::dec << " (GIF kick aborted)\n");
+                m_stopRequested = true;
                 m_xgkick.active = false;
                 return;
             }
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
-                reportReservedInstruction(false, 0xFFFFFFFBu);
+                RUNTIME_ERROR("[vu1:xgkick] malformed packet src=0x" << std::hex
+                              << m_xgkick.sourceAddress << " qw=0x" << qwordOffset
+                              << " tagBytes=" << std::dec << static_cast<unsigned long long>(tagBytes)
+                              << " nloop=" << nloop << " flg=" << format
+                              << " nreg=" << nreg << " (GIF kick aborted)\n");
+                m_stopRequested = true;
                 m_xgkick.active = false;
                 return;
             }
