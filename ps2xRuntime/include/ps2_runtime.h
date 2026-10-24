@@ -33,6 +33,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_thread.h"
+#include "runtime/ps2_vu1_backend.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_rom_device.h"
@@ -607,6 +608,9 @@ private:
     PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
+    // Host VU1 backend in use (runtime/ps2_vu1_backend.h), null for the
+    // interpreter.  Before m_vu1Thread so the worker is gone first.
+    std::unique_ptr<ps2x::Vu1BackendRunner> m_vu1Backend;
     // VIF1 + VU1 worker (null on the serial path, PS2X_VU1_THREAD=0).
     // Declared after everything it references so it is destroyed first.
     std::unique_ptr<ps2x::Vu1Thread> m_vu1Thread;

@@ -88,6 +88,21 @@ namespace ps2x
             const char *value = std::getenv(name);
             return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
         }
+
+        // PS2X_VU1_SLOW_KICK_US=<us>: log any VIF1/VU1 work item that takes at
+        // least that long.  A frame that misses its VBlank showed either a
+        // long item here (microVU compile, a heavy program) or a long
+        // beforeVblank() wait without one (the game thread was not ready).
+        uint64_t slowKickThresholdNs()
+        {
+            static const uint64_t threshold = [] {
+                const char *value = std::getenv("PS2X_VU1_SLOW_KICK_US");
+                if (value == nullptr || value[0] == '\0')
+                    return 0ull;
+                return std::strtoull(value, nullptr, 10) * 1000ull;
+            }();
+            return threshold;
+        }
     } // namespace
 
     struct Vu1Thread::Shadow
@@ -241,6 +256,8 @@ namespace ps2x
             }
 
             t_work = work;
+            const uint64_t slowThreshold = slowKickThresholdNs();
+            const uint64_t workStartNs = slowThreshold != 0u ? nowNs() : 0u;
             try
             {
                 for (const Chunk &chunk : work->chunks)
@@ -262,6 +279,18 @@ namespace ps2x
             m_memory.m_vif1ChunkSrcAddr = 0u;
             m_memory.m_vif1ChunkSrcKind = 0u;
             t_work = nullptr;
+            if (slowThreshold != 0u)
+            {
+                const uint64_t workNs = nowNs() - workStartNs;
+                if (workNs >= slowThreshold)
+                {
+                    std::fprintf(stderr,
+                                 "[vu1-slow] seq=%" PRIu64 " us=%" PRIu64 " bytes=%zu ops=%zu chunks=%zu\n",
+                                 work->sequence, static_cast<uint64_t>(workNs / 1000ull),
+                                 work->bytes.size(), work->opCount, work->chunks.size());
+                    std::fflush(stderr);
+                }
+            }
 
             work->done.store(true);
             m_completed.fetch_add(1u);
@@ -629,7 +658,10 @@ namespace ps2x
         if (t_onWorker || m_replaying || m_pendingVsyncs == 0u)
             return;
         if (m_statsEnabled)
+        {
             ++m_stats.fences[static_cast<size_t>(Vu1SyncReason::VBlank)];
+            ++m_stats.latePresents;
+        }
         m_replaying = true;
         while (m_pendingVsyncs > 0u && !m_log.empty() && replayFront(true, Vu1SyncReason::VBlank))
         {
@@ -758,9 +790,10 @@ namespace ps2x
         m_statsLastVsync = vsyncTick;
         std::fprintf(stderr,
                      "[vu1-thread] vsync=%" PRIu64 " kicks=%" PRIu64 " kb=%" PRIu64 " ops=%" PRIu64
-                     " deferred-ee=%" PRIu64 " max-log=%" PRIu64 " late-presents=%" PRIu64,
+                     " deferred-ee=%" PRIu64 " max-log=%" PRIu64 " deferred-presents=%" PRIu64
+                     " late-presents=%" PRIu64,
                      vsyncTick, m_stats.kicks, m_stats.bytes / 1024u, m_stats.ops, m_stats.deferredEeOps,
-                     m_stats.maxLog, m_stats.deferredPresents);
+                     m_stats.maxLog, m_stats.deferredPresents, m_stats.latePresents);
         for (size_t i = 0; i < static_cast<size_t>(Vu1SyncReason::Count); ++i)
         {
             if (m_stats.fences[i] == 0u)

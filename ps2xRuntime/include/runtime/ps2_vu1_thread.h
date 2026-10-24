@@ -268,7 +268,8 @@ namespace ps2x
             uint64_t waits[static_cast<size_t>(Vu1SyncReason::Count)]{};
             uint64_t waitNs[static_cast<size_t>(Vu1SyncReason::Count)]{};
             uint64_t maxLog = 0u;
-            uint64_t deferredPresents = 0u;
+            uint64_t deferredPresents = 0u; // presents queued in the ordered log
+            uint64_t latePresents = 0u;     // VBlanks whose present was still queued
         };
         bool m_statsEnabled = false;
         Stats m_stats;

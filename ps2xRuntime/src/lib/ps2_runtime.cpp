@@ -763,6 +763,32 @@ bool PS2Runtime::syncCoreSubsystems()
                                         m_gs.processGIFPacket(data, size);
                                     });
     m_memory.setGifArbiter(&m_gifArbiter);
+    // A host VU1 backend (runtime/ps2_vu1_backend.h, e.g. PCSX2's microVU)
+    // replaces the interpreter.  Verify mode's shadow runs the interpreter and
+    // compares bit for bit, so it keeps the interpreter here too.
+    if (m_vu1Thread)
+    {
+        m_vu1Thread->sync(ps2x::Vu1SyncReason::Shutdown);
+        m_memory.setVu1Thread(nullptr);
+        m_vu1Thread.reset();
+    }
+    m_vu1Backend.reset();
+    if (const ps2x::Vu1Backend *backend = ps2x::vu1Backend())
+    {
+        const ps2x::Vu1BackendRunner::Mode jitMode = ps2x::Vu1BackendRunner::modeFromEnvironment();
+        if (jitMode != ps2x::Vu1BackendRunner::Mode::Off &&
+            ps2x::Vu1Thread::modeFromEnvironment() == ps2x::Vu1Thread::Mode::Verify)
+        {
+            std::fprintf(stderr, "[vu1-jit] PS2X_VU1_THREAD=verify compares against the interpreter; "
+                                 "%s is not used\n", backend->name);
+        }
+        else if (jitMode != ps2x::Vu1BackendRunner::Mode::Off)
+        {
+            m_memory.useVu1Storage(backend->micro, backend->data);
+            backend->reset();
+            m_vu1Backend = std::make_unique<ps2x::Vu1BackendRunner>(*backend, m_memory, m_vu1, m_gs, jitMode);
+        }
+    }
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      const bool shareCapture = ps2x::diag::vu1OverlapEnabled();
@@ -786,9 +812,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = onVu1Thread ? m_vu1Thread->workerFbrst() : cpuContext->vu0_fbrst;
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (m_vu1Backend)
+                                     {
+                                         const ps2x::Vu1BackendRunner::Stop stop =
+                                             m_vu1Backend->run({false, startPC, top, itop, fbrst});
+                                         m_vu1.state().stoppedByD = stop.byD;
+                                         m_vu1.state().stoppedByT = stop.byT;
+                                     }
+                                     else
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
                                      if (cpuContext)
                                          cpuContext->vu0_vpu_stat =
                                              (cpuContext->vu0_vpu_stat & ~0x0600u) |
@@ -819,9 +853,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = onVu1Thread ? m_vu1Thread->workerFbrst() : cpuContext->vu0_fbrst;
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                     if (m_vu1Backend)
+                                     {
+                                         const ps2x::Vu1BackendRunner::Stop stop =
+                                             m_vu1Backend->run({true, 0u, top, itop, fbrst});
+                                         m_vu1.state().stoppedByD = stop.byD;
+                                         m_vu1.state().stoppedByT = stop.byT;
+                                     }
+                                     else
+                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                      m_gs, &m_memory, top, itop, 65536);
                                      if (cpuContext)
                                          cpuContext->vu0_vpu_stat =
                                              (cpuContext->vu0_vpu_stat & ~0x0600u) |
