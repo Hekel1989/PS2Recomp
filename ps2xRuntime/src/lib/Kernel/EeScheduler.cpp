@@ -413,23 +413,8 @@ void EeScheduler::run()
             while (dumpNext < dump.count && m_vsyncTick >= dump.at[dumpNext])
             {
                 const uint64_t requested = dump.at[dumpNext++];
-                uint32_t sceneDepth = 0xFFFFFFFFu;
-                uint32_t sceneMode = 0xFFFFFFFFu;
-                uint8_t scriptFlags[2] = {0xFFu, 0xFFu};
-                if (m_rdram != nullptr)
-                {
-                    std::memcpy(&sceneDepth, m_rdram + 0x496D80u, sizeof(sceneDepth));
-                    const uint32_t modeIndex = std::min<uint32_t>(sceneDepth, 0x0Fu);
-                    std::memcpy(&sceneMode, m_rdram + 0x496D84u + modeIndex * 4u, sizeof(sceneMode));
-                    std::memcpy(scriptFlags, m_rdram + 0x67A7F2u, sizeof(scriptFlags));
-                }
                 std::cerr << "[ee-threads] vsync=" << m_vsyncTick << " requested=" << requested
-                          << " running=" << m_currentThreadId
-                          << " sceneDepth=" << sceneDepth
-                          << " sceneMode=" << sceneMode
-                          << " flag55=0x" << std::hex << static_cast<unsigned>(scriptFlags[0])
-                          << " flag5d=0x" << static_cast<unsigned>(scriptFlags[1])
-                          << std::dec << std::endl;
+                          << " running=" << m_currentThreadId << std::endl;
                 for (const auto &[id, item] : m_threads)
                 {
                     if (id < 0)

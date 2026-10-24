@@ -635,11 +635,6 @@ namespace ps2_syscalls
                 if (handled && resultPointer != 0u && resultPointer != receiveBuffer)
                 {
                     rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize);
-                    if (std::getenv("PS2X_DIAG_RPC0_FORCE3") != nullptr && sid == 0u &&
-                        rpcNum == 1u && receiveBuffer != 0u)
-                    {
-                        *reinterpret_cast<uint32_t *>(getMemPtr(rdram, receiveBuffer)) = 3u;
-                    }
                 }
                 else if (!handled && sendBuf != 0u && sendSize != 0u && sendBuf != receiveBuffer)
                 {

@@ -2,7 +2,9 @@
 #include "LibC.h"
 #include "ps2_log.h"
 
+#include <cstdlib>
 #include <sstream>
+#include <utility>
 
 namespace ps2_stubs
 {
@@ -12,6 +14,24 @@ namespace ps2_stubs
         {
             static const bool enabled = std::getenv("PS2X_MOVIE_PCM_TRACE") != nullptr;
             return enabled;
+        }
+
+        // PS2X_MOVIE_PCM_TRACE=<lo>-<hi> (hex) limits the memcpy trace to
+        // callers whose return address lies in [lo, hi), e.g. a game's PSS
+        // audio callback; any other value traces every caller.
+        bool moviePcmTraceCaller(uint32_t callerRa)
+        {
+            static const std::pair<uint32_t, uint32_t> range = []
+            {
+                const char *value = std::getenv("PS2X_MOVIE_PCM_TRACE");
+                char *end = nullptr;
+                const unsigned long lo = value ? std::strtoul(value, &end, 16) : 0ul;
+                if (value == nullptr || end == value || *end != '-')
+                    return std::pair<uint32_t, uint32_t>{0u, 0xFFFFFFFFu};
+                const unsigned long hi = std::strtoul(end + 1, nullptr, 16);
+                return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(lo), static_cast<uint32_t>(hi)};
+            }();
+            return callerRa >= range.first && callerRa < range.second;
         }
 
         uint64_t traceFnv1a(const uint8_t *data, size_t size)
@@ -127,7 +147,7 @@ namespace ps2_stubs
         size = sanitizeMemTransferSize(size, "memcpy");
 
         const uint32_t callerRa = getRegU32(ctx, 31);
-        const bool tracePcm = moviePcmTrace() && callerRa >= 0x3BAE80u && callerRa < 0x3BB200u;
+        const bool tracePcm = moviePcmTrace() && moviePcmTraceCaller(callerRa);
         uint64_t traceHash = 0u;
         std::string traceHead;
         if (tracePcm)
