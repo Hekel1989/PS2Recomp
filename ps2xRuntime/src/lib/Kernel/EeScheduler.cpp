@@ -543,11 +543,7 @@ void EeScheduler::run()
             {
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
-                // Publish the idle/wait state immediately: the throttled
-                // publishSnapshot() can otherwise leave the debugger (and
-                // tests that poll the snapshot) showing the previous ready
-                // state until the next batch of scheduler operations.
-                publishSnapshotNow();
+                publishSnapshot();
                 traceSwitch(0);
                 waitForEvent();
                 continue;
