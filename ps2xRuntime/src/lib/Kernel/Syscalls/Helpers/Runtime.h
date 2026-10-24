@@ -321,7 +321,10 @@ static void ensureOsdConfigInitialized()
     uint32_t version = 1;  // OSD2
     uint32_t language = 1; // English
     g_osd_config_raw = packOsdConfig(spdifMode, screenType, videoOutput, japLanguage, ps1drvConfig, version, language, tz);
-    g_osd_config2_raw = packOsdConfig2(0, 0, 0, 0, version, language);
+    // Real US BIOS defaults: dateNotation=1 (MM/DD/YYYY) and timeNotation=1 (24h).
+    // Games read these via sceScfGetDateNotation/sceScfGetTimeNotation (syscall 0x4B/0x4C
+    // fallback path) and branch on them; zero defaults diverge from retail behaviour.
+    g_osd_config2_raw = packOsdConfig2(0, 0, 1, 1, version, language);
     g_osd_config_initialized = true;
 }
 
