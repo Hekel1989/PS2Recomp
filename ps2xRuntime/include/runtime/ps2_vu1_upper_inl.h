@@ -1,4 +1,4 @@
-// SUIKO(vu1-aot-v2): upper-instruction execution visible to generated code.
+// PS2X(vu1-aot-v2): upper-instruction execution visible to generated code.
 //
 // These are the exact functions from ps2_vu1_upper.cpp / ps2_vu1_core.cpp,
 // moved into the header so a generated aotStepConstant<kPc, Pair>() call can
@@ -15,13 +15,13 @@
 #include "../../src/lib/vu/ps2_vu1_detail.h"
 
 #if defined(__GNUC__) || defined(__clang__)
-#define SUIKO_VU1_INLINE inline __attribute__((always_inline))
+#define PS2X_VU1_INLINE inline __attribute__((always_inline))
 #else
-#define SUIKO_VU1_INLINE inline
+#define PS2X_VU1_INLINE inline
 #endif
 
 
-namespace suiko::vu1::detail
+namespace ps2x::vu1::detail
 {
     inline int32_t vuFloatToInt(float value, float scale)
     {
@@ -48,12 +48,12 @@ namespace suiko::vu1::detail
     }
 }
 
-SUIKO_VU1_INLINE float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+PS2X_VU1_INLINE float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
 {
     return normalizeOperand(vf[bc & 3u]);
 }
 
-SUIKO_VU1_INLINE float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+PS2X_VU1_INLINE float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -81,7 +81,7 @@ SUIKO_VU1_INLINE float VU1Interpreter::normalizeResult(float value, uint32_t &la
     return value;
 }
 
-SUIKO_VU1_INLINE void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+PS2X_VU1_INLINE void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
 {
     if (dest & 0x8u)
         dst[0] = result[0];
@@ -93,7 +93,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::applyDest(float *dst, const float *result,
         dst[3] = result[3];
 }
 
-SUIKO_VU1_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+PS2X_VU1_INLINE void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 {
     applyDest(m_state.acc, result, dest);
 }
@@ -313,7 +313,7 @@ inline bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
 }
 
 template <uint32_t U>
-SUIKO_VU1_INLINE void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+PS2X_VU1_INLINE void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
                                                 uint8_t laneFlags[4])
 {
     for (uint32_t component = 0; component < 4u; ++component)
@@ -322,7 +322,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::normalizeFmacResult(float *result, uint8_t
         if ((dest & lane(component)) == 0u)
             continue;
 
-        if (suiko::vu1::detail::fmacResultNeedsExact(result[component]))
+        if (ps2x::vu1::detail::fmacResultNeedsExact(result[component]))
         {
             long double exactResult = 0.0L;
             if (calculateFmacExactResult<U>(component, exactResult))
@@ -339,7 +339,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::normalizeFmacResult(float *result, uint8_t
 }
 
 template <uint32_t U>
-SUIKO_VU1_INLINE uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+PS2X_VU1_INLINE uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
 {
     uint32_t extraSticky = 0u;
     const uint32_t upper = upperWord<U>();
@@ -389,7 +389,7 @@ SUIKO_VU1_INLINE uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t des
 
         float product = left * right;
         uint8_t productFlags = 0u;
-        if (suiko::vu1::detail::fmacResultNeedsExact(product))
+        if (ps2x::vu1::detail::fmacResultNeedsExact(product))
         {
             const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
             productFlags = normalizeFmacExactResult(product, exactProduct);
@@ -408,7 +408,7 @@ SUIKO_VU1_INLINE uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t des
     return extraSticky;
 }
 
-SUIKO_VU1_INLINE void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+PS2X_VU1_INLINE void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
                                             uint32_t extraSticky)
 {
     if (dest == 0u)
@@ -458,7 +458,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4]
 }
 
 template <uint32_t U>
-SUIKO_VU1_INLINE void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+PS2X_VU1_INLINE void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
 {
     uint8_t laneFlags[4]{};
     normalizeFmacResult<U>(result, dest, laneFlags);
@@ -467,7 +467,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::applyFmacDest(float *dst, float *result, u
 }
 
 template <uint32_t U>
-SUIKO_VU1_INLINE void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
+PS2X_VU1_INLINE void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
     uint8_t laneFlags[4]{};
     normalizeFmacResult<U>(result, dest, laneFlags);
@@ -781,7 +781,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         case 0x14: // FTOI0
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = suiko::vu1::detail::vuFloatToInt(vs[c], 1.0f);
+                int32_t iv = ps2x::vu1::detail::vuFloatToInt(vs[c], 1.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -789,7 +789,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         case 0x15: // FTOI4
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = suiko::vu1::detail::vuFloatToInt(vs[c], 16.0f);
+                int32_t iv = ps2x::vu1::detail::vuFloatToInt(vs[c], 16.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -797,7 +797,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         case 0x16: // FTOI12
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = suiko::vu1::detail::vuFloatToInt(vs[c], 4096.0f);
+                int32_t iv = ps2x::vu1::detail::vuFloatToInt(vs[c], 4096.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -805,7 +805,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
         case 0x17: // FTOI15
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = suiko::vu1::detail::vuFloatToInt(vs[c], 32768.0f);
+                int32_t iv = ps2x::vu1::detail::vuFloatToInt(vs[c], 32768.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -964,7 +964,7 @@ inline void VU1Interpreter::execUpper(uint32_t instr)
 // Compile-time upper-op execution (v2)
 // ---------------------------------------------------------------------------
 template <uint32_t U, uint32_t Op, bool WriteAcc, bool CrossNoAcc>
-SUIKO_VU1_INLINE void VU1Interpreter::execUpperArith()
+PS2X_VU1_INLINE void VU1Interpreter::execUpperArith()
 {
     constexpr uint8_t dest = DEST(U);
     constexpr uint8_t ft = FT(U);
@@ -1183,7 +1183,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::execUpperArith()
 }
 
 template <uint32_t U, uint32_t Special>
-SUIKO_VU1_INLINE void VU1Interpreter::execUpperSpecial()
+PS2X_VU1_INLINE void VU1Interpreter::execUpperSpecial()
 {
     constexpr uint8_t ft = FT(U);
     constexpr uint8_t fs = FS(U);
@@ -1218,7 +1218,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::execUpperSpecial()
                                                    : 32768.0f;
         for (uint32_t c = 0; c < 4u; ++c)
         {
-            const int32_t iv = suiko::vu1::detail::vuFloatToInt(
+            const int32_t iv = ps2x::vu1::detail::vuFloatToInt(
                 normalizeOperand(m_state.vf[fs][c]), scale);
             std::memcpy(&result[c], &iv, 4);
         }
@@ -1283,7 +1283,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::execUpperSpecial()
 }
 
 template <uint32_t U>
-SUIKO_VU1_INLINE void VU1Interpreter::execUpperConstant()
+PS2X_VU1_INLINE void VU1Interpreter::execUpperConstant()
 {
     constexpr uint8_t op = static_cast<uint8_t>(U & 0x3Fu);
     constexpr uint8_t special = static_cast<uint8_t>((U & 3u) | ((U >> 4) & 0x7Cu));

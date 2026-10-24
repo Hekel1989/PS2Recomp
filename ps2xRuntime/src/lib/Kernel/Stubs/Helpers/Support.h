@@ -1910,7 +1910,7 @@ namespace
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
         }
 
-        // SUIKO(gs-phase5b): these register writes bypass the GIF arbiter, so
+        // PS2X(gs-phase5b): these register writes bypass the GIF arbiter, so
         // an external GS backend never sees them. Mirror them as a minimal A+D
         // GIF packet (GIFtag NLOOP=pairCount, FLG=PACKED, NREG=1, REGS=0x0E,
         // EOP, then one {value, reg} qword per pair -- the same shape

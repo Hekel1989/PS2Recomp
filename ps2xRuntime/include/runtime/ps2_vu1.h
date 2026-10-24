@@ -4,9 +4,9 @@
 #include "runtime/ps2_vu1_aot.h"
 
 #if defined(__GNUC__) || defined(__clang__)
-#define SUIKO_VU1_INLINE inline __attribute__((always_inline))
+#define PS2X_VU1_INLINE inline __attribute__((always_inline))
 #else
-#define SUIKO_VU1_INLINE inline
+#define PS2X_VU1_INLINE inline
 #endif
 
 #include <array>
@@ -75,7 +75,7 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
-    // SUIKO(vu1-aot-v2): test seams (tests/vu1/vu1_aot_selftest.cpp).  Both
+    // PS2X(vu1-aot-v2): test seams (tests/vu1/vu1_aot_selftest.cpp).  Both
     // are inert unless called: the game never disables AOT per interpreter and
     // never captures packets outside the differential harness.
     void setAotEnabled(bool enabled) { m_aotDisabled = !enabled; }
@@ -83,27 +83,27 @@ public:
     void resetAotProgramCache() { m_aotProgramCacheValid = false; }
     uint64_t lastRunPairs() const { return m_traceInsns; }
 
-    // SUIKO(vu1-aot): narrow seam used by generated code.  The decoded pair
+    // PS2X(vu1-aot): narrow seam used by generated code.  The decoded pair
     // comes from the program's constexpr table; everything else stays private.
-    suiko::vu1::AotResult aotStepPair(const suiko::vu1::DecodedPair &decoded);
+    ps2x::vu1::AotResult aotStepPair(const ps2x::vu1::DecodedPair &decoded);
     uint32_t aotPc() const { return m_state.pc; }
 
-    // SUIKO(vu1-aot-v2): one instantiation per microcode pair.  kPc and the
+    // PS2X(vu1-aot-v2): one instantiation per microcode pair.  kPc and the
     // decoded pair are compile-time constants so the compiler removes every
     // branch and loop that the generic step routine would evaluate at run time.
-    template <uint32_t kPc, const suiko::vu1::DecodedPair &D>
-    suiko::vu1::AotResult aotStepConstant();
-    template <uint32_t kPc, const suiko::vu1::DecodedPair &D>
+    template <uint32_t kPc, const ps2x::vu1::DecodedPair &D>
+    ps2x::vu1::AotResult aotStepConstant();
+    template <uint32_t kPc, const ps2x::vu1::DecodedPair &D>
     uint64_t pairReadyCycleConstant() const;
-    template <const suiko::vu1::DecodedPair &D>
+    template <const ps2x::vu1::DecodedPair &D>
     void markPairWritesConstant();
 
 private:
-    using Pipeline = suiko::vu1::Pipeline;
-    using enum suiko::vu1::Pipeline;
-    using VfAccess = suiko::vu1::VfAccess;
-    using InstructionUsage = suiko::vu1::InstructionUsage;
-    using DecodedInstructionPair = suiko::vu1::DecodedPair;
+    using Pipeline = ps2x::vu1::Pipeline;
+    using enum ps2x::vu1::Pipeline;
+    using VfAccess = ps2x::vu1::VfAccess;
+    using InstructionUsage = ps2x::vu1::InstructionUsage;
+    using DecodedInstructionPair = ps2x::vu1::DecodedPair;
 
     struct FlagPipelineEntry
     {
@@ -227,7 +227,7 @@ private:
     // can then return without scanning every array on the cycles where nothing
     // becomes visible.
     uint64_t m_nextCommitCycle = UINT64_MAX;
-    // SUIKO(vu1-aot-v2): earliest ready cycle per pipeline type.  commit only
+    // PS2X(vu1-aot-v2): earliest ready cycle per pipeline type.  commit only
     // walks a type whose entries can be visible this cycle; the others are one
     // compare.  The exhaustive scan used to visit every pending entry just to
     // recompute the global minimum.
@@ -254,7 +254,7 @@ private:
     bool m_referenceScheduler = false;
     std::vector<std::vector<uint8_t>> *m_xgkickCapture = nullptr;
 
-    // SUIKO(vu1-aot): compiled-program dispatch.
+    // PS2X(vu1-aot): compiled-program dispatch.
     const uint8_t *m_activeVuCode = nullptr;
     uint32_t m_activeCodeSize = 0;
     uint64_t m_budgetEnd = 0;
@@ -263,14 +263,14 @@ private:
     uint32_t m_traceInsns = 0;
     const char *m_stopReason = "budget";
     uint32_t m_traceStartPc = 0;
-    const suiko::vu1::CompiledProgram *m_aotProgram = nullptr;
+    const ps2x::vu1::CompiledProgram *m_aotProgram = nullptr;
     const uint8_t *m_aotProgramCode = nullptr;
     uint32_t m_aotProgramCodeSize = 0;
     uint64_t m_aotProgramGeneration = 0;
     bool m_aotProgramCacheValid = false;
     bool m_aotDisabled = false;
 
-    const suiko::vu1::CompiledProgram *findCompiledProgram(uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
+    const ps2x::vu1::CompiledProgram *findCompiledProgram(uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
@@ -295,7 +295,7 @@ private:
     void execLowerConstant(uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
                            uint32_t upperInstr);
 
-    // SUIKO(vu1-aot-v2): kRuntimeUpper selects the interpreter's runtime
+    // PS2X(vu1-aot-v2): kRuntimeUpper selects the interpreter's runtime
     // instruction word; any other value is the generated pair's compile-time
     // upper word, which lets the compiler fold the opcode switches (and the
     // dead branches of the exact-result machinery) out of every pair.
@@ -336,7 +336,7 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
-    SUIKO_VU1_INLINE void advanceOneCycle()
+    PS2X_VU1_INLINE void advanceOneCycle()
     {
         ++m_cycle;
         m_state.cycles = m_cycle;

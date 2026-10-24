@@ -1,4 +1,4 @@
-// SUIKO(vu1-aot-v2): compile-time lower-instruction execution.
+// PS2X(vu1-aot-v2): compile-time lower-instruction execution.
 //
 // execLowerConstant<kPc, L>() mirrors VU1Interpreter::execLower() with the
 // instruction word (and therefore every field, immediate and branch
@@ -13,7 +13,7 @@
 #include <cstring>
 #include <limits>
 
-namespace suiko::vu1::detail
+namespace ps2x::vu1::detail
 {
     inline float vuEatan(float value)
     {
@@ -78,7 +78,7 @@ namespace suiko::vu1::detail
 }
 
 template <uint32_t kPc, uint32_t L>
-SUIKO_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_t dataSize,
+PS2X_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_t dataSize,
                                                        GS &gs, PS2Memory *memory, uint32_t upperInstr)
 {
     (void)upperInstr;
@@ -95,7 +95,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_
         constexpr uint8_t dest = static_cast<uint8_t>((L >> 21) & 0xF);
         constexpr int16_t imm = IMM11(L);
         const uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u & (dataSize - 1);
-        if (suiko::vu1::detail::vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
+        if (ps2x::vu1::detail::vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
             std::fprintf(stderr, "[vu1:load] LQ pc=0x%x addr=0x%x vf=%u mask=0x%x\n",
                          kPc, addr, it, dest);
         if (addr + 16 <= dataSize)
@@ -113,7 +113,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_
         constexpr uint8_t dest = static_cast<uint8_t>((L >> 21) & 0xF);
         constexpr int16_t imm = IMM11(L);
         const uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[it] + imm)) * 16u & (dataSize - 1);
-        if (suiko::vu1::detail::vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
+        if (ps2x::vu1::detail::vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))
             std::fprintf(stderr, "[vu1:store] SQ pc=0x%x addr=0x%x vf=%u mask=0x%x\n",
                          kPc, addr, is, dest);
         if (addr + 16 <= dataSize)
@@ -636,14 +636,14 @@ SUIKO_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_
             {
                 const float x = normalizeOperand(m_state.vf[vfS][0]);
                 const float y = normalizeOperand(m_state.vf[vfS][1]);
-                queueP(x != 0.0f ? suiko::vu1::detail::vuEatan(y / x) : 0.0f, 54u);
+                queueP(x != 0.0f ? ps2x::vu1::detail::vuEatan(y / x) : 0.0f, 54u);
                 return;
             }
             else if constexpr (funct2 == 0x75u) // EATANxz
             {
                 const float x = normalizeOperand(m_state.vf[vfS][0]);
                 const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(x != 0.0f ? suiko::vu1::detail::vuEatan(z / x) : 0.0f, 54u);
+                queueP(x != 0.0f ? ps2x::vu1::detail::vuEatan(z / x) : 0.0f, 54u);
                 return;
             }
             else if constexpr (funct2 == 0x76u) // ESUM
@@ -679,7 +679,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_
             {
                 constexpr uint32_t component = (L >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(suiko::vu1::detail::vuEsin(value), 29u);
+                queueP(ps2x::vu1::detail::vuEsin(value), 29u);
                 return;
             }
             else if constexpr (funct2 == 0x7Au) // ERCPR
@@ -696,13 +696,13 @@ SUIKO_VU1_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_
             else if constexpr (funct2 == 0x7Cu) // EATAN
             {
                 constexpr uint32_t component = (L >> 21) & 3u;
-                queueP(suiko::vu1::detail::vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
+                queueP(ps2x::vu1::detail::vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
             else if constexpr (funct2 == 0x7Du) // EEXP
             {
                 constexpr uint32_t component = (L >> 21) & 3u;
-                queueP(suiko::vu1::detail::vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
+                queueP(ps2x::vu1::detail::vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
                 return;
             }
             else

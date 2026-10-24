@@ -407,7 +407,7 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
-    // SUIKO(vu1-inventory): where the chunk being parsed came from, for MPG
+    // PS2X(vu1-inventory): where the chunk being parsed came from, for MPG
     // source reporting.  kind 1 = contiguous physical buffer, 2 = DMA chain.
     uint32_t m_vif1ChunkSrcAddr = 0u;
     uint32_t m_vif1ChunkSrcKind = 0u;

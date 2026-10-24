@@ -17,7 +17,7 @@ struct GifArbiterPacket
     GifPathId pathId;
     bool path2DirectHl = false;
     bool path3Image = false;
-    // SUIKO(gs-phase5b): the packet continues a VIF1 DIRECT payload that was
+    // PS2X(gs-phase5b): the packet continues a VIF1 DIRECT payload that was
     // split at a DMA-chunk boundary; its first qword is a GIFtag the runtime
     // synthesized for its own frontend (see ps2_vif1_interpreter.cpp).
     bool directContinuation = false;
@@ -27,9 +27,9 @@ struct GifArbiterPacket
 class GifArbiter
 {
 public:
-    // SUIKO(gs-phase5): the callback receives the packet's GifPathId so the
+    // PS2X(gs-phase5): the callback receives the packet's GifPathId so the
     // consumer can route it to the right GS path (see ps2_gs_host_hooks.h).
-    // SUIKO(gs-phase5b): plus the packet's directContinuation flag.
+    // PS2X(gs-phase5b): plus the packet's directContinuation flag.
     using ProcessPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t, bool)>;
 
     GifArbiter() = default;

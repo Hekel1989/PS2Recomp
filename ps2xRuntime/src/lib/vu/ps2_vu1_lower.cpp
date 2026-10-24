@@ -116,7 +116,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         int16_t imm = IMM11(instr);
         uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[it] + imm)) * 16u;
         addr &= (dataSize - 1);
-        // SUIKO(diag-vu1-store-trace): the transition renderer is suspected of
+        // PS2X(diag-vu1-store-trace): the transition renderer is suspected of
         // never storing the packet it later kicks; show stores to the two
         // packet slots it uses.
         if (vu1TraceEnabled() && (addr == 0x1e00u || addr == 0x3e00u || addr == 0x5e00u))

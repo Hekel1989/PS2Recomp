@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstring>
 
-namespace suiko::diag
+namespace ps2x::diag
 {
     namespace
     {
@@ -385,4 +385,4 @@ namespace suiko::diag
         }
         std::fflush(stderr);
     }
-} // namespace suiko::diag
+} // namespace ps2x::diag

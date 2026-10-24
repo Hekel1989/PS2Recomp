@@ -30,7 +30,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
 
-        // SUIKO: attach the real SPU2. Passing nullptr restores the original
+        // PS2X: attach the real SPU2. Passing nullptr restores the original
         // register-store / fake DMA behaviour.
         void setSpu2Host(IopSpu2Host *host) noexcept;
 

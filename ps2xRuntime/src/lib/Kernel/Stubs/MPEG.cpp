@@ -1107,7 +1107,7 @@ namespace ps2_stubs
                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
             }
 
-            // SUIKO(movie-audio): a long software video decode blocks the EE
+            // PS2X(movie-audio): a long software video decode blocks the EE
             // executor while the wall-clock pacing keeps advancing the
             // IOP/SPU2.  The game's SIF audio producer is blocked for the same
             // interval, so the 24 KiB IOP ring laps and the pump resyncs with
@@ -2189,7 +2189,7 @@ namespace ps2_stubs
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
             {
-                // SUIKO(movie-audio): one packet per call. Two packets let
+                // PS2X(movie-audio): one packet per call. Two packets let
                 // the callback write the next packet into the ring slot the
                 // SIF pump has not read yet, so the pump sees a torn page
                 // (and resyncs with a ~40 ms skip). One packet gives the
@@ -2669,10 +2669,10 @@ namespace ps2_stubs
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // SUIKO(desched-repay): the intro skip calls sceMpegReset, not
+        // PS2X(desched-repay): the intro skip calls sceMpegReset, not
         // sceMpegDelete.  Without this the movie-active flag stayed set for
         // the rest of the run and the pacing code kept discarding its debt
-        // (the title never repaid OS descheduling; see docs/performance.md).
+        // (the title never repaid OS descheduling).
         // Keep the old behaviour under the developer A/B switch.
         const uint32_t param_1 = getRegU32(ctx, 4);
         const bool activeBefore = runtime != nullptr && runtime->movieAudioActive();

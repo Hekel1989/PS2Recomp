@@ -1,7 +1,7 @@
 #pragma once
 
-// SUIKO(gs-phase6): optional host hooks that let the embedding application take
-// over presentation (see docs/gs-port-plan.md phase 6). When the host shows the
+// PS2X(gs-phase6): optional host hooks that let the embedding application take
+// over presentation. When the host shows the
 // game through its own window (the PCSX2 GS Vulkan swapchain), the runtime must
 // not open the raylib window nor run its CPU-framebuffer present loop. The
 // runtime only calls these; it never requires them, and they contain no

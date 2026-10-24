@@ -31,7 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace suiko::diag
+namespace ps2x::diag
 {
     inline bool vu1OverlapEnabled()
     {
@@ -73,4 +73,4 @@ namespace suiko::diag
     // atexit handler installed on first use, so a timeout/SIGTERM still keeps
     // the completed frames.
     void flush();
-} // namespace suiko::diag
+} // namespace ps2x::diag

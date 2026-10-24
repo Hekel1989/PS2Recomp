@@ -25,7 +25,7 @@ namespace
         return static_cast<uint8_t>(1u << (3u - component));
     }
 
-    // --- SUIKO(vu1-trace): PS2X_VU1_TRACE=1 -----------------------------------
+    // --- PS2X(vu1-trace): PS2X_VU1_TRACE=1 -----------------------------------
     // Log every VU1 microprogram run (start PC, executed instruction count,
     // stop reason) and every XGKICK (source address, packet size, first GIFtag).
     bool vu1TraceEnabled()
@@ -77,7 +77,7 @@ namespace
     }
 
     constexpr uint32_t kMaxCompiledPrograms = 64u;
-    const suiko::vu1::CompiledProgram *s_compiledPrograms[kMaxCompiledPrograms]{};
+    const ps2x::vu1::CompiledProgram *s_compiledPrograms[kMaxCompiledPrograms]{};
     uint32_t s_compiledProgramCount = 0u;
     bool s_compiledProgramsRegistered = false;
     std::set<uint64_t> s_aotMisses;
@@ -98,7 +98,7 @@ namespace
         if (s_compiledProgramsRegistered)
             return;
         s_compiledProgramsRegistered = true;
-        suikoVu1RegisterGeneratedPrograms();
+        ps2xVu1RegisterGeneratedPrograms();
         if (s_compiledProgramCount != 0u)
         {
             std::fprintf(stderr, "[vu1-aot] registered %u compiled program(s)\n",
@@ -157,7 +157,7 @@ namespace
     }
 }
 
-uint32_t suiko::vu1::hash(const uint8_t *data, uint32_t size)
+uint32_t ps2x::vu1::hash(const uint8_t *data, uint32_t size)
 {
     uint32_t value = 0x811C9DC5u;
     for (uint32_t index = 0; index < size; ++index)
@@ -168,26 +168,26 @@ uint32_t suiko::vu1::hash(const uint8_t *data, uint32_t size)
     return value;
 }
 
-void suiko::vu1::registerCompiledProgram(const CompiledProgram *program)
+void ps2x::vu1::registerCompiledProgram(const CompiledProgram *program)
 {
     if (program == nullptr || s_compiledProgramCount >= kMaxCompiledPrograms)
         return;
     s_compiledPrograms[s_compiledProgramCount++] = program;
 }
 
-uint32_t suiko::vu1::compiledProgramCount()
+uint32_t ps2x::vu1::compiledProgramCount()
 {
     ensureCompiledProgramsRegistered();
     return s_compiledProgramCount;
 }
 
-const suiko::vu1::CompiledProgram *suiko::vu1::compiledProgram(uint32_t index)
+const ps2x::vu1::CompiledProgram *ps2x::vu1::compiledProgram(uint32_t index)
 {
     ensureCompiledProgramsRegistered();
     return index < s_compiledProgramCount ? s_compiledPrograms[index] : nullptr;
 }
 
-extern "C" __attribute__((weak)) void suikoVu1RegisterGeneratedPrograms()
+extern "C" __attribute__((weak)) void ps2xVu1RegisterGeneratedPrograms()
 {
 }
 
@@ -565,7 +565,7 @@ void VU1Interpreter::commitReadyPipelines()
                 typeNext = std::min(typeNext, write.readyCycle);
                 continue;
             }
-            // SUIKO(perf): the common case is a full-lane write that is still
+            // PS2X(perf): the common case is a full-lane write that is still
             // the latest for its register -- copy the whole vector at once
             // instead of four lane/sequence tests and four scalar stores.
             // This loop was ~19% of the VU1 AOT benchmark.
@@ -847,7 +847,7 @@ void VU1Interpreter::progressXgkick()
                               << " tagBytes=" << std::dec << static_cast<unsigned long long>(tagBytes)
                               << " nloop=" << nloop << " flg=" << format
                               << " nreg=" << nreg << " (GIF kick aborted)\n");
-                // SUIKO(diag-vu1-xgkick-dump): at the failing tag, show the
+                // PS2X(diag-vu1-xgkick-dump): at the failing tag, show the
                 // VIF1 TOP/ITOP the program saw, every VI register, and the
                 // qwords around the tag. The packet source is often a pointer
                 // loaded from the data buffer, so both matter.
@@ -1588,7 +1588,7 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
-const suiko::vu1::CompiledProgram *VU1Interpreter::findCompiledProgram(
+const ps2x::vu1::CompiledProgram *VU1Interpreter::findCompiledProgram(
     uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory)
 {
     if (m_unit != Unit::VU1 || m_aotDisabled || !vu1AotEnabled())
@@ -1615,13 +1615,13 @@ const suiko::vu1::CompiledProgram *VU1Interpreter::findCompiledProgram(
     m_aotProgramCacheValid = true;
     for (uint32_t index = 0; index < s_compiledProgramCount; ++index)
     {
-        const suiko::vu1::CompiledProgram *program = s_compiledPrograms[index];
+        const ps2x::vu1::CompiledProgram *program = s_compiledPrograms[index];
         if (program == nullptr || program->run == nullptr)
             continue;
         if (program->extentOffset > codeSize ||
             program->extentSize > codeSize - program->extentOffset)
             continue;
-        if (suiko::vu1::hash(vuCode + program->extentOffset, program->extentSize) ==
+        if (ps2x::vu1::hash(vuCode + program->extentOffset, program->extentSize) ==
             program->programHash)
         {
             m_aotProgram = program;
@@ -1631,18 +1631,18 @@ const suiko::vu1::CompiledProgram *VU1Interpreter::findCompiledProgram(
     return m_aotProgram;
 }
 
-suiko::vu1::AotResult VU1Interpreter::aotStepPair(const DecodedInstructionPair &decoded)
+ps2x::vu1::AotResult VU1Interpreter::aotStepPair(const DecodedInstructionPair &decoded)
 {
     if (m_stopRequested)
-        return suiko::vu1::AotResult::StopRequested;
+        return ps2x::vu1::AotResult::StopRequested;
     if (m_cycle >= m_budgetEnd)
-        return suiko::vu1::AotResult::BudgetEnded;
+        return ps2x::vu1::AotResult::BudgetEnded;
     if (m_nextCommitCycle <= m_cycle)
         commitReadyPipelines();
     if (m_state.pc + 8u > m_activeCodeSize)
     {
         m_stopReason = "pc-out-of-range";
-        return suiko::vu1::AotResult::StopRequested;
+        return ps2x::vu1::AotResult::StopRequested;
     }
 
     if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
@@ -1650,7 +1650,7 @@ suiko::vu1::AotResult VU1Interpreter::aotStepPair(const DecodedInstructionPair &
         m_stopReason = "reserved";
         reportReservedInstruction(decoded.upperUsage.reserved,
                                   decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-        return suiko::vu1::AotResult::StopRequested;
+        return ps2x::vu1::AotResult::StopRequested;
     }
 
     const uint64_t readyCycle = calculatePairReadyCycle(decoded);
@@ -1664,10 +1664,10 @@ suiko::vu1::AotResult VU1Interpreter::aotStepPair(const DecodedInstructionPair &
             advanceTo(readyCycle);
     }
     if (m_cycle >= m_budgetEnd)
-        return suiko::vu1::AotResult::BudgetEnded;
+        return ps2x::vu1::AotResult::BudgetEnded;
 
     {
-        // SUIKO(diag-vu1-itrace): PS2X_VU1_ITRACE=<startpc hex>[:<count>]
+        // PS2X(diag-vu1-itrace): PS2X_VU1_ITRACE=<startpc hex>[:<count>]
         // logs every pair of the first <count> runs that begin at startpc.
         static const char *s_itrace = std::getenv("PS2X_VU1_ITRACE");
         static uint32_t s_itracePc = s_itrace ? static_cast<uint32_t>(std::strtoul(s_itrace, nullptr, 16)) : 0xFFFFFFFFu;
@@ -1863,9 +1863,9 @@ suiko::vu1::AotResult VU1Interpreter::aotStepPair(const DecodedInstructionPair &
     if (programEnded)
     {
         m_stopReason = m_state.stoppedByD ? "d-bit" : m_state.stoppedByT ? "t-bit" : "e-bit";
-        return suiko::vu1::AotResult::ProgramEnded;
+        return ps2x::vu1::AotResult::ProgramEnded;
     }
-    return suiko::vu1::AotResult::Continue;
+    return ps2x::vu1::AotResult::Continue;
 }
 
 void VU1Interpreter::runDifferential(uint8_t *vuCode, uint32_t codeSize,
@@ -2021,7 +2021,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
-    // SUIKO(diag-vu1-start-vi): show the VI state the VIF1 hand-off gave
+    // PS2X(diag-vu1-start-vi): show the VI state the VIF1 hand-off gave
     // the title render entries; the 0x140/0x150 loops read their pointers
     // from VI, so a stale value here shows up as a non-terminating loop.
     if (vu1TraceEnabled() && (m_state.pc == 0x140u || m_state.pc == 0x150u))
@@ -2110,7 +2110,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }
 
     bool runInterpreter = true;
-    const suiko::vu1::CompiledProgram *compiled = findCompiledProgram(vuCode, codeSize, memory);
+    const ps2x::vu1::CompiledProgram *compiled = findCompiledProgram(vuCode, codeSize, memory);
     if (compiled != nullptr)
     {
         bool entry = false;
@@ -2126,20 +2126,20 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             logAotHit(compiled->programHash, m_state.pc);
             compiledOnly = true;
-            const suiko::vu1::AotResult result = compiled->run(*this);
-            if (result == suiko::vu1::AotResult::ProgramEnded)
+            const ps2x::vu1::AotResult result = compiled->run(*this);
+            if (result == ps2x::vu1::AotResult::ProgramEnded)
             {
                 programEnded = true;
                 runInterpreter = false;
             }
-            else if (result == suiko::vu1::AotResult::Fallback)
+            else if (result == ps2x::vu1::AotResult::Fallback)
             {
                 compiledOnly = false;
                 logAotMiss(compiled->programHash, m_state.pc);
             }
             else
             {
-                if (result == suiko::vu1::AotResult::BudgetEnded)
+                if (result == ps2x::vu1::AotResult::BudgetEnded)
                     m_stopReason = "budget";
                 else
                     m_stopReason = "stop";
@@ -2160,13 +2160,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         const DecodedInstructionPair decoded =
             getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
-        const suiko::vu1::AotResult result = aotStepPair(decoded);
-        if (result == suiko::vu1::AotResult::ProgramEnded)
+        const ps2x::vu1::AotResult result = aotStepPair(decoded);
+        if (result == ps2x::vu1::AotResult::ProgramEnded)
         {
             programEnded = true;
             break;
         }
-        if (result != suiko::vu1::AotResult::Continue)
+        if (result != ps2x::vu1::AotResult::Continue)
             break;
     }
 

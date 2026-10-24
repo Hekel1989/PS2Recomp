@@ -1,8 +1,8 @@
 #pragma once
 
-// SUIKO(pad-host-hooks): optional host hook that lets the embedding application
-// feed real controller/keyboard state into the PAD HLE (see docs/input.md).
-// The suikoden frontend pumps SDL3 events on the main thread and hands the
+// PS2X(pad-host-hooks): optional host hook that lets the embedding application
+// feed real controller/keyboard state into the PAD HLE.
+// A typical frontend pumps SDL3 events on the main thread and hands the
 // resulting DualShock 2 report to the game thread through this provider; the
 // header itself stays submodule-clean (no SDL/raylib types).
 //

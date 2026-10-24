@@ -1527,7 +1527,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
     const uint32_t rrw = m_transfer.trxreg.rrw;
     const uint32_t dsax = m_transfer.trxpos.dsax;
-    // SUIKO(perf): when the external PCSX2 GS owns local memory and presents,
+    // PS2X(perf): when the external PCSX2 GS owns local memory and presents,
     // the CPU rasterizer never reads its own VRAM without first refreshing it
     // from PCSX2 (syncLocalMemory), so writing the upload into this mirror is
     // redundant -- ~4% of the title CPU on the Legion.  Transfer state still

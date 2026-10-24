@@ -19,8 +19,8 @@ namespace
 
     inline void shareGsEvent(const GSRegisters *regs, const char *reason)
     {
-        if (suiko::diag::gsSyncEnabled() && regs != nullptr)
-            suiko::diag::gsEvent(regs->vsyncTick.load(std::memory_order_relaxed), reason);
+        if (ps2x::diag::gsSyncEnabled() && regs != nullptr)
+            ps2x::diag::gsEvent(regs->vsyncTick.load(std::memory_order_relaxed), reason);
     }
 
     GSPrimReg decodePrimRegister(uint64_t value)
@@ -654,7 +654,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
-    // SUIKO(diag): PS2X_DIAG_GIF_IMAGE=1 logs every arbiter GIF packet header.
+    // PS2X(diag): PS2X_DIAG_GIF_IMAGE=1 logs every arbiter GIF packet header.
     {
         static const bool s_diag = std::getenv("PS2X_DIAG_GIF_IMAGE") != nullptr;
         static std::atomic<unsigned> s_budget{600u};
@@ -669,7 +669,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                            << " nreg=0x" << ((tagLo >> 60) & 0xFu)
                                            << " taghi=0x" << tagHi
                                            << std::dec << std::endl);
-            // SUIKO(diag): dump first payload qwords to decode A_D format.
+            // PS2X(diag): dump first payload qwords to decode A_D format.
             static int s_adDumpBudget = 24;
             if (sizeBytes <= 0x1c0u && s_adDumpBudget-- > 0)
             {
@@ -772,7 +772,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
                 imageBytes = sizeBytes - offset;
-            // SUIKO(gs-xfer-trace): an IMAGE GIFtag whose payload is not fully
+            // PS2X(gs-xfer-trace): an IMAGE GIFtag whose payload is not fully
             // present in this packet (tag-only packet, or a payload cut at the
             // packet end). The hardware keeps the transfer open and consumes
             // the next qwords on the path as image data; note it so the
@@ -857,7 +857,7 @@ void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
     writeRegisterUnlocked(GS_REG_TRXPOS, trxpos);
     writeRegisterUnlocked(GS_REG_TRXREG, trxreg);
     writeRegisterUnlocked(GS_REG_TRXDIR, trxdir);
-    // SUIKO(diag): PS2X_DIAG_GIF_IMAGE=1 logs every native IMAGE upload with
+    // PS2X(diag): PS2X_DIAG_GIF_IMAGE=1 logs every native IMAGE upload with
     // its GS destination (PSM/FBP/FBW), size and first data bytes.
     {
         static const bool s_diag = std::getenv("PS2X_DIAG_GIF_IMAGE") != nullptr;
@@ -1587,7 +1587,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         }
         break;
     }
-    // SUIKO(gs-no-pseudo-privregs): A+D addresses 0x55-0x5f are undefined on
+    // PS2X(gs-no-pseudo-privregs): A+D addresses 0x55-0x5f are undefined on
     // the real GS and writes to them are ignored (PCSX2: GIFRegHandlerNull).
     // Upstream aliased 0x59-0x5f to DISPFB/DISPLAY/BGCOLOR, so a stray game
     // A+D write (Suikoden Tactics writes 0x5 to 0x5a) clobbered DISPLAY1 and
@@ -1685,7 +1685,7 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
-    // SUIKO(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every IMAGE transfer the
+    // PS2X(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every IMAGE transfer the
     // runtime performs -- native fast-path chains and generic GIF IMAGE tags
     // both funnel through here -- with the full transfer setup, the payload
     // qword count and an FNV-1a-64 hash of the payload bytes, so uploads can

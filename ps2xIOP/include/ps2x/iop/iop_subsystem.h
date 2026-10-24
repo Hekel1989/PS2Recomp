@@ -44,7 +44,7 @@ namespace ps2x::iop
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
 
-        // SUIKO: attach/detach the real SPU2 (see iop_spu2_host.h).
+        // PS2X: attach/detach the real SPU2 (see iop_spu2_host.h).
         void setSpu2Host(IopSpu2Host *host) noexcept;
 
     private:

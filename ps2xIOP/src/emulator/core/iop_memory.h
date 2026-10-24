@@ -51,7 +51,7 @@ namespace ps2x::iop::detail
 
         void reset();
 
-        // SUIKO(perf): the IOP interpreter executes every instruction through
+        // PS2X(perf): the IOP interpreter executes every instruction through
         // these accessors, so the plain-RAM case -- by far the common one --
         // is inline.  The old out-of-line call cost ~5% of the title CPU on
         // the Legion; everything unusual (scratch, hardware, SPU2, watch
@@ -164,7 +164,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
         [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }
 
-        // SUIKO: optional real SPU2. When set, the SPU2 register window and
+        // PS2X: optional real SPU2. When set, the SPU2 register window and
         // DMA channels 4/7 are routed to the host instead of the register
         // store / fake DMA-complete path below.
         void setSpu2Host(IopSpu2Host *host) noexcept { m_spu2Host = host; }

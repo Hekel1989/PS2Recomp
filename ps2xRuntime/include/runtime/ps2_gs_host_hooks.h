@@ -1,7 +1,7 @@
 #pragma once
 
-// SUIKO(gs-phase4): optional host hooks that let the embedding application
-// attach an external GS backend (see docs/gs-port-plan.md phase 4). The runtime
+// PS2X(gs-phase4): optional host hooks that let the embedding application
+// attach an external GS backend. The runtime
 // only calls these; it never requires them, and they must not contain any
 // PCSX2 types -- plain integers only, so this header stays submodule-clean.
 //
@@ -28,7 +28,7 @@ namespace Ps2GsHostHooks
         // tick is the scheduler's vsync counter (1-based).
         std::function<void(uint64_t tick)> vsync;
 
-        // SUIKO(gs-phase5): Called for each complete tagged GIF packet as the
+        // PS2X(gs-phase5): Called for each complete tagged GIF packet as the
         // GIF arbiter hands it to the GS frontend (drain), before the runtime's
         // own frontend parses it. path is the effective GIF path in PCSX2's
         // Transfer<n> slot semantics: 1 = PATH1 (VU1 XGKICK), 2 = PATH2 (GIF
@@ -38,7 +38,7 @@ namespace Ps2GsHostHooks
         // qwords * 16 bytes starting with the GIFtag and is only valid for the
         // duration of the call. Fires on the game thread.
         //
-        // SUIKO(gs-phase5b): continuation marks a DIRECT continuation: the
+        // PS2X(gs-phase5b): continuation marks a DIRECT continuation: the
         // packet's first qword is a GIFtag the runtime synthesized for its own
         // frontend because the original DIRECT payload was split at a DMA-chunk
         // boundary (see m_vif1PendingPath2ImageQwc). The raw continuation data
@@ -48,7 +48,7 @@ namespace Ps2GsHostHooks
         // continuation of that open packet instead of parsing it as a new tag.
         std::function<void(uint32_t path, const uint8_t *data, uint32_t qwords, bool continuation)> gifPacket;
 
-        // SUIKO(gs-phase5b): Called when the runtime's own GS frontend consumes
+        // PS2X(gs-phase5b): Called when the runtime's own GS frontend consumes
         // GIF qwords, with the same path numbering as gifPacket. Fires at every
         // consumption site: the arbiter drain, the native GIF fast paths, and
         // the sceGsPutDrawEnv register-pair path. The count is the number of
@@ -58,7 +58,7 @@ namespace Ps2GsHostHooks
         // everything the runtime frontend saw also reached its external GS.
         std::function<void(uint32_t path, uint32_t qwords)> gifConsume;
 
-        // SUIKO(gs-single-raster): Bring the runtime's CPU-side VRAM copy up to
+        // PS2X(gs-single-raster): Bring the runtime's CPU-side VRAM copy up to
         // date from the external GS before the guest reads it (local-to-host
         // IMAGE transfer or GS::ReadVram).  With a hardware GS attached the CPU
         // rasterizer is redundant for display; it is only needed for guest
@@ -66,7 +66,7 @@ namespace Ps2GsHostHooks
         std::function<void()> syncLocalMemory;
     };
 
-    // SUIKO(gs-single-raster): an embedding frontend that renders every packet
+    // PS2X(gs-single-raster): an embedding frontend that renders every packet
     // itself can switch off the redundant CPU rasterizer.  Drawing is still
     // parsed (register/transfer state stays correct); only pixel generation is
     // skipped.  Enabled by default so standalone PS2Recomp behaviour is

@@ -271,7 +271,7 @@ inline const Ps2EeWatchConfig &ps2EeWatchConfig()
     return config;
 }
 
-// SUIKO(perf): generated stores call this before ps2TraceGuestWrite(); inlining
+// PS2X(perf): generated stores call this before ps2TraceGuestWrite(); inlining
 // the disarmed case keeps the diagnostic out of the hot store path (the
 // out-of-line call cost ~1.5% of the title CPU on the Legion).
 inline bool ps2EeWatchEnabled()
@@ -293,7 +293,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     if (watch.enabled)
     {
         const uint32_t writeSize = size != 0u ? size : 4u;
-        // SUIKO(ee-watch-alias): fold the RAM mirrors (kseg0/kseg1 and the
+        // PS2X(ee-watch-alias): fold the RAM mirrors (kseg0/kseg1 and the
         // 0x20000000/0x30000000 uncached views) onto the physical address so
         // a watch on 0x004c7400 also sees writes through 0x304c7400 etc.
         uint32_t matchAddr = guestAddr;
@@ -364,7 +364,7 @@ public:
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
-    // SUIKO: attach the real SPU2 host to the IOP (nullptr = original
+    // PS2X: attach the real SPU2 host to the IOP (nullptr = original
     // register-store/fake-DMA behaviour).
     void setIopSpu2Host(ps2x::iop::IopSpu2Host *host);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
@@ -530,14 +530,14 @@ public:
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
-    // SUIKO(movie-audio): true while an MPEG movie is being demuxed.  Host
+    // PS2X(movie-audio): true while an MPEG movie is being demuxed.  Host
     // stall debt must not be replayed into the IOP/SPU2 clock while the movie
     // is playing: the guest audio producer did not run for it, and replaying
     // it drains the 24 KiB IOP ring (Fixed 36).
     void setMovieAudioActive(bool active) noexcept { m_movieAudioActive.store(active, std::memory_order_relaxed); }
     [[nodiscard]] bool movieAudioActive() const noexcept { return m_movieAudioActive.load(std::memory_order_relaxed); }
 
-    // SUIKO(desched-repay): the game can leave the MPEG object alive for a
+    // PS2X(desched-repay): the game can leave the MPEG object alive for a
     // while after the movie has been skipped/ended (it only calls
     // sceMpegReset/Delete later).  Track when the demux/picture calls last
     // ran so the pacing code can stop treating a stale "movie active" flag as
@@ -631,7 +631,7 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
-    // SUIKO(gs-phase6): true when Ps2PresentHooks::presentationDisabled() was
+    // PS2X(gs-phase6): true when Ps2PresentHooks::presentationDisabled() was
     // set at initialize() time: no raylib window, run() uses the host-tick loop.
     bool m_headlessPresentation = false;
 

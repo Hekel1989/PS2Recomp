@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-// SUIKO(vu1-inventory): PS2X_VU1_INVENTORY=<dir>
+// PS2X(vu1-inventory): PS2X_VU1_INVENTORY=<dir>
 //
 // Observes the VU1 microprograms the game actually runs.  The recorder is
 // created lazily on the first call to instance(); when the environment

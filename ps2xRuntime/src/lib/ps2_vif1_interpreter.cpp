@@ -67,7 +67,7 @@ namespace
             {
                 payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
                 const uint64_t availableBytes = sizeBytes - offset;
-                // SUIKO(gs-xfer-trace): log every IMAGE GIFtag seen in a VIF1
+                // PS2X(gs-xfer-trace): log every IMAGE GIFtag seen in a VIF1
                 // DIRECT payload, whether or not its data is present, so a
                 // font/CLUT upload can be spotted even when the parser later
                 // loses track of it.
@@ -100,7 +100,7 @@ namespace
         return 0u;
     }
 
-    // --- SUIKO(vu1-trace): PS2X_VU1_TRACE=1 -----------------------------------
+    // --- PS2X(vu1-trace): PS2X_VU1_TRACE=1 -----------------------------------
     // Log every VIF1 command that touches VU1: MPG (microcode load),
     // MSCAL/MSCALF/MSCNT (microprogram start).
     bool vu1TraceEnabled()
@@ -120,7 +120,7 @@ namespace
         return h;
     }
 
-    // --- SUIKO(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
+    // --- PS2X(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
     // Log VIF1 DIRECT/DIRECTHL payloads whose GIFtags declare more data than
     // the DIRECT carries (the GIF FIFO would expect the remainder from later
     // data on the path) or that were cut short at the DMA chunk boundary.
@@ -257,7 +257,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         if (irq)
             vif0_regs.stat |= (1u << 11);
 
-        // SUIKO(gs-xfer-trace): log the VIF0 command stream so uploads sent
+        // PS2X(gs-xfer-trace): log the VIF0 command stream so uploads sent
         // via VIF0 (e.g. font/CLUT DIRECTs) can be spotted even though VIF0
         // DIRECT is not forwarded to the GIF today.
         {
@@ -431,7 +431,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else
         {
-            // SUIKO(gs-xfer-trace): VIF0 stops here on DIRECT/DIRECTHL/unknown
+            // PS2X(gs-xfer-trace): VIF0 stops here on DIRECT/DIRECTHL/unknown
             // opcodes; everything after this point in the chunk is dropped.
             static const bool s_vif0Trace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
             static int s_vif0BreakBudget = 2000;
@@ -465,7 +465,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
-    // SUIKO(dma-chain-trace): after a DIRECT was cut at the previous chunk's
+    // PS2X(dma-chain-trace): after a DIRECT was cut at the previous chunk's
     // end, dump the head of this chunk (it holds the continuation bytes).
     if (s_dumpNextChunkHead)
     {
@@ -476,7 +476,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     uint32_t pos = 0;
 
-    // SUIKO(gs-xfer-trace): compact per-command stream so IMAGE-tag data
+    // PS2X(gs-xfer-trace): compact per-command stream so IMAGE-tag data
     // placement can be reconstructed across DMA-chunk boundaries.
     const bool xferTrace = std::getenv("PS2X_GS_XFER_TRACE") != nullptr;
     if (xferTrace)
@@ -488,7 +488,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        // SUIKO(font-upload): continuation of a DIRECT that was cut at the
+        // PS2X(font-upload): continuation of a DIRECT that was cut at the
         // previous chunk's end: the raw bytes at this chunk's start continue the
         // GIF IMAGE transfer that is still waiting for data.
         if (m_vif1PendingPath2ImageQwc != 0u && !m_vif1PendingPath2FromNextDirect)
@@ -510,7 +510,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 (static_cast<uint64_t>(kGifFmtImage) << 58);
             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
             std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            // SUIKO(gs-phase5b): directContinuation=true tells the host GS hook
+            // PS2X(gs-phase5b): directContinuation=true tells the host GS hook
             // that the GIFtag above is synthesized for the runtime's own
             // frontend; the raw data after it continues the DIRECT packet that
             // was split at the DMA-chunk boundary (see ps2_gs_host_hooks.h).
@@ -552,7 +552,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         if (irq)
             vif1_regs.stat |= (1u << 11); // INT
 
-        // SUIKO(font-upload): an over-declaring IMAGE tag left the GIF path
+        // PS2X(font-upload): an over-declaring IMAGE tag left the GIF path
         // waiting for qwords. On hardware the next DIRECT/DIRECTHL's payload
         // supplies them; the VIF command word itself never reaches the GIF
         // path. Feed that payload as the continuation instead of submitting it
@@ -813,7 +813,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                // SUIKO(dma-chain-trace): log DIRECTs whose GIFtags
+                // PS2X(dma-chain-trace): log DIRECTs whose GIFtags
                 // over-declare the payload or that were cut at the chunk end.
                 if (directTraceEnabled() && directTraceBudget())
                 {
@@ -837,7 +837,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             s_dumpNextChunkHead = true;
                     }
                 }
-                // SUIKO(gs-xfer-trace): log the DIRECT packet head so IMAGE
+                // PS2X(gs-xfer-trace): log the DIRECT packet head so IMAGE
                 // uploads carried this way can be traced to their source bytes.
                 if (xferTrace)
                 {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// SUIKO: host interface for the real SPU2 core. ps2xIOP owns the IOP side
+// PS2X: host interface for the real SPU2 core. ps2xIOP owns the IOP side
 // (register window 0x1F900000-0x1F9007FF, SPU2 DMA channels 4 and 7, INTC
 // lines); the host implements the SPU2 itself. With no host attached the
 // emulator keeps its original register-store / fake-DMA behaviour.

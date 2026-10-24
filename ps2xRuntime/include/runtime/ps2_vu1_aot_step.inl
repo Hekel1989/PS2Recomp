@@ -5,7 +5,7 @@
 
 #include "runtime/ps2_vu1_inventory.h"
 
-// SUIKO(vu1-aot-v2): build-time specialised pair step.
+// PS2X(vu1-aot-v2): build-time specialised pair step.
 //
 // The generator instantiates aotStepConstant<kPc, kPair>() once per microcode
 // pair.  Every field of the decoded pair, the pc and the branch displacement
@@ -17,7 +17,7 @@
 // Included at the end of ps2_vu1.h; the definitions are member templates and
 // therefore have access to the interpreter's private scheduler state.
 
-template <uint32_t kPc, const suiko::vu1::DecodedPair &D>
+template <uint32_t kPc, const ps2x::vu1::DecodedPair &D>
 inline uint64_t VU1Interpreter::pairReadyCycleConstant() const
 {
     // Plain compare/select instead of std::max: clang vectorises a 4-lane
@@ -106,7 +106,7 @@ inline uint64_t VU1Interpreter::pairReadyCycleConstant() const
     return ready;
 }
 
-template <const suiko::vu1::DecodedPair &D>
+template <const ps2x::vu1::DecodedPair &D>
 inline void VU1Interpreter::markPairWritesConstant()
 {
     const VfAccess lowerWrite = D.lowerUsage.vfWrite;
@@ -151,13 +151,13 @@ inline void VU1Interpreter::markPairWritesConstant()
     }
 }
 
-template <uint32_t kPc, const suiko::vu1::DecodedPair &D>
-SUIKO_VU1_INLINE suiko::vu1::AotResult VU1Interpreter::aotStepConstant()
+template <uint32_t kPc, const ps2x::vu1::DecodedPair &D>
+PS2X_VU1_INLINE ps2x::vu1::AotResult VU1Interpreter::aotStepConstant()
 {
     if (m_stopRequested)
-        return suiko::vu1::AotResult::StopRequested;
+        return ps2x::vu1::AotResult::StopRequested;
     if (m_cycle >= m_budgetEnd)
-        return suiko::vu1::AotResult::BudgetEnded;
+        return ps2x::vu1::AotResult::BudgetEnded;
     // No commit here: advanceOneCycle() at the end of the previous pair (or
     // advanceTo() during a stall) already committed everything that became
     // visible at this cycle.  aotStepPair() keeps its own check for the
@@ -168,7 +168,7 @@ SUIKO_VU1_INLINE suiko::vu1::AotResult VU1Interpreter::aotStepConstant()
         m_stopReason = "reserved";
         reportReservedInstruction(D.upperUsage.reserved,
                                   D.upperUsage.reserved ? D.upper : D.lower);
-        return suiko::vu1::AotResult::StopRequested;
+        return ps2x::vu1::AotResult::StopRequested;
     }
     else
     {
@@ -183,7 +183,7 @@ SUIKO_VU1_INLINE suiko::vu1::AotResult VU1Interpreter::aotStepConstant()
                 advanceTo(readyCycle);
         }
         if (m_cycle >= m_budgetEnd)
-            return suiko::vu1::AotResult::BudgetEnded;
+            return ps2x::vu1::AotResult::BudgetEnded;
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;
@@ -351,8 +351,8 @@ SUIKO_VU1_INLINE suiko::vu1::AotResult VU1Interpreter::aotStepConstant()
         if (programEnded)
         {
             m_stopReason = m_state.stoppedByD ? "d-bit" : m_state.stoppedByT ? "t-bit" : "e-bit";
-            return suiko::vu1::AotResult::ProgramEnded;
+            return ps2x::vu1::AotResult::ProgramEnded;
         }
-        return suiko::vu1::AotResult::Continue;
+        return ps2x::vu1::AotResult::Continue;
     }
 }

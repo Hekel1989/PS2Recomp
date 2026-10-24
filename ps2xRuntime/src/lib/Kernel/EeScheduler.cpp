@@ -26,7 +26,7 @@
 
 namespace
 {
-    // SUIKO(dmac-dstat-mask): DMAC channels 0..9 and their D_STAT register.
+    // PS2X(dmac-dstat-mask): DMAC channels 0..9 and their D_STAT register.
     constexpr uint32_t kDmacChannelCount = 10u;
     constexpr uint32_t kDStatAddress = 0x1000E010u;
 
@@ -2062,7 +2062,7 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
     {
         if (dmac && cause < kDmacChannelCount)
         {
-            // SUIKO(dmac-dstat-mask): the channel masks live in the hardware
+            // PS2X(dmac-dstat-mask): the channel masks live in the hardware
             // D_STAT register (CIM, bits 16..25), which is also what games
             // read and toggle directly. Enable/DisableDmac flip the bit only
             // when it differs from the request (D_STAT mask bits toggle on
@@ -2128,7 +2128,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (dmac && cause < kDmacChannelCount)
     {
-        // SUIKO(dmac-dstat-mask): channel interrupts are gated by D_STAT CIM.
+        // PS2X(dmac-dstat-mask): channel interrupts are gated by D_STAT CIM.
         const uint32_t cim = (m_runtime.memory().readIORegister(kDStatAddress) >> 16u) & 0x3FFu;
         mask = (mask & ~0x3FFu) | cim;
     }
@@ -2909,14 +2909,14 @@ void EeScheduler::processEvent(const EeEvent &event)
         {
             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
         }
-        // SUIKO(gs-phase4): tick the optional external GS backend (no-op unless
+        // PS2X(gs-phase4): tick the optional external GS backend (no-op unless
         // the host registered hooks; see runtime/ps2_gs_host_hooks.h).
         if (const auto &gsHooks = Ps2GsHostHooks::hooks(); gsHooks.vsync)
         {
             gsHooks.vsync(m_vsyncTick);
         }
-        if (suiko::diag::gsSyncEnabled())
-            suiko::diag::gsEvent(m_vsyncTick, "present");
+        if (ps2x::diag::gsSyncEnabled())
+            ps2x::diag::gsEvent(m_vsyncTick, "present");
         writeGuestU32(m_vsyncFlagAddress, 1u);
         if (m_vsyncTickAddress != 0u)
         {

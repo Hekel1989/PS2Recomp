@@ -39,14 +39,14 @@ namespace ps2_stubs
     void resetSifState();
 }
 
-// SUIKO(profiler): the game frontend's in-game sampler registers every
+// PS2X(profiler): the game frontend's in-game sampler registers every
 // significant host thread itself.  Weak so the runtime and its tests still
 // link when the profiling TU is absent.
 #if defined(__GNUC__) || defined(__clang__)
-extern "C" void suikoProfRegisterThread(const char *name) __attribute__((weak));
-#define SUIKO_HAS_PROF_HOOK 1
+extern "C" void ps2xProfRegisterThread(const char *name) __attribute__((weak));
+#define PS2X_HAS_PROF_HOOK 1
 #else
-#define SUIKO_HAS_PROF_HOOK 0
+#define PS2X_HAS_PROF_HOOK 0
 #endif
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -726,7 +726,7 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    // SUIKO(gs-phase5): hand each complete tagged GIF packet to the optional
+    // PS2X(gs-phase5): hand each complete tagged GIF packet to the optional
     // external GS backend (see runtime/ps2_gs_host_hooks.h) before the
     // runtime's own frontend parses it. The hook's path follows PCSX2's
     // Transfer<n> slot semantics: PS2Recomp models VIF1 DIRECT/DIRECTHL as
@@ -742,7 +742,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                         {
                                             gsHooks.gifPacket(gsPath, data, size / 16u, continuation);
                                         }
-                                        // SUIKO(gs-phase5b): the runtime's own
+                                        // PS2X(gs-phase5b): the runtime's own
                                         // frontend consumes these qwords now.
                                         // A continuation's synthesized GIFtag is
                                         // a runtime artifact, not GIF data, so
@@ -756,11 +756,11 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     const bool shareCapture = suiko::diag::vu1OverlapEnabled();
+                                     const bool shareCapture = ps2x::diag::vu1OverlapEnabled();
                                      const uint64_t shareVsync =
                                          shareCapture ? m_memory.gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
                                      if (shareCapture)
-                                         suiko::diag::vu1KickBegin(shareVsync);
+                                         ps2x::diag::vu1KickBegin(shareVsync);
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -778,14 +778,14 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u);
                                      if (shareCapture)
-                                         suiko::diag::vu1KickEnd(shareVsync); });
+                                         ps2x::diag::vu1KickEnd(shareVsync); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     const bool shareCapture = suiko::diag::vu1OverlapEnabled();
+                                     const bool shareCapture = ps2x::diag::vu1OverlapEnabled();
                                      const uint64_t shareVsync =
                                          shareCapture ? m_memory.gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
                                      if (shareCapture)
-                                         suiko::diag::vu1KickBegin(shareVsync);
+                                         ps2x::diag::vu1KickBegin(shareVsync);
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -803,7 +803,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u);
                                      if (shareCapture)
-                                         suiko::diag::vu1KickEnd(shareVsync); });
+                                         ps2x::diag::vu1KickEnd(shareVsync); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -822,7 +822,7 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
-        // SUIKO(vu1-inventory): create the capture/JSON even when the phase
+        // PS2X(vu1-inventory): create the capture/JSON even when the phase
         // runs no VU1 microprogram at all (the menu does not).
         (void)VU1InventoryRecorder::instance();
 
@@ -831,7 +831,7 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
-        // SUIKO(gs-phase6): when the host presents through its own window (the
+        // PS2X(gs-phase6): when the host presents through its own window (the
         // PCSX2 GS Vulkan swapchain, see runtime/ps2_present_hooks.h) no raylib
         // window is opened; the debug UI (raylib+imgui based) stays off too.
         m_headlessPresentation = []
@@ -2620,7 +2620,7 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer (skipped when the host presents;
-    // there is no raylib GL context to upload it to, SUIKO gs-phase6).
+    // there is no raylib GL context to upload it to, PS2X gs-phase6).
     Texture2D frameTex{};
     if (!m_headlessPresentation)
     {
@@ -2634,9 +2634,9 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
-#if SUIKO_HAS_PROF_HOOK
-        if (suikoProfRegisterThread != nullptr)
-            suikoProfRegisterThread("EE/game");
+#if PS2X_HAS_PROF_HOOK
+        if (ps2xProfRegisterThread != nullptr)
+            ps2xProfRegisterThread("EE/game");
 #endif
         try
         {
@@ -2763,7 +2763,7 @@ void PS2Runtime::run()
                     out.write(reinterpret_cast<const char *>(vram), static_cast<std::streamsize>(PS2_GS_VRAM_SIZE));
                     RUNTIME_LOG("[diag:statedump] wrote " << name << std::endl);
                 }
-                // SUIKO(diag-dump-vu1): VU1 micro/data memory. The short names
+                // PS2X(diag-dump-vu1): VU1 micro/data memory. The short names
                 // match tools/cmp_vu1.py's expectations and sit next to
                 // ee_<vsync>.bin; the contents are the same 16 KiB VU1 code and
                 // data memories PCSX2 stores as vu1MicroMem.bin/vu1Memory.bin.
@@ -2840,7 +2840,7 @@ void PS2Runtime::run()
         }
         if (m_headlessPresentation)
         {
-            // SUIKO(gs-phase6): the host owns presentation (PCSX2 GS swapchain
+            // PS2X(gs-phase6): the host owns presentation (PCSX2 GS swapchain
             // window). Pump its events via mainTick; a true return means the
             // window closed. The game thread paces itself through the VBlank
             // scheduler, so a short sleep here is all the pacing this loop needs.
@@ -3007,7 +3007,7 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    if (!m_headlessPresentation) // SUIKO(gs-phase6): no raylib window in host-presented mode
+    if (!m_headlessPresentation) // PS2X(gs-phase6): no raylib window in host-presented mode
     {
         UnloadTexture(frameTex);
         CloseWindow();

@@ -23,14 +23,14 @@ namespace
 
     inline void shareVu1Observe(const GSRegisters &regs, const char *reason)
     {
-        if (suiko::diag::vu1OverlapEnabled())
-            suiko::diag::vu1Observe(shareVsync(regs), reason);
+        if (ps2x::diag::vu1OverlapEnabled())
+            ps2x::diag::vu1Observe(shareVsync(regs), reason);
     }
 
     inline void shareGsEvent(const GSRegisters &regs, const char *reason)
     {
-        if (suiko::diag::gsSyncEnabled())
-            suiko::diag::gsEvent(shareVsync(regs), reason);
+        if (ps2x::diag::gsSyncEnabled())
+            ps2x::diag::gsEvent(shareVsync(regs), reason);
     }
 
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
@@ -162,7 +162,7 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    // SUIKO(gs-phase4): forward a completed GS privileged-register write to the
+    // PS2X(gs-phase4): forward a completed GS privileged-register write to the
     // optional host hooks (see runtime/ps2_gs_host_hooks.h). value is the full
     // 64-bit register contents after PS2Recomp semantics were applied.
     inline void notifyGsPrivRegWrite(uint32_t regOff, uint64_t value)
@@ -294,7 +294,7 @@ namespace
         return 0u;
     }
 
-    // --- SUIKO(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
+    // --- PS2X(dma-chain-trace): PS2X_DMA_CHAIN_TRACE=1 ----------------------
     // Diagnostic for GIF packets that reach the frontend with less data than
     // their GIFtags declare. When enabled, every GIF submission whose trailing
     // GIFtag over-declares its payload is logged with full provenance: the DMA
@@ -1176,7 +1176,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         throw std::runtime_error("Unaligned 64-bit write at address: 0x" + std::to_string(address));
     }
 
-    // SUIKO(diag): dump raw GIF_AD page writes (0x12000000-0x120000FF).
+    // PS2X(diag): dump raw GIF_AD page writes (0x12000000-0x120000FF).
     if ((address & 0xFFFFFF00u) == 0x12000000u)
     {
         static const bool s_diagAd = std::getenv("PS2X_DIAG_AD") != nullptr;
@@ -1404,7 +1404,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if ((status & mask) != 0u)
             next |= (1u << 31);
         m_ioRegisters[address] = next;
-        // SUIKO(diag-dmac-trace): direct D_STAT writes that touch the masks.
+        // PS2X(diag-dmac-trace): direct D_STAT writes that touch the masks.
         static const bool s_dmacTrace = std::getenv("PS2X_DMAC_TRACE") != nullptr;
         if (s_dmacTrace && (value >> 16) != 0u)
         {
@@ -1519,7 +1519,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 {
                     if (qwCount == 0)
                         return;
-                    // SUIKO(dma-chain-trace): normal-mode (MADR/QWC) GIF
+                    // PS2X(dma-chain-trace): normal-mode (MADR/QWC) GIF
                     // transfer; log it when its GIFtags over-declare.
                     if (channelBase == 0x1000A000u && dmaChainTraceEnabled() && dmaChainTraceBudget())
                     {
@@ -1564,7 +1564,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
 
-                // SUIKO(vif1-kick-trace): PS2X_VIF1_KICK_TRACE=1 logs every VIF1
+                // PS2X(vif1-kick-trace): PS2X_VIF1_KICK_TRACE=1 logs every VIF1
                 // channel start (mode, MADR/QWC/TADR) and, in chain mode, each tag.
                 static const bool s_vif1KickTrace = std::getenv("PS2X_VIF1_KICK_TRACE") != nullptr;
                 const bool vif1KickTrace = s_vif1KickTrace && channelBase == 0x10009000u;
@@ -1646,7 +1646,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
-                    // SUIKO(dma-chain-trace): record the walk so an
+                    // PS2X(dma-chain-trace): record the walk so an
                     // over-declared GIF packet can be traced back to the chain
                     // that produced it (see dmaChainTraceEnabled()).
                     const bool chainTrace =
@@ -1987,7 +1987,7 @@ void PS2Memory::processPendingTransfers()
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
-        // SUIKO(diag): PS2X_DIAG_GIF_IMAGE=1 logs every PATH3 IMAGE-mode GIF
+        // PS2X(diag): PS2X_DIAG_GIF_IMAGE=1 logs every PATH3 IMAGE-mode GIF
         // submission with its guest source address and first bytes, so font
         // texture uploads can be matched against their EE source buffers.
         {
@@ -2301,19 +2301,19 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     // A PATH2/PATH3 packet submitted while a VU1 program is outstanding is an
     // ordering point for a VU1 thread: PATH1 XGKICK output must stay in front
-    // of it (see docs/multicore-plan.md).  PS2X_VU1_OVERLAP=2 ignores it, to
+    // of it.  PS2X_VU1_OVERLAP=2 ignores it, to
     // measure the overlap available if the GS queue keeps that order itself.
-    if (pathId != GifPathId::Path1 && suiko::diag::vu1OverlapEnabled() &&
-        !suiko::diag::vu1OverlapIgnoreGif())
+    if (pathId != GifPathId::Path1 && ps2x::diag::vu1OverlapEnabled() &&
+        !ps2x::diag::vu1OverlapIgnoreGif())
     {
         uint64_t tagLo = 0u;
         std::memcpy(&tagLo, data, sizeof(tagLo));
         const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 0x3u);
-        suiko::diag::vu1Observe(shareVsync(gs_regs),
+        ps2x::diag::vu1Observe(shareVsync(gs_regs),
                                 (flg == 2u || flg == 3u) ? "gifimg" : "gifpath");
     }
 
-    // SUIKO(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every tagged packet as it
+    // PS2X(gs-xfer-trace): PS2X_GS_XFER_TRACE=1 logs every tagged packet as it
     // enters the GIF arbiter, with the submitting path (p2 = VIF1
     // DIRECT/DIRECTHL, p3 = GIF DMA) and the leading GIFtag header, so each
     // IMAGE data burst seen by the GS frontend can be attributed to the DMA
@@ -2490,7 +2490,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     if (!decodeSetupPayload(setupPayload, setupRegs))
         return false;
 
-    // SUIKO(gs-xfer-trace): the chain looks like an IMAGE upload setup from
+    // PS2X(gs-xfer-trace): the chain looks like an IMAGE upload setup from
     // here on; if a later structural check rejects it, the upload is silently
     // handed to the generic walker instead. Log such near-misses and the
     // accepted chain's source addresses so image uploads can be traced
@@ -2592,7 +2592,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
 
-    // SUIKO(gs-phase5b): this fast path consumes the GIF DMA chain before the
+    // PS2X(gs-phase5b): this fast path consumes the GIF DMA chain before the
     // arbiter, so the arbiter's gifPacket hook never sees it. Feed the host GS
     // the PATH2 (GIF DMA) byte stream this chain represents: the A+D setup
     // packet (GIFtag + 4 A+D qwords), the IMAGE GIFtag, then the image
@@ -2615,7 +2615,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
         }
     }
 
-    // SUIKO(dma-chain-trace): this fast path consumes the chain before the
+    // PS2X(dma-chain-trace): this fast path consumes the chain before the
     // generic walker, so note it when tracing (the over-declaration, if any,
     // would then be inside the consumed payload, not the walk).
     if (dmaChainTraceEnabled())
@@ -2701,7 +2701,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
         return false;
 
-    // SUIKO(gs-phase5b): mirror the consumed packet to the host GS (see the
+    // PS2X(gs-phase5b): mirror the consumed packet to the host GS (see the
     // image-upload fast path above for why the arbiter hook misses these).
     // validatePackedGifPacket guarantees a complete PACKED packet, so it can
     // be handed to the GS unchanged.
@@ -2714,7 +2714,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
         gsHooks.gifConsume(2u, payloadBytes / 16u);
     }
 
-    // SUIKO(dma-chain-trace): note the fast-path consumption (see above).
+    // PS2X(dma-chain-trace): note the fast-path consumption (see above).
     if (dmaChainTraceEnabled())
     {
         std::fprintf(stderr, "[dma-chain] GIF fast PACKED consumed tadr=0x%08x qwc=%u\n", tadr, tag.qwc);
@@ -2750,8 +2750,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
-    if (suiko::diag::vu1OverlapEnabled() && address == 0x10003C00u)
-        suiko::diag::vu1Observe(shareVsync(gs_regs), "vif1stat");
+    if (ps2x::diag::vu1OverlapEnabled() && address == 0x10003C00u)
+        ps2x::diag::vu1Observe(shareVsync(gs_regs), "vif1stat");
 
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;

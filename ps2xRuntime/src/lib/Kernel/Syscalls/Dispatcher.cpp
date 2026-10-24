@@ -11,7 +11,7 @@ namespace ps2_syscalls
             return true;
         }
 
-        // SUIKO(diag-dmac-trace): PS2X_DMAC_TRACE=1 logs the DMAC/INTC handler
+        // PS2X(diag-dmac-trace): PS2X_DMAC_TRACE=1 logs the DMAC/INTC handler
         // and enable/disable syscalls with their arguments and caller.
         {
             static const bool s_dmacTrace = std::getenv("PS2X_DMAC_TRACE") != nullptr;

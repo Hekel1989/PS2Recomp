@@ -1,4 +1,4 @@
-// SUIKO(vu1-inventory): PS2X_VU1_INVENTORY=<dir>
+// PS2X(vu1-inventory): PS2X_VU1_INVENTORY=<dir>
 //
 // Captures the VU1 microprograms the game runs and aggregates, per 16 KiB
 // micro-memory image and per start PC, call counts, executed pairs, VU1

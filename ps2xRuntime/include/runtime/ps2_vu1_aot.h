@@ -6,12 +6,12 @@
 
 class VU1Interpreter;
 
-// SUIKO(vu1-aot): shared types for the build-time compiled VU1 microprograms.
+// PS2X(vu1-aot): shared types for the build-time compiled VU1 microprograms.
 //
 // The generator (tools/vu1_aot.py) emits a constexpr DecodedPair table per
 // program.  The interpreter uses the same types for its decoded-pair cache, so
 // generated and interpreted execution feed identical data to the step routine.
-namespace suiko::vu1
+namespace ps2x::vu1
 {
     enum class Pipeline : uint8_t
     {
@@ -99,6 +99,6 @@ namespace suiko::vu1
 
 // The generated registry defines this strongly; the runtime provides a weak
 // no-op so a build without generated VU1 code still links.
-extern "C" void suikoVu1RegisterGeneratedPrograms();
+extern "C" void ps2xVu1RegisterGeneratedPrograms();
 
 #endif

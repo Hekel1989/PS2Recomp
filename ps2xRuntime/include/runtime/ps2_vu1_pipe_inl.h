@@ -1,4 +1,4 @@
-// SUIKO(vu1-aot-v2): hot pipeline enqueue helpers.
+// PS2X(vu1-aot-v2): hot pipeline enqueue helpers.
 //
 // Moved out of ps2_vu1_core.cpp so generated aotStepConstant<kPc, Pair>()
 // instantiations can inline them with constant register/lane/latency values.
@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <bit>
 
-SUIKO_VU1_INLINE void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+PS2X_VU1_INLINE void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
     const uint32_t slot = static_cast<uint32_t>(std::countr_zero(
         static_cast<uint16_t>(~m_storeValid) & ((1u << kMaxPendingStores) - 1u)));
@@ -28,7 +28,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::queueStore(uint32_t address, const uint32_
     reportReservedInstruction(false, 0xFFFFFFFCu);
 }
 
-SUIKO_VU1_INLINE void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+PS2X_VU1_INLINE void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
                                   const float value[4], uint32_t latency)
 {
     if (reg == 0u || laneMask == 0u)
@@ -58,7 +58,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask
     reportReservedInstruction(false, 0xFFFFFFF7u);
 }
 
-SUIKO_VU1_INLINE void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+PS2X_VU1_INLINE void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
 {
     if (reg == 0u)
         return;
@@ -82,7 +82,7 @@ SUIKO_VU1_INLINE void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, u
     reportReservedInstruction(false, 0xFFFFFFF6u);
 }
 
-SUIKO_VU1_INLINE void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency)
+PS2X_VU1_INLINE void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency)
 {
     if (laneMask == 0u)
         return;

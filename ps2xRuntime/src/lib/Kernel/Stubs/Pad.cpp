@@ -42,7 +42,7 @@ namespace ps2_stubs
             uint8_t ry = kPadAnalogCenter;
             uint8_t lx = kPadAnalogCenter;
             uint8_t ly = kPadAnalogCenter;
-            // SUIKO(pad-host-hooks): optional explicit pressure bytes (order of
+            // PS2X(pad-host-hooks): optional explicit pressure bytes (order of
             // report bytes 8..19: right left up down triangle circle cross
             // square l1 l2 r1 r2). When set, pressure mode reports these
             // instead of the digital 0xFF/0x00 derived from buttons.
@@ -383,7 +383,7 @@ namespace ps2_stubs
             {
                 return 0u;
             }
-            // SUIKO(pad-host-hooks): explicit host pressure wins over the
+            // PS2X(pad-host-hooks): explicit host pressure wins over the
             // digital derivation.
             if (state.hasPressure)
             {
@@ -453,8 +453,8 @@ namespace ps2_stubs
                 }
             }
 
-            // SUIKO(pad-host-hooks): the embedding app may supply the pad state
-            // (suikoden's src/input: SDL3 gamepad/keyboard -> DualShock report,
+            // PS2X(pad-host-hooks): the embedding app may supply the pad state
+            // (e.g. SDL3 gamepad/keyboard -> DualShock report,
             // handed over thread-safely). The script below still overrides
             // port 0, so scripted runs stay deterministic.
             bool usedHostProvider = false;
@@ -730,7 +730,7 @@ namespace ps2_stubs
             setReturnS32(ctx, 0);
             return;
         case 4: // PAD_MODETABLE
-            // SUIKO(pad-mode-table): a DualShock 2 advertises both its digital
+            // PS2X(pad-mode-table): a DualShock 2 advertises both its digital
             // (id 4 / report 0x41) and analog (id 7 / report 0x73) modes. The
             // game's pad init walks this table looking for id 7 and only leaves
             // its setup state once it can call scePadSetMainMode with that
