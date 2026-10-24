@@ -2,6 +2,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <cstdlib>
 #include <map>
 #include <iostream>
 #include <exception>
@@ -125,10 +126,14 @@ public:
         int failedCount = 0;
         int totalTests = 0;
 
+        // MINITEST_SUITE=<substring>: run only the suites whose name contains it.
+        const char* suiteFilter = std::getenv("MINITEST_SUITE");
         for (auto& c : m_cases)
         {
             const std::string& suiteName = c.first;
             const TestCaseCallback& suiteCallback = c.second;
+            if (suiteFilter != nullptr && suiteName.find(suiteFilter) == std::string::npos)
+                continue;
 
             std::cout << "\n[Suite]: " << suiteName << std::endl;
 
