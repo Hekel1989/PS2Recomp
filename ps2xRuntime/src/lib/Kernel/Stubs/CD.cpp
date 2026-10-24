@@ -450,8 +450,12 @@ namespace ps2_stubs
 
     void sceCdDiskReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        cdCallTrace("sceCdDiskReady", 2, ctx->pc);
-        setReturnS32(ctx, 2);
+        // Real hardware reports "ready" (2) whenever the drive can accept a
+        // read (spin, pause, stopped); only a busy drive (reading, seeking)
+        // or an unusable disc state reports SCECdNotReady (0).
+        const uint32_t ready = (g_cdDriveState == 2u || g_cdDriveState == 0x0au || g_cdDriveState == 0u) ? 2u : 0u;
+        cdCallTrace("sceCdDiskReady", static_cast<int32_t>(ready), ctx->pc);
+        setReturnS32(ctx, static_cast<int32_t>(ready));
     }
 
     void sceCdGetDiskType(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
