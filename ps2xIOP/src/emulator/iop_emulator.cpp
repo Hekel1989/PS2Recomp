@@ -129,6 +129,7 @@ namespace ps2x::iop::detail
 
         void reset()
         {
+            rpcLoops.clear();
             memory.reset();
             if (const char *watch = std::getenv("PS2X_IOP_WATCH"); watch != nullptr)
             {
@@ -509,6 +510,21 @@ namespace ps2x::iop::detail
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
+            if (iequals(call.library, "sifcmd") && call.ordinal == 22u) // sceSifRpcLoop(queue)
+            {
+                // PS2X(iop-rpc-thread): the calling thread becomes the queue's
+                // server and loops at kRpcLoopSentinel (stepRpcLoop), running
+                // each queued handler on its own stack.
+                IopThread *thread = kernel.currentThread();
+                if (thread != nullptr && &thread->cpu == &cpu)
+                {
+                    rpc.bindLoopThread(cpu.gpr[4], thread->id);
+                    rpcLoops[thread->id] = RpcLoopState{cpu.gpr[4], (cpu.gpr[29] - 0x40u) & ~15u, 0u};
+                    cpu.pc = kRpcLoopSentinel;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
+            }
             if (iequals(call.library, "sifcmd"))
             {
                 return rpc.dispatchSifCmdImport(call.ordinal, cpu)
@@ -611,6 +627,47 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // One pass of sceSifRpcLoop on the server thread: send the reply of
+        // the handler that just returned, start the next queued handler, or
+        // sleep until a request wakes the thread (as OpenPS2BIOS and Play! do).
+        bool stepRpcLoop(CpuState &cpu)
+        {
+            ++totalInstructions;
+            ++totalCycles;
+            IopThread *thread = kernel.currentThread();
+            const auto loop = thread != nullptr && &thread->cpu == &cpu ? rpcLoops.find(thread->id) : rpcLoops.end();
+            if (loop == rpcLoops.end())
+            {
+                log(LogLevel::Error, "[IOP] RpcLoop reached outside its server thread");
+                cpu.stopped = true;
+                return false;
+            }
+            RpcLoopState &state = loop->second;
+            if (state.active != 0u)
+            {
+                rpc.finishRequest(state.active, cpu.gpr[2]);
+                state.active = 0u;
+            }
+            if (const auto next = rpc.takeNextRequest(state.queue))
+            {
+                state.active = next->token;
+                cpu.gpr[4] = next->rpcNumber;
+                cpu.gpr[5] = next->buffer;
+                cpu.gpr[6] = next->size;
+                cpu.gpr[28] = next->gp;
+                cpu.gpr[29] = state.stack;
+                cpu.gpr[31] = kRpcLoopSentinel;
+                cpu.pc = next->function;
+                cpu.branchPending = false;
+                return true;
+            }
+            if (thread->wakeupCount > 0)
+                --thread->wakeupCount;
+            else
+                (void)kernel.sleepCurrent(cpu, "RpcLoop");
+            return true;
+        }
+
         void recordBranch(uint32_t from, uint32_t to)
         {
             static const char *s_range = std::getenv("PS2X_IOP_TRACERANGE");
@@ -662,6 +719,8 @@ namespace ps2x::iop::detail
                 cpu.stopped = true;
                 return false;
             }
+            if (cpu.pc == kRpcLoopSentinel)
+                return stepRpcLoop(cpu);
             if (physicalAddress(cpu.pc) >= kRamSize)
             {
                 std::ostringstream out;
@@ -1163,44 +1222,6 @@ namespace ps2x::iop::detail
             }
         }
 
-        // Runs the threads that are ready at the current IOP time until all of
-        // them block, without moving time on to the next wake.  On hardware the
-        // IOP is a separate CPU: a thread woken by a VBlank finishes its few
-        // microseconds of work long before the EE's next RPC arrives, and an
-        // RPC server that needs a lock the thread holds waits for it.  Here an
-        // RPC handler runs as a plain call that cannot block, so WaitSema on a
-        // held semaphore returned at once: IOPMAIN's command handler then
-        // overwrote the command block its command thread was still reading,
-        // and a lost boot command left the sound table empty (the black screen
-        // after the book, docs/bringup.md).  Draining first gives the woken
-        // thread the time it would have had.
-        void drainReadyThreads(uint64_t budget) noexcept
-        {
-            if (callDepth != 0u || activeCpu != nullptr)
-                return;
-            try
-            {
-                const uint64_t limit = totalCycles + budget;
-                while (totalCycles < limit)
-                {
-                    servicePendingDmaInterrupts();
-                    servicePendingGuestCallbacks();
-                    serviceTimersAndAlarms();
-                    IopThread *next = kernel.beginNextReady(totalCycles);
-                    if (next == nullptr)
-                        break;
-                    const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, limit - totalCycles)));
-                    kernel.endTimeslice(*next, kThreadReturnSentinel);
-                    if (totalCycles == before)
-                        ++totalCycles;
-                }
-            }
-            catch (...)
-            {
-            }
-        }
-
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -1307,6 +1328,13 @@ namespace ps2x::iop::detail
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
+        struct RpcLoopState
+        {
+            uint32_t queue = 0;
+            uint32_t stack = 0;
+            uint64_t active = 0; // token of the request whose handler is running
+        };
+        std::map<int, RpcLoopState> rpcLoops;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
@@ -1398,14 +1426,41 @@ namespace ps2x::iop::detail
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
-        // PS2X(iop-rpc-drain): see drainReadyThreads.
-        constexpr uint64_t kRpcDrainCycles = 20000u;
-        m_impl->drainReadyThreads(kRpcDrainCycles);
+        auto &impl = *m_impl;
         static const bool s_rpcTime = std::getenv("PS2X_IOP_TRACE_RPC") != nullptr;
         if (s_rpcTime)
             std::fprintf(stderr, "[iop-rpc-time] sid=0x%x cycle=%llu\n", request.sid,
-                         static_cast<unsigned long long>(m_impl->totalCycles));
-        return m_impl->rpc.handleRpc(request, *m_impl);
+                         static_cast<unsigned long long>(impl.totalCycles));
+
+        // PS2X(iop-rpc-thread): queue the call for the server's thread and
+        // run the IOP until that thread has answered it.  The EE is charged
+        // the IOP time the call took (RpcResult::iopCycles).
+        const uint64_t token = impl.rpc.enqueueRequest(request);
+        if (token == 0u)
+            return impl.rpc.handleRpc(request, impl);
+        constexpr uint64_t kStepCycles = 256u;
+        constexpr uint64_t kWaitLimitCycles = kIopClockHz / 2u;
+        const uint64_t start = impl.totalCycles;
+        while (!impl.rpc.takeDone(token))
+        {
+            if (impl.totalCycles - start > kWaitLimitCycles)
+            {
+                std::fprintf(stderr, "[iop-rpc] sid=0x%x fn=%u not answered after %llu IOP cycles; EE continues\n",
+                             request.sid, request.function,
+                             static_cast<unsigned long long>(impl.totalCycles - start));
+                break;
+            }
+            impl.runCycles(kStepCycles);
+        }
+
+        RpcResult result{};
+        result.handled = true;
+        result.resultAddress = request.receive.address;
+        result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+        result.signalNowaitCompletion = true;
+        result.signalCompletion = true;
+        result.iopCycles = impl.totalCycles - start;
+        return result;
     }
 
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept

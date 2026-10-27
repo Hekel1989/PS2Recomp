@@ -314,10 +314,7 @@ namespace ps2x::iop::detail
                 setV0(KE_DORMANT);
                 return true;
             }
-            if (it->second.state == IopThreadState::Sleep)
-                makeReady(it->second, 0);
-            else
-                ++it->second.wakeupCount;
+            wakeupThread(id);
             setV0(0);
             return true;
         }
@@ -416,6 +413,17 @@ namespace ps2x::iop::detail
         default:
             return false;
         }
+    }
+
+    void IopKernel::wakeupThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end() || it->second.state == IopThreadState::Dormant)
+            return;
+        if (it->second.state == IopThreadState::Sleep)
+            makeReady(it->second, 0);
+        else
+            ++it->second.wakeupCount;
     }
 
     bool IopKernel::referThreadStatus(int id, uint32_t outputAddress)

@@ -90,6 +90,10 @@ namespace ps2x::iop::detail
         // (the EE re-anchored its VBlank chain).
         void retargetVblankWaiters(uint8_t kind, uint64_t wakeCycle);
 
+        // WakeupThread: a sleeping thread becomes ready, any other one (not
+        // dormant) gets a pending wakeup for its next SleepThread.
+        void wakeupThread(int id);
+
         // Interrupt context (interrupt, timer and alarm handlers): blocking
         // calls fail with KE_ILLEGAL_CONTEXT instead of blocking the thread
         // the interrupt arrived on.

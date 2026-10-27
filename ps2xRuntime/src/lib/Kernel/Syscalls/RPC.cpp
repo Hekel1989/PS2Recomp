@@ -563,6 +563,13 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            // PS2X(iop-rpc-thread): the call lasted as long as the IOP took
+            // to answer it; keep the EE clock in step with the IOP.
+            if (iopResult.iopCycles != 0u)
+            {
+                runtime->eeScheduler().accountCycles(static_cast<uint32_t>(
+                    std::min<uint64_t>(iopResult.iopCycles * 8u, std::numeric_limits<uint32_t>::max())));
+            }
 
             if (iopResult.completionSemaId >= 0)
             {
