@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <vector>
 
 // PS2X(iop-kernel-rules): thread, semaphore, event-flag and alarm semantics
 // follow the real IOP kernel; the rules, their sources (OpenPS2BIOS's
@@ -27,6 +28,7 @@ namespace ps2x::iop::detail
         constexpr int32_t KE_FOUND_HANDLER = -104;
         constexpr int32_t KE_NOTFOUND_HANDLER = -105;
         constexpr int32_t KE_ILLEGAL_ENTRY = -402;
+        constexpr int32_t KE_ILLEGAL_STACK_SIZE = -404;
         constexpr int32_t KE_DORMANT = -413;
         constexpr int32_t KE_NOT_WAIT = -416;
         constexpr int32_t KE_RELEASE_WAIT = -418;
@@ -47,6 +49,41 @@ namespace ps2x::iop::detail
         // DEFAULT_STACKSIZE = 0x4000) and IopBios.cpp RequestModuleStart.
         constexpr uint32_t kModuleStartPriority = 8u;
         constexpr uint32_t kModuleStartStackSize = 0x4000u;
+
+        // PS2X(iop-startthread-rules): thread start and stack setup, from
+        // Play! Source/iop/IopBios.cpp (STACK_FRAME_RESERVE_SIZE = 0x10,
+        // CreateThread/StartThread/StartThreadArgs) and OpenPS2BIOS
+        // src/iop/kernel.c (CreateThread, clear_start_frame, StartThread).
+        constexpr uint32_t kStackFrameReserveSize = 0x10u;
+        // OpenPS2BIOS CreateThread leaves the new stack's top 0x30 bytes
+        // unfilled; Play! fills the whole stack, so this part follows
+        // OpenPS2BIOS.
+        // Play! StartThread and OpenPS2BIOS StartThread/clear_start_frame
+        // zero the 0xb8-byte register area at the top of the stack.
+        constexpr uint32_t kStartFrameBytes = 0xB8u;
+
+        uint32_t stackTop(const IopThread &thread)
+        {
+            return alignUp(thread.stackBase + thread.stackSize, 16u);
+        }
+
+        // PS2X(iop-startthread-rules): Play! IopBios.cpp CreateThread fills
+        // the whole new stack with 0xff.  OpenPS2BIOS leaves the top 0x30
+        // bytes and honours TH_NO_FILLSTACK; where they differ, Play! wins.
+        void fillNewStack(IopMemory &memory, const IopThread &thread)
+        {
+            const std::vector<uint8_t> bytes(thread.stackSize, 0xFFu);
+            (void)memory.writeRam(thread.stackBase, bytes.data(), bytes.size());
+        }
+
+        // PS2X(iop-startthread-rules): Play! IopBios.cpp StartThread and
+        // OpenPS2BIOS src/iop/kernel.c clear_start_frame/StartThread zero the
+        // 0xb8-byte register area at the stack top before the entry runs.
+        void clearStartFrame(IopMemory &memory, const IopThread &thread)
+        {
+            const uint32_t clearSize = std::min(thread.stackSize, kStartFrameBytes);
+            (void)memory.zeroRam(stackTop(thread) - clearSize, clearSize);
+        }
 
         bool isWaiting(IopThreadState state)
         {
@@ -145,6 +182,8 @@ namespace ps2x::iop::detail
                 setV0(-400);
                 return true;
             }
+            // PS2X(iop-startthread-rules): Play! CreateThread stack fill.
+            fillNewStack(m_memory, thread);
             const int id = thread.id;
             m_threads.emplace(id, std::move(thread));
             setV0(id);
@@ -176,13 +215,71 @@ namespace ps2x::iop::detail
                 return true;
             }
             IopThread &thread = it->second;
+
+            // PS2X(iop-startthread-rules): Play! IopBios.cpp StartThread /
+            // StartThreadArgs warn and fail on a thread that is not dormant;
+            // OpenPS2BIOS src/common/iopk.c obk_thread_start returns
+            // OBK_NOT_DORMANT (-414); Play! returns -1, and Play! wins.  The
+            // thread is left exactly as it was.
+            if (thread.state != IopThreadState::Dormant)
+            {
+                std::fprintf(stderr, "[IOP] StartThread id=%d refused: not dormant (state %u)\n",
+                             id, static_cast<unsigned>(thread.state));
+                setV0(-1);
+                return true;
+            }
+
+            // PS2X(iop-startthread-rules): Play! StartThread/StartThreadArgs
+            // and OpenPS2BIOS obk_thread_start reset the current priority from
+            // the initial priority.
+            const uint32_t args = ordinal == 7 ? cpu.gpr[5] : 0u;
+            const uint64_t argsSize64 = (static_cast<uint64_t>(args) + 3u) & ~3ull;
+            // OpenPS2BIOS kernel.c StartThreadArgs checks the copy fits before
+            // starting; Play! has no check. A refused start leaves the thread
+            // alone either way.
+            if (ordinal == 7 && argsSize64 + kStackFrameReserveSize > thread.stackSize)
+            {
+                setV0(KE_ILLEGAL_STACK_SIZE);
+                return true;
+            }
+
             thread.cpu = {};
+            thread.priority = thread.initialPriority;
             thread.cpu.pc = thread.entry;
-            thread.cpu.gpr[4] = cpu.gpr[5];
-            thread.cpu.gpr[5] = ordinal == 7 ? cpu.gpr[6] : 0u;
             thread.cpu.gpr[28] = cpu.gpr[28];
-            thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
             thread.cpu.gpr[31] = kThreadReturnSentinel;
+
+            const uint32_t top = stackTop(thread);
+            if (ordinal == 7)
+            {
+                // PS2X(iop-startthread-rules): Play! IopBios.cpp
+                // StartThreadArgs copies the arguments to the top of the
+                // stack and passes their address in a1; OpenPS2BIOS
+                // kernel.c StartThreadArgs does the same.
+                const uint32_t argsSize = static_cast<uint32_t>(argsSize64);
+                const uint32_t argsAddress = top - argsSize;
+                if (args != 0u)
+                {
+                    std::vector<uint8_t> bytes(args);
+                    (void)m_memory.readRam(cpu.gpr[6], bytes.data(), bytes.size());
+                    (void)m_memory.writeRam(argsAddress, bytes.data(), bytes.size());
+                }
+                thread.cpu.gpr[4] = args;
+                thread.cpu.gpr[5] = argsAddress;
+                thread.cpu.gpr[29] = argsAddress - kStackFrameReserveSize;
+            }
+            else
+            {
+                thread.cpu.gpr[4] = cpu.gpr[5];
+                thread.cpu.gpr[5] = 0u;
+                // PS2X(iop-startthread-rules): Play! IopBios.cpp
+                // STACK_FRAME_RESERVE_SIZE (0x10): the initial SP is the
+                // stack top minus 0x10, kept 16-byte aligned. Then both
+                // references zero the top 0xb8 bytes (StartThread).
+                thread.cpu.gpr[29] = top - kStackFrameReserveSize;
+                clearStartFrame(m_memory, thread);
+            }
+
             makeReady(thread, 0);
             setV0(0);
             return true;
@@ -463,11 +560,18 @@ namespace ps2x::iop::detail
         thread.stackBase = m_memory.allocate(thread.stackSize + kStackGuardBytes, 16u);
         if (thread.stackBase == 0u)
             return 0;
+        // PS2X(iop-startthread-rules): the starter thread is created and
+        // started like Play!'s RequestModuleStart thread, so it gets the same
+        // stack treatment (IopBios.cpp CreateThread fills 0xff and StartThread
+        // zeroes the top 0xb8; OpenPS2BIOS kernel.c CreateThread and
+        // clear_start_frame agree on the zeroed start frame).
+        fillNewStack(m_memory, thread);
+        clearStartFrame(m_memory, thread);
         thread.cpu.pc = entry;
         thread.cpu.gpr[4] = a0;
         thread.cpu.gpr[5] = a1;
         thread.cpu.gpr[28] = gp;
-        thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+        thread.cpu.gpr[29] = stackTop(thread) - kStackFrameReserveSize;
         thread.cpu.gpr[31] = kThreadReturnSentinel;
         const int id = thread.id;
         const auto inserted = m_threads.emplace(id, std::move(thread));
