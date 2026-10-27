@@ -327,6 +327,17 @@ namespace
         return enabled;
     }
 
+    // PS2X(jitter-seed): small, fully specified PRNG so a seed replays on any
+    // host and compiler.  SplitMix64 has no warm-up and handles seed 0.
+    uint64_t splitMix64(uint64_t &state) noexcept
+    {
+        state += 0x9E3779B97F4A7C15ull;
+        uint64_t value = state;
+        value = (value ^ (value >> 30u)) * 0xBF58476D1CE4E5B9ull;
+        value = (value ^ (value >> 27u)) * 0x94D049BB133111EBull;
+        return value ^ (value >> 31u);
+    }
+
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
     {
@@ -442,6 +453,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
+    configureCycleJitter();
     m_hostAnchorCycle = m_eeCycle;
     m_paceLastWallNs = m_paceLastCpuNs = m_paceLastStallNs = m_paceLastWaitNs = 0u;
     m_paceAdvanceNs = 0u;
@@ -1141,6 +1153,57 @@ void EeScheduler::traceSwitch(int toThreadId) noexcept
     m_traceFromId = 0;
 }
 
+void EeScheduler::configureCycleJitter()
+{
+    // PS2X(jitter-seed): PS2X_JITTER_SEED is a developer knob beside
+    // PS2X_DETERMINISTIC, never a user setting.  Without deterministic mode
+    // it is ignored (and logged) so normal runs keep their old timing.
+    m_jitterEnabled = false;
+    m_jitterState = 0u;
+    const char *value = std::getenv("PS2X_JITTER_SEED");
+    if (value == nullptr || value[0] == '\0')
+    {
+        return;
+    }
+    if (!ps2x::time::deterministicMode())
+    {
+        std::fprintf(stderr,
+                     "[ee-jitter] PS2X_JITTER_SEED=%s ignored: PS2X_DETERMINISTIC=1 is not set\n",
+                     value);
+        return;
+    }
+    if (value[0] == '-' || value[0] == '+')
+    {
+        std::fprintf(stderr, "[ee-jitter] ignored invalid PS2X_JITTER_SEED=\"%s\"\n", value);
+        return;
+    }
+    char *end = nullptr;
+    const unsigned long long seed = std::strtoull(value, &end, 10);
+    if (end == value || end == nullptr || *end != '\0')
+    {
+        std::fprintf(stderr, "[ee-jitter] ignored invalid PS2X_JITTER_SEED=\"%s\"\n", value);
+        return;
+    }
+    m_jitterState = static_cast<uint64_t>(seed);
+    m_jitterEnabled = true;
+    std::fprintf(stderr,
+                 "[ee-jitter] PS2X_JITTER_SEED=%llu active: EE cycles 75..125%% per checkpoint\n",
+                 seed);
+}
+
+uint64_t EeScheduler::jitterCycles(uint64_t cycles) noexcept
+{
+    if (!m_jitterEnabled)
+    {
+        return cycles;
+    }
+    // PS2X(jitter-seed): 75..125% per call, rounded to the nearest cycle.
+    // Integer arithmetic keeps the sequence identical across hosts.
+    const uint64_t percent = 75u + splitMix64(m_jitterState) % 51u;
+    const uint64_t varied = (cycles * percent + 50u) / 100u;
+    return std::max<uint64_t>(1u, varied);
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     // Sample at most once per kPaceSamplePeriodNs: a CPU-time clock_gettime()
@@ -1183,6 +1246,9 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     }
     else
     {
+        // PS2X(jitter-seed): vary the EE cycles charged for this block so the
+        // IOP's progress relative to the recompiled EE code differs per seed.
+        elapsed = jitterCycles(elapsed);
         m_eeCycle += elapsed;
     }
 
