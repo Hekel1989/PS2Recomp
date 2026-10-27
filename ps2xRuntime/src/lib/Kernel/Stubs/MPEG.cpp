@@ -42,6 +42,13 @@ namespace ps2_stubs
             std::vector<uint8_t> rgba;
         };
 
+        enum class MpegDecodeStatus
+        {
+            Frame,
+            NeedMore,
+            Failed,
+        };
+
 #if PS2X_HAS_FFMPEG
         std::string ffmpegErrorString(int err)
         {
@@ -66,6 +73,20 @@ namespace ps2_stubs
                            });
         }
 
+        struct MpegQueuedPacket
+        {
+            std::vector<uint8_t> data;
+            int64_t pts = AV_NOPTS_VALUE;
+            int64_t dts = AV_NOPTS_VALUE;
+        };
+
+        struct MpegEsTimestamp
+        {
+            size_t offset = 0u;
+            int64_t pts = AV_NOPTS_VALUE;
+            int64_t dts = AV_NOPTS_VALUE;
+        };
+
         class MpegFfmpegDecoder
         {
         public:
@@ -79,129 +100,138 @@ namespace ps2_stubs
             MpegFfmpegDecoder(const MpegFfmpegDecoder &) = delete;
             MpegFfmpegDecoder &operator=(const MpegFfmpegDecoder &) = delete;
 
-            bool feed(const uint8_t *data, size_t size, std::deque<MpegDecodedFrame> &frames, int64_t pts90k = -1, int64_t dts90k = -1)
+            // PS2X(mpeg-lazy-decode): AddBs/demux only queue the elementary
+            // stream.  The parser and the decoder run later, when the guest
+            // asks for a picture.
+            bool queue(const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
             {
                 if (!data || size == 0)
                 {
                     return true;
                 }
 
+                compactQueuedBytes();
+
+                if (pts90k >= 0 || dts90k >= 0)
+                {
+                    m_esTimestamps.push_back(MpegEsTimestamp{
+                        m_esBuffer.size(),
+                        pts90k >= 0 ? pts90k : AV_NOPTS_VALUE,
+                        dts90k >= 0 ? dts90k : AV_NOPTS_VALUE});
+                }
+
+                m_esBuffer.insert(m_esBuffer.end(), data, data + size);
+                m_queuedBytes += size;
+                return true;
+            }
+
+            [[nodiscard]] bool hasQueuedInput() const
+            {
+                return m_esOffset < m_esBuffer.size() || !m_packets.empty();
+            }
+
+            [[nodiscard]] size_t queuedBytes() const
+            {
+                size_t bytes = m_queuedBytes;
+                for (const MpegQueuedPacket &packet : m_packets)
+                {
+                    bytes += packet.data.size();
+                }
+                return bytes;
+            }
+
+            // PS2X(mpeg-lazy-decode): decode packets until one picture is
+            // available.  FFmpeg can need a couple of packets for B-frame
+            // reordering, so this is a loop rather than a single send.
+            MpegDecodeStatus decodeNextPicture(std::deque<MpegDecodedFrame> &frames)
+            {
+                if (!hasQueuedInput())
+                {
+                    return MpegDecodeStatus::NeedMore;
+                }
                 if (!ensureInitialized())
                 {
-                    return false;
+                    return MpegDecodeStatus::Failed;
                 }
 
-                // PS2X(mpeg-cost): the whole demuxed elementary-stream feed,
-                // including parser, decoder and colour conversion.
-                ps2x::mpeg_cost::Step feedStep("decode");
-
-                static uint32_t s_feedLogCount = 0u;
-                const bool shouldLog = (s_feedLogCount < 32u);
-                if (shouldLog)
-                    ++s_feedLogCount;
-
-                size_t totalParsed = 0u;
-                size_t totalPacketsSent = 0u;
-                size_t framesBefore = frames.size();
-
-                const uint8_t *cursor = data;
-                size_t remaining = size;
-                int64_t parserPts = pts90k >= 0 ? pts90k : AV_NOPTS_VALUE;
-                int64_t parserDts = dts90k >= 0 ? dts90k : AV_NOPTS_VALUE;
-                while (remaining > 0)
+                const size_t framesBefore = frames.size();
+                while (true)
                 {
-                    uint8_t *packetData = nullptr;
-                    int packetSize = 0;
-                    const int chunk = static_cast<int>(std::min<size_t>(
-                        remaining, static_cast<size_t>(std::numeric_limits<int>::max())));
-                    int used = 0;
+                    if (m_packets.empty())
                     {
-                        // PS2X(mpeg-cost): elementary-stream parsing is part
-                        // of the demux cost, separately from decode.
-                        ps2x::mpeg_cost::Step parseStep("av-parse");
-                        used = av_parser_parse2(
-                            m_parser,
-                            m_codecCtx,
-                            &packetData,
-                            &packetSize,
-                            cursor,
-                            chunk,
-                            parserPts,
-                            parserDts,
-                            0);
-                    }
-                    if (used < 0)
-                    {
-                        std::cerr << "[MPEG] parser failed: " << ffmpegErrorString(used) << std::endl;
-                        return false;
-                    }
-                    if (used == 0 && packetSize == 0)
-                    {
-                        break;
-                    }
-
-                    totalParsed += static_cast<size_t>(used);
-                    cursor += used;
-                    remaining -= static_cast<size_t>(used);
-
-                    if (used > 0)
-                    {
-                        parserPts = AV_NOPTS_VALUE;
-                        parserDts = AV_NOPTS_VALUE;
-                    }
-
-                    if (packetSize > 0)
-                    {
-                        ++totalPacketsSent;
-                        if (!sendPacket(packetData, static_cast<size_t>(packetSize), frames, m_parser->pts, m_parser->dts))
+                        const int parsed = parseNextQueuedPacket();
+                        if (parsed < 0)
                         {
-                            return false;
+                            return MpegDecodeStatus::Failed;
+                        }
+                        if (parsed == 0)
+                        {
+                            return MpegDecodeStatus::NeedMore;
                         }
                     }
-                }
 
-                if (shouldLog)
-                {
-                    PS2_IF_AGRESSIVE_LOGS({
-                        std::cerr << "[MPEG:feed] inSize=" << size
-                                  << " parsed=" << totalParsed
-                                  << " packets=" << totalPacketsSent
-                                  << " newFrames=" << (frames.size() - framesBefore)
-                                  << " totalFrames=" << frames.size()
-                                  << std::endl;
-                    });
+                    MpegQueuedPacket packet = std::move(m_packets.front());
+                    m_packets.pop_front();
+                    if (!sendPacket(packet.data.data(), packet.data.size(), frames, packet.pts, packet.dts))
+                    {
+                        return MpegDecodeStatus::Failed;
+                    }
+                    if (frames.size() > framesBefore)
+                    {
+                        return MpegDecodeStatus::Frame;
+                    }
                 }
-
-                return true;
             }
 
             bool flush(std::deque<MpegDecodedFrame> &frames)
             {
-                if (!m_initialized || m_drained)
+                // PS2X(mpeg-lazy-decode): flush now has to run the queued
+                // elementary stream through the parser before draining the
+                // codec, because AddBs/demux no longer parse it eagerly.
+                if (m_drained && !hasQueuedInput())
                 {
                     return true;
+                }
+                if (!m_initialized && !hasQueuedInput())
+                {
+                    m_drained = true;
+                    return true;
+                }
+                if (!ensureInitialized())
+                {
+                    return false;
                 }
 
                 // PS2X(mpeg-cost): parser flush and decoder drain can both
                 // produce a burst of frames at a sequence boundary.
                 ps2x::mpeg_cost::Step flushStep("flush");
 
-                if (m_parser)
+                while (true)
                 {
-                    uint8_t *packetData = nullptr;
-                    int packetSize = 0;
-                    const int used = av_parser_parse2(
-                        m_parser,
-                        m_codecCtx,
-                        &packetData,
-                        &packetSize,
-                        nullptr,
-                        0,
-                        AV_NOPTS_VALUE,
-                        AV_NOPTS_VALUE,
-                        0);
-                    (void)used;
-                    if (packetSize > 0 && !sendPacket(packetData, static_cast<size_t>(packetSize), frames, m_parser->pts, m_parser->dts))
+                    if (m_packets.empty())
+                    {
+                        const int parsed = parseNextQueuedPacket();
+                        if (parsed < 0)
+                        {
+                            return false;
+                        }
+                        if (parsed == 0)
+                        {
+                            const int flushed = flushQueuedParser();
+                            if (flushed < 0)
+                            {
+                                return false;
+                            }
+                            if (flushed == 0)
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    MpegQueuedPacket packet = std::move(m_packets.front());
+                    m_packets.pop_front();
+                    if (!sendPacket(packet.data.data(), packet.data.size(), frames, packet.pts, packet.dts))
                     {
                         return false;
                     }
@@ -252,11 +282,174 @@ namespace ps2_stubs
                 m_swsWidth = 0;
                 m_swsHeight = 0;
                 m_swsFormat = AV_PIX_FMT_NONE;
+                m_esBuffer.clear();
+                m_esOffset = 0u;
+                m_queuedBytes = 0u;
+                m_esTimestamps.clear();
+                m_packets.clear();
                 m_initialized = false;
                 m_drained = false;
             }
 
         private:
+            void compactQueuedBytes()
+            {
+                if (m_esOffset == 0u)
+                {
+                    return;
+                }
+
+                if (m_esOffset >= m_esBuffer.size())
+                {
+                    m_esBuffer.clear();
+                    m_esOffset = 0u;
+                    m_esTimestamps.clear();
+                    return;
+                }
+
+                constexpr size_t kCompactThreshold = 256u * 1024u;
+                if (m_esOffset < kCompactThreshold)
+                {
+                    return;
+                }
+
+                m_esBuffer.erase(
+                    m_esBuffer.begin(),
+                    m_esBuffer.begin() + static_cast<std::ptrdiff_t>(m_esOffset));
+                for (MpegEsTimestamp &timestamp : m_esTimestamps)
+                {
+                    timestamp.offset = timestamp.offset >= m_esOffset
+                                           ? timestamp.offset - m_esOffset
+                                           : 0u;
+                }
+                m_esOffset = 0u;
+            }
+
+            // PS2X(mpeg-lazy-decode): pull at most one packet from the queued
+            // elementary stream.  Returns 1 for a packet, 0 when more input is
+            // needed and -1 on a parser error.
+            int parseNextQueuedPacket()
+            {
+                while (m_esOffset < m_esBuffer.size())
+                {
+                    size_t limit = m_esBuffer.size();
+                    for (const MpegEsTimestamp &timestamp : m_esTimestamps)
+                    {
+                        if (timestamp.offset > m_esOffset)
+                        {
+                            limit = std::min(limit, timestamp.offset);
+                            break;
+                        }
+                    }
+
+                    int64_t parserPts = AV_NOPTS_VALUE;
+                    int64_t parserDts = AV_NOPTS_VALUE;
+                    if (!m_esTimestamps.empty() && m_esTimestamps.front().offset == m_esOffset)
+                    {
+                        parserPts = m_esTimestamps.front().pts;
+                        parserDts = m_esTimestamps.front().dts;
+                    }
+
+                    uint8_t *packetData = nullptr;
+                    int packetSize = 0;
+                    const size_t remaining = limit - m_esOffset;
+                    const int chunk = static_cast<int>(std::min<size_t>(
+                        remaining, static_cast<size_t>(std::numeric_limits<int>::max())));
+                    int used = 0;
+                    {
+                        // PS2X(mpeg-cost): elementary-stream parsing is part
+                        // of the on-demand decode cost, separately from the
+                        // decoder call itself.
+                        ps2x::mpeg_cost::Step parseStep("av-parse");
+                        used = av_parser_parse2(
+                            m_parser,
+                            m_codecCtx,
+                            &packetData,
+                            &packetSize,
+                            m_esBuffer.data() + m_esOffset,
+                            chunk,
+                            parserPts,
+                            parserDts,
+                            0);
+                    }
+                    if (used < 0)
+                    {
+                        std::cerr << "[MPEG] parser failed: " << ffmpegErrorString(used) << std::endl;
+                        return -1;
+                    }
+
+                    if (used > 0)
+                    {
+                        m_esOffset += static_cast<size_t>(used);
+                        m_queuedBytes -= std::min(m_queuedBytes, static_cast<size_t>(used));
+                        while (!m_esTimestamps.empty() &&
+                               m_esTimestamps.front().offset < m_esOffset)
+                        {
+                            m_esTimestamps.pop_front();
+                        }
+                    }
+
+                    if (packetSize > 0)
+                    {
+                        MpegQueuedPacket packet;
+                        packet.data.assign(packetData, packetData + packetSize);
+                        packet.pts = m_parser->pts;
+                        packet.dts = m_parser->dts;
+                        m_packets.push_back(std::move(packet));
+                        return 1;
+                    }
+
+                    if (used == 0)
+                    {
+                        return 0;
+                    }
+                }
+                return 0;
+            }
+
+            // PS2X(mpeg-lazy-decode): the parser keeps the last picture
+            // buffered until it sees another start code.  Only the explicit
+            // end-of-stream flush may pull that packet out.
+            int flushQueuedParser()
+            {
+                if (!m_parser)
+                {
+                    return 0;
+                }
+
+                uint8_t *packetData = nullptr;
+                int packetSize = 0;
+                int used = 0;
+                {
+                    ps2x::mpeg_cost::Step parseStep("av-parse");
+                    used = av_parser_parse2(
+                        m_parser,
+                        m_codecCtx,
+                        &packetData,
+                        &packetSize,
+                        nullptr,
+                        0,
+                        AV_NOPTS_VALUE,
+                        AV_NOPTS_VALUE,
+                        0);
+                }
+                if (used < 0)
+                {
+                    std::cerr << "[MPEG] parser flush failed: " << ffmpegErrorString(used) << std::endl;
+                    return -1;
+                }
+                if (packetSize > 0)
+                {
+                    MpegQueuedPacket packet;
+                    packet.data.assign(packetData, packetData + packetSize);
+                    packet.pts = m_parser->pts;
+                    packet.dts = m_parser->dts;
+                    m_packets.push_back(std::move(packet));
+                    return 1;
+                }
+                return 0;
+            }
+
             bool ensureInitialized()
             {
                 if (m_initialized)
@@ -502,6 +695,11 @@ namespace ps2_stubs
             int m_swsWidth = 0;
             int m_swsHeight = 0;
             AVPixelFormat m_swsFormat = AV_PIX_FMT_NONE;
+            std::vector<uint8_t> m_esBuffer;
+            size_t m_esOffset = 0u;
+            size_t m_queuedBytes = 0u;
+            std::deque<MpegEsTimestamp> m_esTimestamps;
+            std::deque<MpegQueuedPacket> m_packets;
             bool m_initialized = false;
             bool m_drained = false;
         };
@@ -510,7 +708,7 @@ namespace ps2_stubs
         class MpegFfmpegDecoder
         {
         public:
-            bool feed(const uint8_t *, size_t, std::deque<MpegDecodedFrame> &, int64_t = -1, int64_t = -1)
+            bool queue(const uint8_t *, size_t, int64_t = -1, int64_t = -1)
             {
                 static bool s_warnedNoFfmpeg = false;
                 if (!s_warnedNoFfmpeg)
@@ -518,7 +716,22 @@ namespace ps2_stubs
                     std::cerr << "[MPEG] runtime built without FFmpeg; MPEG video decode is disabled." << std::endl;
                     s_warnedNoFfmpeg = true;
                 }
+                return true;
+            }
+
+            [[nodiscard]] bool hasQueuedInput() const
+            {
                 return false;
+            }
+
+            [[nodiscard]] size_t queuedBytes() const
+            {
+                return 0u;
+            }
+
+            MpegDecodeStatus decodeNextPicture(std::deque<MpegDecodedFrame> &)
+            {
+                return MpegDecodeStatus::Failed;
             }
 
             bool flush(std::deque<MpegDecodedFrame> &)
@@ -545,6 +758,10 @@ namespace ps2_stubs
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
         constexpr size_t kMpegTimingScanLimit = 4096u;
         constexpr size_t kMaxDecodedPicturesAhead = 8u;
+        // PS2X(mpeg-lazy-decode): the demuxer may run ahead of the picture
+        // consumer, but only by a few frames.  The PSS stream is ~22 KiB per
+        // picture at 320x240, so 128 KiB is roughly six pictures.
+        constexpr size_t kMaxQueuedElementaryBytes = 128u * 1024u;
 
         struct MpegPlaybackState
         {
@@ -1112,6 +1329,63 @@ namespace ps2_stubs
             }
         }
 
+        bool hasPendingMpegInput(const MpegPlaybackState &playback)
+        {
+            return playback.decoder && playback.decoder->hasQueuedInput();
+        }
+
+        // PS2X(movie-audio): keep charging excess decoder time as host-only
+        // time.  The decode now happens in sceMpegGetPicture instead of the
+        // producer, but it still blocks the EE executor.
+        void accountMpegDecodeDuration(std::chrono::steady_clock::time_point start)
+        {
+            const auto end = std::chrono::steady_clock::now();
+            const auto decodeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+            constexpr auto kFreeDecodeTime = std::chrono::milliseconds(2);
+            if (decodeNs > kFreeDecodeTime)
+                ps2x::time::noteHostStall(decodeNs - kFreeDecodeTime);
+        }
+
+        // PS2X(mpeg-lazy-decode): decode only when the guest asks for the
+        // next picture.  AddBs and the PSS demuxer now stop after queueing.
+        bool decodePendingPicture(MpegPlaybackState &playback)
+        {
+            if (!playback.decoder || !playback.decoder->hasQueuedInput())
+            {
+                return false;
+            }
+
+            // PS2X(mpeg-cost): the on-demand decoder work, including the
+            // parser and colour conversion, keeps the old "decode" step name.
+            ps2x::mpeg_cost::Step decodeStep("decode");
+            const auto decodeStart = std::chrono::steady_clock::now();
+            MpegDecodeStatus status = playback.decoder->decodeNextPicture(playback.decodedFrames);
+            // PS2X(mpeg-lazy-decode): a stream that is already at its end may
+            // still have reordered pictures buffered in the codec.  Drain them
+            // one GetPicture at a time, as the old end-of-stream flush did.
+            if (status == MpegDecodeStatus::NeedMore &&
+                playback.streamEnded &&
+                !playback.decoder->hasQueuedInput())
+            {
+                playback.decoder->flush(playback.decodedFrames);
+                if (!playback.decodedFrames.empty())
+                {
+                    status = MpegDecodeStatus::Frame;
+                }
+            }
+            accountMpegDecodeDuration(decodeStart);
+
+            if (status == MpegDecodeStatus::Failed)
+            {
+                playback.decoder.reset();
+                playback.waitingForVideoSequenceHeader = true;
+                playback.videoSequenceSyncBuffer.clear();
+                playback.decoderFailed = false;
+                return false;
+            }
+            return status == MpegDecodeStatus::Frame;
+        }
+
         void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
         {
             if (!data || size == 0)
@@ -1221,22 +1495,10 @@ namespace ps2_stubs
                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
             }
 
-            // PS2X(movie-audio): a long software video decode blocks the EE
-            // executor while the wall-clock pacing keeps advancing the
-            // IOP/SPU2.  The game's SIF audio producer is blocked for the same
-            // interval, so the 24 KiB IOP ring laps and the pump resyncs with
-            // a ~40 ms tear at a complex frame.  Charge the excess over the
-            // normal decode cost as host-only time: the guest (and the audio
-            // hardware) pauses, and the output cushion absorbs the pause.
-            const auto decodeStart = std::chrono::steady_clock::now();
-            const bool decoded = playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k);
-            const auto decodeEnd = std::chrono::steady_clock::now();
-            const auto decodeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(decodeEnd - decodeStart);
-            constexpr auto kFreeDecodeTime = std::chrono::milliseconds(2);
-            if (decodeNs > kFreeDecodeTime)
-                ps2x::time::noteHostStall(decodeNs - kFreeDecodeTime);
-
-            if (!decoded)
+            // PS2X(mpeg-lazy-decode): AddBs/demux only append the elementary
+            // stream here.  The parser and decoder run from
+            // sceMpegGetPicture, so the producer never decodes a whole chunk.
+            if (!playback.decoder->queue(data, size, pts90k, dts90k))
             {
                 playback.decoder.reset();
                 playback.waitingForVideoSequenceHeader = true;
@@ -1246,10 +1508,6 @@ namespace ps2_stubs
             }
 
             playback.videoSequenceSyncBuffer.clear();
-            {
-                ps2x::mpeg_cost::Step flushStep("flush");
-                flushDecoderIfEnded(playback);
-            }
         }
 
         void erasePssPrefix(MpegPlaybackState &playback, size_t count)
@@ -1587,8 +1845,15 @@ namespace ps2_stubs
             // lets the game's producer loop wake the consumer again. Backpressure
             // still propagates naturally to sceCdStRead because the ring does not
             // advance while this is true.
+            //
+            // PS2X(mpeg-lazy-decode): decoded frames are no longer produced by
+            // the demuxer, so bound the queued elementary stream instead.  A few
+            // frames of lead keep the next GetPicture cheap without letting the
+            // producer run arbitrarily far ahead of the picture consumer.
+            const bool elementaryQueueFull =
+                playback.decoder && playback.decoder->queuedBytes() >= kMaxQueuedElementaryBytes;
             return !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
+                   (playback.decodedFrames.size() >= kMaxDecodedPicturesAhead || elementaryQueueFull);
         }
 
         void recordCdStreamBytesDemuxedUnlocked(
@@ -1985,6 +2250,71 @@ namespace ps2_stubs
         resetMpegStubStateUnlocked();
     }
 
+    bool mpegLazyDecodeTest(const uint8_t *data,
+                            size_t size,
+                            size_t expectedFrames,
+                            MpegLazyDecodeTestStats &stats)
+    {
+#if PS2X_HAS_FFMPEG
+        if (!data || size == 0u)
+        {
+            return false;
+        }
+
+        MpegPlaybackState playback = makeFreshPlaybackState();
+        std::deque<MpegDecodedFrame> &frames = playback.decodedFrames;
+
+        // Queue the stream in several chunks, as AddBs would.  Nothing may be
+        // decoded before the first explicit decode call.
+        const size_t chunkSize = std::max<size_t>(1u, size / 3u);
+        for (size_t offset = 0u; offset < size; offset += chunkSize)
+        {
+            const size_t chunk = std::min(chunkSize, size - offset);
+            feedElementaryStream(playback, data + offset, chunk);
+        }
+        stats.decodedAfterQueue = frames.size();
+        if (stats.decodedAfterQueue != 0u || !hasPendingMpegInput(playback))
+        {
+            return false;
+        }
+
+        auto drainFrames = [&]()
+        {
+            while (!frames.empty())
+            {
+                stats.width = frames.front().width;
+                stats.height = frames.front().height;
+                if (!frames.front().rgba.empty())
+                {
+                    stats.lumaSamples.push_back(frames.front().rgba[0]);
+                }
+                ++stats.decodedFrames;
+                frames.pop_front();
+            }
+        };
+
+        size_t guard = expectedFrames + 64u;
+        while (guard-- > 0u && decodePendingPicture(playback))
+        {
+            drainFrames();
+        }
+
+        if (!playback.decoder || !playback.decoder->flush(frames))
+        {
+            return false;
+        }
+        drainFrames();
+
+        return stats.decodedFrames == expectedFrames;
+#else
+        (void)data;
+        (void)size;
+        (void)expectedFrames;
+        (void)stats;
+        return false;
+#endif
+    }
+
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
     {
         constexpr int kTestFrameWidth = 16;
@@ -2114,7 +2444,6 @@ namespace ps2_stubs
                 setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
             }
             ps2x::mpeg_cost::Step addStep("add-bs");
-            const size_t framesBefore = playback.decodedFrames.size();
             while (copied < byteCount)
             {
                 const uint32_t curAddr = dataAddr + static_cast<uint32_t>(copied);
@@ -2125,10 +2454,13 @@ namespace ps2_stubs
                 {
                     break;
                 }
+                // PS2X(mpeg-lazy-decode): only append.  The decoder is driven
+                // by sceMpegGetPicture, so a waiting picture consumer must be
+                // woken even though no frame exists yet.
                 feedElementaryStream(playback, src, chunk);
                 copied += chunk;
             }
-            wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+            wakePictureWaiter = copied != 0u || playback.streamEnded || playback.decoderFailed;
         }
 
         if (wakePictureWaiter)
@@ -2399,7 +2731,9 @@ namespace ps2_stubs
             return;
         }
         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+        // PS2X(mpeg-lazy-decode): queued bitstream is enough to wake the
+        // picture consumer; it decodes the frame itself.
+        if (consumed != 0u || decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
         {
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
         }
@@ -2508,7 +2842,9 @@ namespace ps2_stubs
             return;
         }
         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+        // PS2X(mpeg-lazy-decode): queued bitstream is enough to wake the
+        // picture consumer; it decodes the frame itself.
+        if (consumed != 0u || decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
         {
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
         }
@@ -2612,10 +2948,17 @@ namespace ps2_stubs
                     setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
                 }
             }
+            if (playback.decodedFrames.empty())
+            {
+                // PS2X(mpeg-lazy-decode): the bitstream was queued by AddBs
+                // or the PSS demuxer; decode just enough for the next picture.
+                decodePendingPicture(playback);
+            }
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
-                !playback.decoderFailed)
+                !playback.decoderFailed &&
+                !playback.sawSequenceEnd)
             {
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
@@ -2740,10 +3083,12 @@ namespace ps2_stubs
             const bool presentationComplete =
                 presentationEnd == std::numeric_limits<uint64_t>::max() ||
                 nowTickQ32 >= presentationEnd;
+            const bool inputDrained = !hasPendingMpegInput(playback);
             atStreamEnd = !haveFrame &&
                           playback.decodedFrames.empty() &&
                           playback.sawInput &&
                           playbackEnded &&
+                          inputDrained &&
                           presentationComplete;
             if (mpegTraceEnabled())
             {
@@ -2883,7 +3228,10 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+        setReturnS32(ctx, (ended && playback.decodedFrames.empty() &&
+                           !hasPendingMpegInput(playback) && presentationComplete)
+                              ? 1
+                              : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2893,7 +3241,12 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         auto lock = lockMpegStub();
         const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-        setReturnS32(ctx, playback.decodedFrames.empty() ? 1 : 0);
+        // PS2X(mpeg-lazy-decode): queued bitstream counts as non-empty.  The
+        // old eager decoder would already have turned it into frames.
+        setReturnS32(ctx, (playback.decodedFrames.empty() &&
+                           !hasPendingMpegInput(playback))
+                              ? 1
+                              : 0);
     }
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

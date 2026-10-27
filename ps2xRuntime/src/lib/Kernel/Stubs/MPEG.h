@@ -2,9 +2,25 @@
 
 #include "ps2_stubs.h"
 
+#include <cstddef>
+#include <vector>
+
 namespace ps2_stubs
 {
+    struct MpegLazyDecodeTestStats
+    {
+        size_t decodedAfterQueue = 0u;
+        size_t decodedFrames = 0u;
+        int width = 0;
+        int height = 0;
+        std::vector<int> lumaSamples;
+    };
+
     void resetMpegStubState();
+    bool mpegLazyDecodeTest(const uint8_t *data,
+                            size_t size,
+                            size_t expectedFrames,
+                            MpegLazyDecodeTestStats &stats);
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
