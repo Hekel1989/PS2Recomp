@@ -71,6 +71,44 @@ namespace ps2_stubs
             uint32_t arg2 = 0u;
         };
 
+        // DISPLAYn as libgraph's sceGsSetDefDispEnv computes it (read from the
+        // copy statically linked into Suikoden Tactics, 0x37B7D0).  The PCRTC
+        // runs 2560 VCK per line, so MAGH = 2560 / w - 1 and DW spans the whole
+        // line; DX/DY add the caller's offset to the video standard's start
+        // position.  Writing dx/dy straight into DISPLAY with MAGH 0 (the old
+        // stub) put the picture's top above the visible area: the top rows were
+        // cut off and a black band showed at the bottom.  The console-model
+        // offsets libgraph reads for early ROMs are zero on later consoles.
+        uint64_t makeLibgraphDisplay(uint32_t w, uint32_t h, int32_t dx, int32_t dy)
+        {
+            constexpr uint8_t kOmodeNtsc = 2u;
+            constexpr uint8_t kOmodePal = 3u;
+            const bool interlace = (g_gparam.interlace & 0x1u) != 0u;
+            int32_t baseX = 0;
+            int32_t baseY = 0;
+            if (g_gparam.omode == kOmodeNtsc)
+            {
+                baseX = 636;
+                baseY = interlace ? 50 : 25;
+            }
+            else if (g_gparam.omode == kOmodePal)
+            {
+                baseX = 656;
+                baseY = interlace ? 72 : 36;
+            }
+            else
+            {
+                // Other output modes (VESA/DTV) keep the previous behaviour.
+                return makeDisplay(static_cast<uint32_t>(dx), static_cast<uint32_t>(dy), 0u, 0u, w - 1u, h - 1u);
+            }
+            const uint32_t magh = (w + 2559u) / w - 1u;
+            const uint32_t dw = (magh + 1u) * w - 1u;
+            const uint32_t dh = (interlace && (g_gparam.ffmode & 0x1u) != 0u) ? h * 2u - 1u : h - 1u;
+            const int32_t displayX = baseX + dx * static_cast<int32_t>(magh + 1u);
+            const int32_t displayY = baseY + dy;
+            return makeDisplay(static_cast<uint32_t>(displayX), static_cast<uint32_t>(displayY), magh, 0u, dw, dh);
+        }
+
         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
         {
             const uint32_t reg8 = getRegU32(ctx, 8);
@@ -894,7 +932,8 @@ namespace ps2_stubs
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        // libgraph's sceGsSetDefDBuff calls sceGsSetDefDispEnv with dx = dy = 0.
+        const uint64_t display = makeLibgraphDisplay(w, h, 0, 0);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -966,7 +1005,8 @@ namespace ps2_stubs
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
         const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        // libgraph's sceGsSetDefDBuff calls sceGsSetDefDispEnv with dx = dy = 0.
+        const uint64_t display = makeLibgraphDisplay(w, h, 0, 0);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -1005,9 +1045,11 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const GsTrailingArgs2 trailing = decodeGsTrailingArgs2(rdram, ctx);
-        uint32_t dx = trailing.arg0;
-        uint32_t dy = trailing.arg1;
+        // dx/dy are the 5th and 6th arguments: t0/t1 in the EE ABI, short.
+        // (The old trailing-argument heuristic read the stack when both were
+        // zero, which is exactly what retail callers pass.)
+        const int32_t dx = static_cast<int16_t>(getRegU32(ctx, 8) & 0xFFFFu);
+        const int32_t dy = static_cast<int16_t>(getRegU32(ctx, 9) & 0xFFFFu);
 
         if (w == 0)
             w = 640;
@@ -1016,7 +1058,7 @@ namespace ps2_stubs
 
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+        uint64_t display = makeLibgraphDisplay(w, h, dx, dy);
 
         writeGsDispEnv(rdram, envAddr, display, dispfb);
         setReturnS32(ctx, 0);
