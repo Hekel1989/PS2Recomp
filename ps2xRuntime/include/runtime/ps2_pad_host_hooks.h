@@ -53,4 +53,26 @@ namespace Ps2PadHostHooks
     {
         mutableProvider() = std::move(provider);
     }
+
+    // PS2X(pad-record): optional observer called once per PAD read with the
+    // final port 0 button mask (active-low) and the vsync counter the
+    // PS2X_PAD_SCRIPT player uses. suikoden's src/input writes it as a script
+    // when PS2X_PAD_RECORD is set; there is no observer in normal runs.
+    using StateObserver = std::function<void(int port, uint64_t vsync, uint16_t buttons)>;
+
+    inline StateObserver &mutableStateObserver()
+    {
+        static StateObserver observer;
+        return observer;
+    }
+
+    inline const StateObserver &stateObserver()
+    {
+        return mutableStateObserver();
+    }
+
+    inline void setStateObserver(StateObserver observer)
+    {
+        mutableStateObserver() = std::move(observer);
+    }
 } // namespace Ps2PadHostHooks
