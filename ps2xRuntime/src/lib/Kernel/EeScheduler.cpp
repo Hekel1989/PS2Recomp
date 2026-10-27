@@ -345,6 +345,32 @@ namespace
     }
 }
 
+std::time_t ps2x::time::wallTimeNow() noexcept
+{
+    if (deterministicMode())
+    {
+        return kDeterministicTimeT;
+    }
+    return std::time(nullptr);
+}
+
+std::tm ps2x::time::localTime(std::time_t value) noexcept
+{
+    std::tm result{};
+#ifdef _WIN32
+    if (deterministicMode())
+        gmtime_s(&result, &value);
+    else
+        localtime_s(&result, &value);
+#else
+    if (deterministicMode())
+        gmtime_r(&value, &result);
+    else
+        localtime_r(&value, &result);
+#endif
+    return result;
+}
+
 void ps2x::time::noteHostStall(std::chrono::nanoseconds duration) noexcept
 {
     if (duration.count() > 0)
@@ -480,8 +506,11 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
+    const auto firstVBlankDeadline = ps2x::time::deterministicMode()
+                                         ? std::chrono::steady_clock::time_point{}
+                                         : std::chrono::steady_clock::now() + kVBlankPeriod;
     scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+                  firstVBlankDeadline,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -826,6 +855,10 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
 void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
 {
+    if (ps2x::time::deterministicMode())
+    {
+        return;
+    }
     const uint64_t cpuNow = threadCpuNowNs();
     if (!m_paceInitialized)
     {
@@ -1114,31 +1147,43 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     // is a syscall (not vDSO), and paying it per dispatch cost ~13% of the
     // menu frame budget in the first version of this fix.  The sample interval
     // is far below a VBlank period, so pacing stays smooth.
-    // The wall clock itself is vDSO but was still read at every checkpoint
-    // after 2 ms of guest time; gate it on guest cycles instead.  Emulated
-    // time is floored at wall time, so 2 ms of guest time is the same cadence
-    // on a healthy host, and a delayed sample after a host stall still sees
-    // the whole stall interval because the timestamp is read at sample time.
-    const uint64_t nowWall = steadyNowNs();
-    if (!m_paceInitialized || nowWall - m_paceLastWallNs >= kPaceSamplePeriodNs)
-    {
-        sampleHostPacing(nowWall);
-    }
-
+    // PS2X(deterministic-mode): under the switch EE time advances only by
+    // guest cycles.  No wall-clock sample, no floor and no catch-up, so the
+    // same guest execution always reaches the same cycle count.
+    const bool deterministic = ps2x::time::deterministicMode();
     uint64_t elapsed = std::max<uint64_t>(1u, cycles);
-    m_eeCycle += elapsed;
-
-    // Wall-clock floor from the pacing sample, capped to one VBlank period per
-    // call so a large backlog is spread over checkpoints instead of landing as
-    // one timer/IOP burst.
-    const uint64_t target = m_hostAnchorCycle +
-        hostDurationToEeCycles(std::chrono::nanoseconds(m_paceAdvanceNs));
-    uint64_t catchUp = 0u;
-    if (target > m_eeCycle)
+    if (!deterministic)
     {
-        catchUp = std::min<uint64_t>(target - m_eeCycle, kVBlankPeriodCycles);
-        m_eeCycle += catchUp;
-        elapsed += catchUp;
+        // The wall clock itself is vDSO but was still read at every checkpoint
+        // after 2 ms of guest time; gate it on guest cycles instead.  Emulated
+        // time is floored at wall time, so 2 ms of guest time is the same
+        // cadence on a healthy host, and a delayed sample after a host stall
+        // still sees the whole stall interval because the timestamp is read at
+        // sample time.
+        const uint64_t nowWall = steadyNowNs();
+        if (!m_paceInitialized || nowWall - m_paceLastWallNs >= kPaceSamplePeriodNs)
+        {
+            sampleHostPacing(nowWall);
+        }
+
+        m_eeCycle += elapsed;
+
+        // Wall-clock floor from the pacing sample, capped to one VBlank period
+        // per call so a large backlog is spread over checkpoints instead of
+        // landing as one timer/IOP burst.
+        const uint64_t target = m_hostAnchorCycle +
+            hostDurationToEeCycles(std::chrono::nanoseconds(m_paceAdvanceNs));
+        uint64_t catchUp = 0u;
+        if (target > m_eeCycle)
+        {
+            catchUp = std::min<uint64_t>(target - m_eeCycle, kVBlankPeriodCycles);
+            m_eeCycle += catchUp;
+            elapsed += catchUp;
+        }
+    }
+    else
+    {
+        m_eeCycle += elapsed;
     }
 
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
@@ -1953,8 +1998,12 @@ int EeScheduler::setAlarm(uint16_t ticks,
     }
     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
+    const auto hostDeadline = ps2x::time::deterministicMode()
+                                  ? std::chrono::steady_clock::time_point{}
+                                  : std::chrono::steady_clock::now() +
+                                        std::chrono::microseconds(tickCount * kAlarmTickMicroseconds);
     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
+                  hostDeadline,
                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
     return id;
 }
@@ -2379,8 +2428,11 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
     constexpr uint32_t kInternalDelayWaitType = 0x44656C00u;
     const uint64_t cycles = std::max<uint64_t>(1u, eeCycles);
     const uint64_t token = ++m_internalDelayToken;
+    const auto hostDeadline = ps2x::time::deterministicMode()
+                                  ? std::chrono::steady_clock::time_point{}
+                                  : std::chrono::steady_clock::now() + eeCyclesToHostDuration(cycles);
     scheduleEvent(m_eeCycle + cycles,
-                  std::chrono::steady_clock::now() + eeCyclesToHostDuration(cycles),
+                  hostDeadline,
                   EeEvent{EeEventType::ExternalWake, kInternalDelayWaitType, token});
     blockCurrent(EeWaitState{EeWaitReason::External,
                              EeExternalWait{kInternalDelayWaitType, token},
@@ -2821,6 +2873,12 @@ bool EeScheduler::deadlineProbeDue() noexcept
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     if (nextEventCycle == 0u || m_eeCycle < nextEventCycle)
         return false;
+    if (ps2x::time::deterministicMode())
+    {
+        // Cycle deadline only: no host-clock probe and no probe interval.
+        m_deadlineDueObserved = true;
+        return true;
+    }
     if (m_deadlineProbeCountdown != 0u)
     {
         --m_deadlineProbeCountdown;
@@ -2843,50 +2901,70 @@ void EeScheduler::processDueDeadlines()
         return;
     m_deadlineDueObserved = false;
 
+    const bool deterministic = ps2x::time::deterministicMode();
+
     for (;;)
     {
         std::vector<ScheduledEvent> due;
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);
-            const auto now = std::chrono::steady_clock::now();
-            for (const ScheduledEvent &item : m_deadlines)
+            if (deterministic)
             {
-                if (item.deadlineCycle <= m_eeCycle &&
-                    (pacingDeadline == std::chrono::steady_clock::time_point{} ||
-                     item.hostDeadline < pacingDeadline))
+                // PS2X(deterministic-mode): fire every event whose cycle
+                // deadline has passed, in cycle order.  The host deadline is
+                // intentionally not consulted.
+                auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                                  [this](const ScheduledEvent &item)
+                                                  { return item.deadlineCycle <= m_eeCycle; });
+                due.insert(due.end(),
+                           std::make_move_iterator(m_deadlines.begin()),
+                           std::make_move_iterator(firstFuture));
+                m_deadlines.erase(m_deadlines.begin(), firstFuture);
+                updateNextDeadline();
+            }
+            else
+            {
+                const auto now = std::chrono::steady_clock::now();
+                for (const ScheduledEvent &item : m_deadlines)
                 {
-                    pacingDeadline = item.hostDeadline;
+                    if (item.deadlineCycle <= m_eeCycle &&
+                        (pacingDeadline == std::chrono::steady_clock::time_point{} ||
+                         item.hostDeadline < pacingDeadline))
+                    {
+                        pacingDeadline = item.hostDeadline;
+                    }
                 }
-            }
 
-            if (pacingDeadline == std::chrono::steady_clock::time_point{})
-            {
+                if (pacingDeadline == std::chrono::steady_clock::time_point{})
+                {
+                    updateNextDeadline();
+                    return;
+                }
+
+                if (now < pacingDeadline)
+                {
+                    // EE time has reached this event but its host deadline has
+                    // not passed yet.  Do not block the executor on it: guest
+                    // threads still have work to do, and the host-aware
+                    // checkpoint trigger re-enters here once the host deadline
+                    // passes.  When no thread is runnable the equivalent wait
+                    // happens in waitForEvent.
+                    updateNextDeadline();
+                    return;
+                }
+
+                const auto pacedNow = std::chrono::steady_clock::now();
+                auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                                  [this, pacedNow](const ScheduledEvent &item)
+                                                  { return item.deadlineCycle <= m_eeCycle &&
+                                                           item.hostDeadline <= pacedNow; });
+                due.insert(due.end(),
+                           std::make_move_iterator(m_deadlines.begin()),
+                           std::make_move_iterator(firstFuture));
+                m_deadlines.erase(m_deadlines.begin(), firstFuture);
                 updateNextDeadline();
-                return;
             }
-
-            if (now < pacingDeadline)
-            {
-                // EE time has reached this event but its host deadline has not
-                // passed yet.  Do not block the executor on it: guest threads
-                // still have work to do, and the host-aware checkpoint trigger
-                // re-enters here once the host deadline passes.  When no thread
-                // is runnable the equivalent wait happens in waitForEvent.
-                updateNextDeadline();
-                return;
-            }
-
-            const auto pacedNow = std::chrono::steady_clock::now();
-            auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
-                                              [this, pacedNow](const ScheduledEvent &item)
-                                              { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
-            due.insert(due.end(),
-                       std::make_move_iterator(m_deadlines.begin()),
-                       std::make_move_iterator(firstFuture));
-            m_deadlines.erase(m_deadlines.begin(), firstFuture);
-            updateNextDeadline();
         }
 
         std::sort(due.begin(), due.end(), [](const ScheduledEvent &left, const ScheduledEvent &right)
@@ -2914,74 +2992,97 @@ void EeScheduler::processDueDeadlines()
         // periods at once (a host-side stall), the due batch holds every
         // missed vsync; fire only the latest start and end so the game sees
         // one catch-up frame instead of a burst that would run it faster
-        // than real time.
-        const auto keepLatestVSync = [&due](EeEventType type)
+        // than real time.  Under deterministic mode the cycle grid is the
+        // only clock, so every due VBlank fires in order instead.
+        if (!deterministic)
         {
-            size_t keep = due.size();
-            for (size_t i = 0; i < due.size(); ++i)
+            const auto keepLatestVSync = [&due](EeEventType type)
             {
-                if (due[i].event.type == type)
+                size_t keep = due.size();
+                for (size_t i = 0; i < due.size(); ++i)
                 {
-                    keep = i;
+                    if (due[i].event.type == type)
+                    {
+                        keep = i;
+                    }
                 }
-            }
-            if (keep == due.size())
-            {
-                return;
-            }
-            size_t write = 0;
-            for (size_t i = 0; i < due.size(); ++i)
-            {
-                if (i != keep && due[i].event.type == type)
+                if (keep == due.size())
                 {
-                    continue;
+                    return;
                 }
-                if (write != i)
+                size_t write = 0;
+                for (size_t i = 0; i < due.size(); ++i)
                 {
-                    due[write] = std::move(due[i]);
+                    if (i != keep && due[i].event.type == type)
+                    {
+                        continue;
+                    }
+                    if (write != i)
+                    {
+                        due[write] = std::move(due[i]);
+                    }
+                    ++write;
                 }
-                ++write;
-            }
-            due.resize(write);
-        };
-        keepLatestVSync(EeEventType::VBlankStart);
-        keepLatestVSync(EeEventType::VBlankEnd);
+                due.resize(write);
+            };
+            keepLatestVSync(EeEventType::VBlankStart);
+            keepLatestVSync(EeEventType::VBlankEnd);
+        }
 
         for (ScheduledEvent &scheduled : due)
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
-                // Keep the vsync chain anchored to the host clock.  If the
-                // next start would already be due (the chain fell a full
-                // period behind after a stall), skip the missed vsyncs and
-                // re-anchor the chain to now instead of replaying the
-                // backlog as a burst.  The end event follows its start: if
-                // the start was noticed late, fire the end as soon as
-                // possible rather than on the stale grid.
-                const auto now = std::chrono::steady_clock::now();
-                auto endHostDeadline = scheduled.hostDeadline + kVBlankDuration;
-                uint64_t endCycle = scheduled.deadlineCycle + kVBlankDurationCycles;
-                if (endHostDeadline <= now)
+                if (deterministic)
                 {
-                    endHostDeadline = now;
-                    endCycle = m_eeCycle;
+                    // PS2X(deterministic-mode): the chain is anchored to the
+                    // scheduled cycle, never re-anchored to host now.
+                    const uint64_t endCycle = scheduled.deadlineCycle + kVBlankDurationCycles;
+                    scheduleEvent(endCycle, std::chrono::steady_clock::time_point{},
+                                  EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                    const uint64_t startCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
+                    scheduleEvent(startCycle, std::chrono::steady_clock::time_point{},
+                                  EeEvent{EeEventType::VBlankStart, 0, 0});
+                    // PS2X(iop-vblank-phase): the IOP's WaitVblank* wakes at
+                    // these same EE cycles, so both processors see one VBlank.
+                    m_runtime.announceIopVblank(startCycle > m_eeCycle ? startCycle - m_eeCycle : 0u,
+                                                endCycle > m_eeCycle ? endCycle - m_eeCycle : 0u,
+                                                kVBlankPeriodCycles);
                 }
-                scheduleEvent(endCycle, endHostDeadline,
-                              EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                auto startHostDeadline = scheduled.hostDeadline + kVBlankPeriod;
-                uint64_t startCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
-                if (startHostDeadline <= now)
+                else
                 {
-                    startHostDeadline = now + kVBlankPeriod;
-                    startCycle = m_eeCycle + kVBlankPeriodCycles;
+                    // Keep the vsync chain anchored to the host clock.  If the
+                    // next start would already be due (the chain fell a full
+                    // period behind after a stall), skip the missed vsyncs and
+                    // re-anchor the chain to now instead of replaying the
+                    // backlog as a burst.  The end event follows its start: if
+                    // the start was noticed late, fire the end as soon as
+                    // possible rather than on the stale grid.
+                    const auto now = std::chrono::steady_clock::now();
+                    auto endHostDeadline = scheduled.hostDeadline + kVBlankDuration;
+                    uint64_t endCycle = scheduled.deadlineCycle + kVBlankDurationCycles;
+                    if (endHostDeadline <= now)
+                    {
+                        endHostDeadline = now;
+                        endCycle = m_eeCycle;
+                    }
+                    scheduleEvent(endCycle, endHostDeadline,
+                                  EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                    auto startHostDeadline = scheduled.hostDeadline + kVBlankPeriod;
+                    uint64_t startCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
+                    if (startHostDeadline <= now)
+                    {
+                        startHostDeadline = now + kVBlankPeriod;
+                        startCycle = m_eeCycle + kVBlankPeriodCycles;
+                    }
+                    scheduleEvent(startCycle, startHostDeadline,
+                                  EeEvent{EeEventType::VBlankStart, 0, 0});
+                    // PS2X(iop-vblank-phase): the IOP's WaitVblank* wakes at
+                    // these same EE cycles, so both processors see one VBlank.
+                    m_runtime.announceIopVblank(startCycle > m_eeCycle ? startCycle - m_eeCycle : 0u,
+                                                endCycle > m_eeCycle ? endCycle - m_eeCycle : 0u,
+                                                kVBlankPeriodCycles);
                 }
-                scheduleEvent(startCycle, startHostDeadline,
-                              EeEvent{EeEventType::VBlankStart, 0, 0});
-                // PS2X(iop-vblank-phase): the IOP's WaitVblank* wakes at these
-                // same EE cycles, so both processors see one VBlank.
-                m_runtime.announceIopVblank(startCycle > m_eeCycle ? startCycle - m_eeCycle : 0u,
-                                            endCycle > m_eeCycle ? endCycle - m_eeCycle : 0u,
-                                            kVBlankPeriodCycles);
             }
             processEvent(scheduled.event);
         }
@@ -3245,6 +3346,63 @@ void EeScheduler::waitForEvent()
     }
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
+
+    if (ps2x::time::deterministicMode())
+    {
+        // PS2X(deterministic-mode): with every EE thread idle, jump the
+        // emulated clock to the next cycle deadline instead of sleeping until
+        // a host deadline.  VBlank, timer and alarm events are all scheduled
+        // on guest cycles, so this is the same instant the guest would reach.
+        uint64_t deadlineCycle = 0u;
+        bool haveDeadline = false;
+        if (!m_deadlines.empty())
+        {
+            const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+                                               [](const ScheduledEvent &left, const ScheduledEvent &right)
+                                               {
+                                                   if (left.deadlineCycle != right.deadlineCycle)
+                                                   {
+                                                       return left.deadlineCycle < right.deadlineCycle;
+                                                   }
+                                                   return left.sequence < right.sequence;
+                                               });
+            deadlineCycle = next->deadlineCycle;
+            haveDeadline = true;
+        }
+        if (hasTimerDeadline)
+        {
+            const uint64_t timerDeadline = m_eeCycle + timerCycles;
+            if (!haveDeadline || timerDeadline < deadlineCycle)
+            {
+                deadlineCycle = timerDeadline;
+                haveDeadline = true;
+            }
+        }
+
+        if (!haveDeadline)
+        {
+            // Nothing can advance guest time on its own; only a posted event
+            // (a stop request or a host-side wake) can end this wait.
+            m_eventCv.wait(lock, [this]()
+                           { return !m_events.empty() ||
+                                    m_stopRequested.load(std::memory_order_acquire); });
+            return;
+        }
+
+        const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
+        m_deadlineProbeCountdown = 0u;
+        m_deadlineDueObserved = true;
+        m_checkpointPending.store(true, std::memory_order_release);
+        lock.unlock();
+        uint64_t remaining = elapsed;
+        while (remaining > 0u)
+        {
+            const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+            accountCycles(step);
+            remaining -= step;
+        }
+        return;
+    }
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
         const auto waitStart = std::chrono::steady_clock::now();

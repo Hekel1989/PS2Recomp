@@ -2,6 +2,7 @@
 #include "CD.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ee_time.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -628,13 +629,8 @@ namespace ps2_stubs
             return;
         }
 
-        std::time_t now = std::time(nullptr);
-        std::tm localTm{};
-#ifdef _WIN32
-        localtime_s(&localTm, &now);
-#else
-        localtime_r(&now, &localTm);
-#endif
+        const std::time_t now = ps2x::time::wallTimeNow();
+        const std::tm localTm = ps2x::time::localTime(now);
 
         // sceCdCLOCK format (BCD fields).
         clockData[0] = 0;
