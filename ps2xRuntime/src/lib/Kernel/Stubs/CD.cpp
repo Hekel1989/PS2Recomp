@@ -3,6 +3,7 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ee_time.h"
+#include "runtime/mpeg_cost.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -184,6 +185,10 @@ namespace ps2_stubs
 
         void restartCdStreamAt(uint32_t lbn, PS2Runtime *runtime)
         {
+            // PS2X(mpeg-cost): a stream seek/restart flushes the CD stream
+            // ring and resets its production clock.
+            ps2x::mpeg_cost::Step seekStep("cd-seek");
+
             g_cdStreamingLbn = lbn;
             g_cdStreamingEndLbn = cdStreamingEndLbnForStart(lbn);
             resetCdStreamProduction(runtime);
@@ -1043,6 +1048,9 @@ namespace ps2_stubs
 
     void sceCdStStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // PS2X(mpeg-cost): starting a CD stream (the movie's first read).
+        ps2x::mpeg_cost::Step startStep("cd-start");
+
         const uint32_t lbn = getRegU32(ctx, 4);
         const uint32_t modeAddr = getRegU32(ctx, 5);
         uint8_t spindleControl = 0u;

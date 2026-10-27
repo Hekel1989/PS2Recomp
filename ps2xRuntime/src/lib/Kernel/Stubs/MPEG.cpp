@@ -2,6 +2,7 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ee_time.h"
+#include "runtime/mpeg_cost.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -90,6 +91,10 @@ namespace ps2_stubs
                     return false;
                 }
 
+                // PS2X(mpeg-cost): the whole demuxed elementary-stream feed,
+                // including parser, decoder and colour conversion.
+                ps2x::mpeg_cost::Step feedStep("decode");
+
                 static uint32_t s_feedLogCount = 0u;
                 const bool shouldLog = (s_feedLogCount < 32u);
                 if (shouldLog)
@@ -109,16 +114,22 @@ namespace ps2_stubs
                     int packetSize = 0;
                     const int chunk = static_cast<int>(std::min<size_t>(
                         remaining, static_cast<size_t>(std::numeric_limits<int>::max())));
-                    const int used = av_parser_parse2(
-                        m_parser,
-                        m_codecCtx,
-                        &packetData,
-                        &packetSize,
-                        cursor,
-                        chunk,
-                        parserPts,
-                        parserDts,
-                        0);
+                    int used = 0;
+                    {
+                        // PS2X(mpeg-cost): elementary-stream parsing is part
+                        // of the demux cost, separately from decode.
+                        ps2x::mpeg_cost::Step parseStep("av-parse");
+                        used = av_parser_parse2(
+                            m_parser,
+                            m_codecCtx,
+                            &packetData,
+                            &packetSize,
+                            cursor,
+                            chunk,
+                            parserPts,
+                            parserDts,
+                            0);
+                    }
                     if (used < 0)
                     {
                         std::cerr << "[MPEG] parser failed: " << ffmpegErrorString(used) << std::endl;
@@ -171,6 +182,10 @@ namespace ps2_stubs
                     return true;
                 }
 
+                // PS2X(mpeg-cost): parser flush and decoder drain can both
+                // produce a burst of frames at a sequence boundary.
+                ps2x::mpeg_cost::Step flushStep("flush");
+
                 if (m_parser)
                 {
                     uint8_t *packetData = nullptr;
@@ -206,6 +221,11 @@ namespace ps2_stubs
 
             void reset()
             {
+                // PS2X(mpeg-cost): freeing the decoder is cheap in theory but
+                // the large sws/AVFrame allocations make the free path worth
+                // measuring at a reset/seek.
+                ps2x::mpeg_cost::Step resetStep("decoder-reset");
+
                 if (m_swsCtx)
                 {
                     sws_freeContext(m_swsCtx);
@@ -243,6 +263,11 @@ namespace ps2_stubs
                 {
                     return true;
                 }
+
+                // PS2X(mpeg-cost): parser + codec allocation and the first
+                // avcodec_open2 are the prime suspects for the movie-start
+                // stall.
+                ps2x::mpeg_cost::Step createStep("decoder-create");
 
                 configureFfmpegLogLevel();
 
@@ -302,18 +327,28 @@ namespace ps2_stubs
                     return true;
                 }
 
-                av_packet_unref(m_packet);
-                const int allocRet = av_new_packet(m_packet, static_cast<int>(size));
-                if (allocRet < 0)
                 {
-                    std::cerr << "[MPEG] failed to allocate packet: " << ffmpegErrorString(allocRet) << std::endl;
-                    return false;
-                }
-                std::memcpy(m_packet->data, data, size);
-                m_packet->pts = pts;
-                m_packet->dts = dts;
+                    // PS2X(mpeg-cost): packet allocation + copy from the PSS
+                    // buffer, separately from the decoder call itself.
+                    ps2x::mpeg_cost::Step copyStep("packet-copy");
 
-                int ret = avcodec_send_packet(m_codecCtx, m_packet);
+                    av_packet_unref(m_packet);
+                    const int allocRet = av_new_packet(m_packet, static_cast<int>(size));
+                    if (allocRet < 0)
+                    {
+                        std::cerr << "[MPEG] failed to allocate packet: " << ffmpegErrorString(allocRet) << std::endl;
+                        return false;
+                    }
+                    std::memcpy(m_packet->data, data, size);
+                    m_packet->pts = pts;
+                    m_packet->dts = dts;
+                }
+
+                int ret = 0;
+                {
+                    ps2x::mpeg_cost::Step sendStep("av-send");
+                    ret = avcodec_send_packet(m_codecCtx, m_packet);
+                }
                 if (ret == AVERROR(EAGAIN))
                 {
                     if (!receiveFrames(frames))
@@ -321,6 +356,7 @@ namespace ps2_stubs
                         av_packet_unref(m_packet);
                         return false;
                     }
+                    ps2x::mpeg_cost::Step sendStep("av-send");
                     ret = avcodec_send_packet(m_codecCtx, m_packet);
                 }
                 av_packet_unref(m_packet);
@@ -343,7 +379,13 @@ namespace ps2_stubs
             {
                 while (true)
                 {
-                    const int ret = avcodec_receive_frame(m_codecCtx, m_frame);
+                    int ret = 0;
+                    {
+                        // PS2X(mpeg-cost): this is where an I/P picture is
+                        // actually reconstructed.
+                        ps2x::mpeg_cost::Step receiveStep("av-receive");
+                        ret = avcodec_receive_frame(m_codecCtx, m_frame);
+                    }
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
                     {
                         return true;
@@ -389,6 +431,10 @@ namespace ps2_stubs
                         sws_freeContext(m_swsCtx);
                         m_swsCtx = nullptr;
                     }
+                    // PS2X(mpeg-cost): a new frame size/format rebuilds the
+                    // scaler; the first creation is part of the movie-start
+                    // cost.
+                    ps2x::mpeg_cost::Step swsStep("sws-create");
                     m_swsCtx = sws_getContext(
                         width,
                         height,
@@ -417,18 +463,27 @@ namespace ps2_stubs
                 decoded.pts90k = m_frame->best_effort_timestamp != AV_NOPTS_VALUE
                                      ? m_frame->best_effort_timestamp
                                      : -1;
-                decoded.rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+                {
+                    // PS2X(mpeg-cost): a 320x240 RGBA frame is ~300 KiB and
+                    // the deque keeps several of them alive.
+                    ps2x::mpeg_cost::Step allocStep("frame-alloc");
+                    decoded.rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+                }
 
                 uint8_t *dstData[4] = {decoded.rgba.data(), nullptr, nullptr, nullptr};
                 int dstLinesize[4] = {width * 4, 0, 0, 0};
-                const int scaledRows = sws_scale(
-                    m_swsCtx,
-                    m_frame->data,
-                    m_frame->linesize,
-                    0,
-                    height,
-                    dstData,
-                    dstLinesize);
+                int scaledRows = 0;
+                {
+                    ps2x::mpeg_cost::Step scaleStep("scale");
+                    scaledRows = sws_scale(
+                        m_swsCtx,
+                        m_frame->data,
+                        m_frame->linesize,
+                        0,
+                        height,
+                        dstData,
+                        dstLinesize);
+                }
                 if (scaledRows <= 0)
                 {
                     std::cerr << "[MPEG] FFmpeg scaler produced no rows." << std::endl;
@@ -519,6 +574,12 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            // PS2X(mpeg-cost): last PES timestamp seen, used only to label
+            // the cost trace; waitStartNs records a scheduler wait that has no
+            // return path of its own (waitExternal is noreturn).
+            int64_t lastPts90k = -1;
+            uint64_t waitStartNs = 0u;
+            const char *waitStep = nullptr;
         };
 
         struct MpegStreamCallbackEvent
@@ -554,6 +615,20 @@ namespace ps2_stubs
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
         MpegStubState g_mpeg_stub_state;
+
+        // PS2X(mpeg-cost): report a lock acquisition that blocked, then hand
+        // back the same ownership the old lock_guard had.
+        std::unique_lock<std::mutex> lockMpegStub()
+        {
+            if (!ps2x::mpeg_cost::enabled())
+            {
+                return std::unique_lock<std::mutex>(g_mpeg_stub_mutex);
+            }
+            const uint64_t startNs = ps2x::mpeg_cost::nowNs();
+            std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+            ps2x::mpeg_cost::note("lock", startNs);
+            return lock;
+        }
 
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
@@ -825,6 +900,24 @@ namespace ps2_stubs
             return playback;
         }
 
+        // PS2X(mpeg-cost): label every step with the guest context that was
+        // current when it ran.  The fields are diagnostic only; nothing in the
+        // playback state depends on them.
+        void setMpegCostContext(const MpegPlaybackState &playback,
+                                uint64_t vsync,
+                                int64_t pts90k = -1)
+        {
+            if (!ps2x::mpeg_cost::enabled())
+            {
+                return;
+            }
+            ps2x::mpeg_cost::Context context;
+            context.pts90k = pts90k >= 0 ? pts90k : playback.lastPts90k;
+            context.frame = playback.picturesServed;
+            context.vsync = vsync;
+            ps2x::mpeg_cost::setContext(context);
+        }
+
         uint16_t readBe16(const uint8_t *p)
         {
             return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8u) | static_cast<uint16_t>(p[1]));
@@ -1045,9 +1138,30 @@ namespace ps2_stubs
             }
 
             playback.sawInput = true;
-            updateMpegPictureTiming(playback, data, size);
+            if (pts90k >= 0)
+            {
+                playback.lastPts90k = pts90k;
+            }
+            if (ps2x::mpeg_cost::enabled())
+            {
+                ps2x::mpeg_cost::Context context = ps2x::mpeg_cost::context();
+                context.pts90k = pts90k >= 0 ? pts90k : playback.lastPts90k;
+                context.frame = playback.picturesServed;
+                ps2x::mpeg_cost::setContext(context);
+            }
+
+            {
+                // PS2X(mpeg-cost): the sequence-header/timing scan runs over
+                // a moving 4 KiB window on every feed.
+                ps2x::mpeg_cost::Step timingStep("timing-scan");
+                updateMpegPictureTiming(playback, data, size);
+            }
             if (playback.waitingForVideoSequenceHeader)
             {
+                // PS2X(mpeg-cost): resync buffer growth/search before the
+                // first sequence header can be a one-off at movie start.
+                ps2x::mpeg_cost::Step syncStep("es-sync");
+
                 playback.videoSequenceSyncBuffer.insert(
                     playback.videoSequenceSyncBuffer.end(),
                     data,
@@ -1132,7 +1246,10 @@ namespace ps2_stubs
             }
 
             playback.videoSequenceSyncBuffer.clear();
-            flushDecoderIfEnded(playback);
+            {
+                ps2x::mpeg_cost::Step flushStep("flush");
+                flushDecoderIfEnded(playback);
+            }
         }
 
         void erasePssPrefix(MpegPlaybackState &playback, size_t count)
@@ -1357,6 +1474,10 @@ namespace ps2_stubs
                 if (isVideoStreamId(streamId))
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
+                    if (pes.pts90k >= 0)
+                    {
+                        playback.lastPts90k = pes.pts90k;
+                    }
                     const size_t payloadStart = pes.payloadOffset;
                     if (payloadStart < packetEnd)
                     {
@@ -1382,6 +1503,10 @@ namespace ps2_stubs
                 else if (isAudioStreamId(streamId))
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
+                    if (pes.pts90k >= 0)
+                    {
+                        playback.lastPts90k = pes.pts90k;
+                    }
                     const size_t payloadStart = pes.payloadOffset;
                     // The audio payload is `ff a0 00 00` followed by PCM; the
                     // first payload also carries the SShd/SSbd stream header.
@@ -1421,7 +1546,10 @@ namespace ps2_stubs
         void finishPlaybackStream(uint32_t mpegAddr, MpegPlaybackState &playback)
         {
             std::vector<MpegStreamCallbackEvent> ignoredCallbacks;
-            processPssBuffer(mpegAddr, playback, ignoredCallbacks, true);
+            {
+                ps2x::mpeg_cost::Step parseStep("pss-parse");
+                processPssBuffer(mpegAddr, playback, ignoredCallbacks, true);
+            }
             playback.streamEnded = true;
             playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
             flushDecoderIfEnded(playback);
@@ -1510,13 +1638,24 @@ namespace ps2_stubs
             }
             playback.sawInput = true;
 
-            playback.pssBuffer.insert(playback.pssBuffer.end(), data, data + size);
-            playback.pssGuestAddrs.reserve(playback.pssGuestAddrs.size() + size);
-            for (size_t i = 0; i < size; ++i)
             {
-                playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+                // PS2X(mpeg-cost): the PSS buffer keeps one guest address per
+                // byte, so a refill reallocates and copies both vectors.
+                ps2x::mpeg_cost::Step appendStep("pss-append");
+
+                playback.pssBuffer.insert(playback.pssBuffer.end(), data, data + size);
+                playback.pssGuestAddrs.reserve(playback.pssGuestAddrs.size() + size);
+                for (size_t i = 0; i < size; ++i)
+                {
+                    playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+                }
             }
-            processPssBuffer(mpegAddr, playback, callbackEvents);
+            {
+                // PS2X(mpeg-cost): PES parsing, stream-callback queueing and
+                // the nested FFmpeg decode call.
+                ps2x::mpeg_cost::Step parseStep("pss-parse");
+                processPssBuffer(mpegAddr, playback, callbackEvents);
+            }
         }
 
         size_t appendGuestBytes(uint32_t mpegAddr,
@@ -1696,6 +1835,13 @@ namespace ps2_stubs
 
             for (const MpegStreamCallbackEvent &event : events)
             {
+                // PS2X(mpeg-cost): hand-off to the game's stream callback.
+                // The callback itself is queued on the EE scheduler and runs
+                // after this stub returns; this measures the hand-off only.
+                const char *stepName = event.streamType == kMpegStrPCM
+                                           ? "audio-handoff"
+                                           : (event.streamType == kMpegStrADPCM ? "adpcm-handoff" : "video-handoff");
+                ps2x::mpeg_cost::Step handoffStep(stepName);
                 for (const MpegRegisteredCallback &callback : event.callbacks)
                 {
                     dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
@@ -1722,6 +1868,8 @@ namespace ps2_stubs
             {
                 return;
             }
+
+            ps2x::mpeg_cost::Step writeStep("blank-write");
 
             const uint32_t outWidth = align16(width == 0u ? kStubMovieWidth : width);
             const uint32_t outHeight = align16(height == 0u ? kStubMovieHeight : height);
@@ -1756,6 +1904,11 @@ namespace ps2_stubs
             {
                 return;
             }
+
+            // PS2X(mpeg-cost): guest frame write.  The 16-pixel macroblock
+            // layout writes each row through a separate getMemPtr() and copies
+            // pixel by pixel.
+            ps2x::mpeg_cost::Step writeStep("frame-write");
 
             const uint32_t width = static_cast<uint32_t>(frame.width);
             const uint32_t height = static_cast<uint32_t>(frame.height);
@@ -1828,7 +1981,7 @@ namespace ps2_stubs
 
     void resetMpegStubState()
     {
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         resetMpegStubStateUnlocked();
     }
 
@@ -1842,7 +1995,7 @@ namespace ps2_stubs
         frame.height = kTestFrameHeight;
         frame.rgba.resize(static_cast<size_t>(kTestFrameWidth * kTestFrameHeight * 4), 0x80u);
 
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
         playback.sawInput = true;
         playback.decodedFrames.push_back(std::move(frame));
@@ -1851,7 +2004,7 @@ namespace ps2_stubs
     void notifyMpegCdStreamStart(PS2Runtime *runtime)
     {
         (void)runtime;
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         ++g_mpeg_stub_state.cdStreamGeneration;
         g_mpeg_stub_state.cdStreamBytesProduced = 0u;
         g_mpeg_stub_state.cdStreamBytesDemuxed = 0u;
@@ -1864,6 +2017,7 @@ namespace ps2_stubs
         g_mpeg_stub_state.pictureTraceCount = 0u;
         g_mpeg_stub_state.isEndTraceCount = 0u;
 
+        ps2x::mpeg_cost::Step startStep("stream-start");
         for (auto &[mpegAddr, playback] : g_mpeg_stub_state.playbackByMpeg)
         {
             playback = makeFreshPlaybackStatePreservingConfig(playback);
@@ -1876,7 +2030,7 @@ namespace ps2_stubs
 
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream)
     {
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         g_mpeg_stub_state.cdStreamBytesProduced += byteCount;
         if (endOfStream)
         {
@@ -1889,7 +2043,9 @@ namespace ps2_stubs
         std::vector<uint32_t> completedMpegIds;
         bool changed = false;
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
+            // PS2X(mpeg-cost): EOF finalisation can decode/flush the tail.
+            ps2x::mpeg_cost::Step eofStep("eof-finalize");
             finalizeCdStreamEofUnlocked(completedMpegIds, changed);
         }
 
@@ -1919,8 +2075,13 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         bool wakePictureWaiter = false;
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (runtime != nullptr)
+            {
+                setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
+            }
+            ps2x::mpeg_cost::Step flushStep("flush");
             const size_t framesBefore = playback.decodedFrames.size();
             if (playback.decoder)
             {
@@ -1946,8 +2107,13 @@ namespace ps2_stubs
         size_t copied = 0u;
         bool wakePictureWaiter = false;
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (runtime != nullptr)
+            {
+                setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
+            }
+            ps2x::mpeg_cost::Step addStep("add-bs");
             const size_t framesBefore = playback.decodedFrames.size();
             while (copied < byteCount)
             {
@@ -1971,7 +2137,7 @@ namespace ps2_stubs
         }
         if (mpegTraceEnabled())
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
             std::cerr << "[mpeg-trace] AddBs mpeg=0x" << std::hex << mpegAddr
                       << std::dec << " copied=" << copied
@@ -1995,7 +2161,7 @@ namespace ps2_stubs
         const uint32_t callbackFunc = getRegU32(ctx, 6);
         const uint32_t callbackData = getRegU32(ctx, 7);
 
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
 
@@ -2015,7 +2181,7 @@ namespace ps2_stubs
         const uint32_t callbackFunc = getRegU32(ctx, 7);
         const uint32_t callbackData = readAbiArg4(rdram, ctx);
 
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
@@ -2071,6 +2237,9 @@ namespace ps2_stubs
 
     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // PS2X(mpeg-cost): MPEG handle/work-area creation and guestMalloc.
+        ps2x::mpeg_cost::Step createStep("mpeg-create");
+
         if (runtime != nullptr)
         {
             runtime->setMovieAudioActive(true);
@@ -2090,7 +2259,7 @@ namespace ps2_stubs
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             getPlaybackState(param_1) = makeFreshPlaybackState();
         }
 
@@ -2157,9 +2326,10 @@ namespace ps2_stubs
     {
         (void)rdram;
 
+        ps2x::mpeg_cost::Step deleteStep("mpeg-delete");
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
         }
@@ -2183,8 +2353,15 @@ namespace ps2_stubs
         bool eofChanged = false;
         bool backpressured = false;
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (runtime != nullptr)
+            {
+                setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
+            }
+            // PS2X(mpeg-cost): the whole host-side demux call; nested
+            // decode/parse steps break it down.
+            ps2x::mpeg_cost::Step demuxStep("demux");
             decodedBefore = playback.decodedFrames.size();
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
@@ -2280,8 +2457,15 @@ namespace ps2_stubs
         bool eofChanged = false;
         bool backpressured = false;
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (runtime != nullptr)
+            {
+                setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
+            }
+            // PS2X(mpeg-cost): ring demux call, including the nested copy,
+            // parse and decode steps.
+            ps2x::mpeg_cost::Step demuxStep("demux");
             decodedBefore = playback.decodedFrames.size();
             backpressured = mpegDemuxBackpressured(playback);
             if (!backpressured)
@@ -2373,7 +2557,7 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         setReturnU32(ctx, getPlaybackState(mpegAddr).height);
     }
 
@@ -2382,7 +2566,7 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         setReturnU32(ctx, getPlaybackState(mpegAddr).width);
     }
 
@@ -2391,12 +2575,17 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // PS2X(mpeg-cost): the waiting path is noreturn, so time the work
+        // after any wait with an explicit start/end pair.
+        const bool costEnabled = ps2x::mpeg_cost::enabled();
+        const uint64_t pictureStartNs = costEnabled ? ps2x::mpeg_cost::nowNs() : 0u;
+
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         if (runtime != nullptr)
             runtime->noteMovieAudioActivity(runtime->eeScheduler().currentVSyncTick());
@@ -2408,8 +2597,21 @@ namespace ps2_stubs
         bool atStreamEnd = false;
         MpegDecodedFrame frame;
         {
-            std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (costEnabled)
+            {
+                if (playback.waitStartNs != 0u)
+                {
+                    ps2x::mpeg_cost::note(playback.waitStep, playback.waitStartNs);
+                    playback.waitStartNs = 0u;
+                    playback.waitStep = nullptr;
+                }
+                if (runtime != nullptr)
+                {
+                    setMpegCostContext(playback, runtime->eeScheduler().currentVSyncTick());
+                }
+            }
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
@@ -2424,6 +2626,14 @@ namespace ps2_stubs
                                   << " sawInput=" << playback.sawInput << std::endl;
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                }
+                if (costEnabled)
+                {
+                    // PS2X(mpeg-cost): this wait parks the game thread until
+                    // the CD/IOP producer delivers a picture.  The resumed
+                    // call records the elapsed time as step=wait-frames.
+                    playback.waitStartNs = ps2x::mpeg_cost::nowNs();
+                    playback.waitStep = "wait-frames";
                 }
                 lock.unlock();
                 runtime->eeScheduler().waitExternal(
@@ -2487,6 +2697,18 @@ namespace ps2_stubs
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
                 haveFrame = true;
+                if (costEnabled)
+                {
+                    ps2x::mpeg_cost::Context context;
+                    context.pts90k = frame.pts90k >= 0 ? frame.pts90k : playback.lastPts90k;
+                    context.frame = frameCount;
+                    context.vsync = runtime->eeScheduler().currentVSyncTick();
+                    ps2x::mpeg_cost::setContext(context);
+                    if (frame.pts90k >= 0)
+                    {
+                        playback.lastPts90k = frame.pts90k;
+                    }
+                }
                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({
@@ -2583,6 +2805,10 @@ namespace ps2_stubs
             writeBlankMpegFrame(rdram, imageAddr, width, height);
         }
 
+        if (costEnabled)
+        {
+            ps2x::mpeg_cost::note("picture", pictureStartNs);
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -2599,7 +2825,10 @@ namespace ps2_stubs
     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        (void)runtime;
+        // PS2X(mpeg-cost): library init keeps the CD-stream counters.
+        ps2x::mpeg_cost::Step initStep("mpeg-init");
+        auto lock = lockMpegStub();
         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
         const uint64_t cdStreamBytesProduced = g_mpeg_stub_state.cdStreamBytesProduced;
         const uint64_t cdStreamBytesDemuxed = g_mpeg_stub_state.cdStreamBytesDemuxed;
@@ -2620,7 +2849,7 @@ namespace ps2_stubs
         (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
 
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         g_mpeg_stub_state.initialized = true;
         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
         // Only the producer/demux EOF is authoritative. A sequence_end_code can
@@ -2662,13 +2891,16 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
         setReturnS32(ctx, playback.decodedFrames.empty() ? 1 : 0);
     }
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // PS2X(mpeg-cost): a reset drops the decoder and every queued frame.
+        ps2x::mpeg_cost::Step resetStep("mpeg-reset");
+
         // PS2X(desched-repay): the intro skip calls sceMpegReset, not
         // sceMpegDelete.  Without this the movie-active flag stayed set for
         // the rest of the run and the pacing code kept discarding its debt
@@ -2686,7 +2918,7 @@ namespace ps2_stubs
                       << " activeBefore=" << activeBefore << std::endl;
         }
         {
-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            auto lock = lockMpegStub();
             MpegPlaybackState &playback = getPlaybackState(param_1);
             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
             if (playback.streamEnded || playback.decoderFailed)
@@ -2730,7 +2962,7 @@ namespace ps2_stubs
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t mode = getRegU32(ctx, 5);
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         getPlaybackState(mpegAddr).decodeMode = mode;
         setReturnS32(ctx, 0);
     }
@@ -2748,7 +2980,7 @@ namespace ps2_stubs
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t imageBufferAddr = getRegU32(ctx, 5);
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        auto lock = lockMpegStub();
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
     }

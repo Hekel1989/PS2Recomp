@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include "runtime/ee_time.h"
+#include "runtime/mpeg_cost.h"
 #include "runtime/ps2_gs_host_hooks.h"
 
 namespace
@@ -444,6 +445,11 @@ namespace
             return true;
         }
 
+        // PS2X(mpeg-cost): every CD read opens, seeks and fills a host file
+        // synchronously on the game thread.  This is the file/ISO read that
+        // feeds the movie demuxer.
+        ::ps2x::mpeg_cost::Step readStep("file-read");
+
         std::memset(dst, 0, byteCount);
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open())
@@ -466,6 +472,9 @@ namespace
 
     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
     {
+        // PS2X(mpeg-cost): path lookup plus the nested file-read step.
+        ::ps2x::mpeg_cost::Step readStep("cd-read");
+
         for (const auto &[key, entry] : g_cdFilesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;
