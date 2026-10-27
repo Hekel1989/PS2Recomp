@@ -557,8 +557,12 @@ void register_ps2_gs_tests()
             std::memcpy(&xyoffset10Addr, rdram.data() + kEnvAddr + kXYOffset1AddrOffset, sizeof(xyoffset10Addr));
 
             t.Equals((dispfb0 >> 9) & 0x3Fu, 10ull, "dbuff display env should seed FBW from width");
-            t.Equals((display0 >> 32) & 0x0FFFull, 639ull, "dbuff display env should seed DW from width");
-            t.Equals((display0 >> 44) & 0x07FFull, 447ull, "dbuff display env should seed DH from height");
+            // DISPLAY as libgraph's sceGsSetDefDispEnv computes it: the PCRTC
+            // runs 2560 VCK per line, so 640 pixels need MAGH 3 and DW spans
+            // the whole line; interlaced FRAME mode doubles DH.
+            t.Equals((display0 >> 23) & 0x0Full, 3ull, "dbuff display env should seed MAGH from width");
+            t.Equals((display0 >> 32) & 0x0FFFull, 2559ull, "dbuff display env should seed DW from width");
+            t.Equals((display0 >> 44) & 0x07FFull, 895ull, "dbuff display env should seed DH from height");
             t.Equals((frame10 >> 16) & 0x3Full, 10ull, "dbuff draw env should seed FRAME FBW from width");
             t.Equals(frame10Addr, 0x4Cull, "dbuff draw env should seed FRAME_1 register id");
             t.Equals(xyoffset10 & 0xFFFFull, 0x6C00ull, "dbuff draw env should seed OFX in 12.4 fixed point");
@@ -579,7 +583,7 @@ void register_ps2_gs_tests()
 
             t.Equals(runtime.memory().gs().dispfb1 & 0x1FFull, 151ull,
                      "sceGsSwapDBuffDc should program GS to the selected display page");
-            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
+            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 2559ull,
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
         });
 

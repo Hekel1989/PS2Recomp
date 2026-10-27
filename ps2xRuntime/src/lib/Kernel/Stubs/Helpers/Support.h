@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cctype>
+#include "runtime/ee_time.h"
+#include "runtime/mpeg_cost.h"
 #include "runtime/ps2_gs_host_hooks.h"
 
 namespace
@@ -251,17 +253,29 @@ namespace
             bool matched = false;
             const std::string needle = toLowerAscii(component.string());
             std::error_code iterEc;
+            std::vector<std::filesystem::path> entries;
             for (const auto &entry : std::filesystem::directory_iterator(current, iterEc))
             {
                 if (iterEc)
                 {
                     break;
                 }
-
-                const std::string candidate = toLowerAscii(entry.path().filename().string());
+                entries.push_back(entry.path());
+            }
+            // PS2X(deterministic-mode): host directory order must not choose
+            // between case-insensitive matches.
+            if (ps2x::time::deterministicMode())
+            {
+                std::sort(entries.begin(), entries.end(),
+                          [](const std::filesystem::path &left, const std::filesystem::path &right)
+                          { return left.generic_string() < right.generic_string(); });
+            }
+            for (const std::filesystem::path &entry : entries)
+            {
+                const std::string candidate = toLowerAscii(entry.filename().string());
                 if (candidate == needle)
                 {
-                    current = entry.path();
+                    current = entry;
                     matched = true;
                     break;
                 }
@@ -300,6 +314,7 @@ namespace
             return;
         }
 
+        std::vector<std::filesystem::path> files;
         for (const auto &entry : std::filesystem::recursive_directory_iterator(
                  root, std::filesystem::directory_options::skip_permission_denied, ec))
         {
@@ -311,18 +326,30 @@ namespace
             {
                 continue;
             }
-
-            const std::string leaf = toLowerAscii(entry.path().filename().string());
-            g_cdLeafIndex.emplace(leaf, entry.path());
+            files.push_back(entry.path());
+        }
+        // PS2X(deterministic-mode): recursive_directory_iterator order is a
+        // host-filesystem property; it must not decide which duplicate leaf
+        // name a guest file lookup resolves to.
+        if (ps2x::time::deterministicMode())
+        {
+            std::sort(files.begin(), files.end(),
+                      [](const std::filesystem::path &left, const std::filesystem::path &right)
+                      { return left.generic_string() < right.generic_string(); });
+        }
+        for (const std::filesystem::path &file : files)
+        {
+            const std::string leaf = toLowerAscii(file.filename().string());
+            g_cdLeafIndex.emplace(leaf, file);
 
             std::error_code relEc;
-            const std::filesystem::path relative = std::filesystem::relative(entry.path(), root, relEc);
+            const std::filesystem::path relative = std::filesystem::relative(file, root, relEc);
             if (!relEc)
             {
                 const std::string looseKey = cdLoosePathKeyFromRelative(relative);
                 if (!looseKey.empty())
                 {
-                    g_cdLoosePathIndex.emplace(looseKey, entry.path());
+                    g_cdLoosePathIndex.emplace(looseKey, file);
                 }
             }
         }
@@ -418,6 +445,11 @@ namespace
             return true;
         }
 
+        // PS2X(mpeg-cost): every CD read opens, seeks and fills a host file
+        // synchronously on the game thread.  This is the file/ISO read that
+        // feeds the movie demuxer.
+        ::ps2x::mpeg_cost::Step readStep("file-read");
+
         std::memset(dst, 0, byteCount);
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open())
@@ -440,6 +472,9 @@ namespace
 
     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
     {
+        // PS2X(mpeg-cost): path lookup plus the nested file-read step.
+        ::ps2x::mpeg_cost::Step readStep("cd-read");
+
         for (const auto &[key, entry] : g_cdFilesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;

@@ -499,10 +499,14 @@ namespace ps2_stubs
 
             // Scripted input drives port 0 and overrides live devices so
             // automated runs are deterministic (see PS2X_PAD_SCRIPT above).
+            // PS2X(pad-record): one vsync stamp for both the script player and
+            // the recorder, so a recorded entry replays on the read it saw.
+            const uint64_t padVsync =
+                (port == 0 && runtime != nullptr) ? runtime->eeScheduler().currentVSyncTick() : 0u;
             if (port == 0 && runtime != nullptr)
             {
                 uint16_t scriptedButtons = 0xFFFFu;
-                if (padScriptButtonsAt(runtime->eeScheduler().currentVSyncTick(), scriptedButtons))
+                if (padScriptButtonsAt(padVsync, scriptedButtons))
                 {
                     state.buttons = scriptedButtons;
                     state.rx = kPadAnalogCenter;
@@ -512,6 +516,13 @@ namespace ps2_stubs
                     // Pressure follows the scripted buttons, not the host device.
                     state.hasPressure = false;
                 }
+            }
+
+            // PS2X(pad-record): let the frontend observe the final game-visible
+            // port 0 buttons (no observer is registered unless recording).
+            if (port == 0 && runtime != nullptr && Ps2PadHostHooks::stateObserver())
+            {
+                Ps2PadHostHooks::stateObserver()(port, padVsync, state.buttons);
             }
 
             fillPadStatus(outData, state, portState);

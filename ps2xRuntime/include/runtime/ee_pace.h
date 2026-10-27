@@ -62,11 +62,13 @@ namespace ps2x::time
         const uint64_t excluded = std::min(sample.wallNs, sample.stallNs + step.descheduledNs);
         step.baseNs = sample.wallNs - excluded;
 
-        // During an MPEG movie, replaying excluded time advances VBlank/IOP/SPU2
-        // while the audio producer is stalled, draining the IOP ring.  The
-        // movie pauses for the stall/descheduling instead.  This rule is
-        // deliberately unchanged.
-        if (sample.movieActive || !sample.repayShortDesched)
+        // Short descheduling is repaid during an MPEG movie too.  The sound
+        // device consumes 48 kHz of wall time; leaving the descheduling out
+        // ran the guest clock (and so SPU2 output) 1-2 % slow for the whole
+        // movie, and the output queue drained into a short silence every
+        // ~10 s.  One VBlank of catch-up is well inside the game's 24 KiB
+        // (128 ms) IOP audio ring.  Long stalls are still discarded below.
+        if (!sample.repayShortDesched)
         {
             step.shortDeschedNs = 0u;
         }

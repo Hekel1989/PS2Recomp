@@ -18,7 +18,10 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
+#include <atomic>
+#include <csignal>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +39,11 @@ namespace ps2x::iop::detail
 {
     namespace
     {
+        // PS2X_IOP_SIGNAL_DUMP=1: SIGUSR1 requests one thread dump plus an IOP
+        // RAM image at the next idle point.  Nothing else changes until the
+        // signal arrives, so a timing-sensitive hang keeps its timing.
+        std::atomic<bool> s_signalDumpRequested{false};
+        void onSignalDump(int) { s_signalDumpRequested.store(true, std::memory_order_relaxed); }
         constexpr uint32_t kRamSize = IopMemory::RamSize;
         constexpr uint32_t kKernelHeapBase = IopMemory::HeapBase;
         constexpr uint32_t kKernelHeapLimit = IopMemory::HeapLimit;
@@ -122,6 +130,7 @@ namespace ps2x::iop::detail
 
         void reset()
         {
+            rpcLoops.clear();
             memory.reset();
             if (const char *watch = std::getenv("PS2X_IOP_WATCH"); watch != nullptr)
             {
@@ -373,8 +382,72 @@ namespace ps2x::iop::detail
             Missing,
         };
 
+        // PS2X_IOP_TRACE_IMPORTS="lib[,lib:ordinal]...": logs only the listed
+        // imports (pc, ra, a0-a3, the string at a0 for ioman/iomanx open), so a
+        // rare call can be followed without PS2X_IOP_IMPORT_TRACE's flood.
+        void traceImportCall(const IopImportCall &call, const CpuState &cpu)
+        {
+            static const std::vector<std::pair<std::string, int>> s_filter = []
+            {
+                std::vector<std::pair<std::string, int>> filter;
+                const char *env = std::getenv("PS2X_IOP_TRACE_IMPORTS");
+                if (env == nullptr)
+                    return filter;
+                std::string spec(env);
+                size_t start = 0;
+                while (start <= spec.size())
+                {
+                    const size_t end = std::min(spec.find(',', start), spec.size());
+                    std::string item = spec.substr(start, end - start);
+                    if (!item.empty())
+                    {
+                        const size_t colon = item.find(':');
+                        if (colon == std::string::npos)
+                            filter.emplace_back(item, -1);
+                        else
+                            filter.emplace_back(item.substr(0, colon), std::atoi(item.c_str() + colon + 1));
+                    }
+                    start = end + 1;
+                }
+                return filter;
+            }();
+            if (s_filter.empty())
+                return;
+            bool match = false;
+            for (const auto &[library, ordinal] : s_filter)
+            {
+                if (iequals(call.library, library) && (ordinal < 0 || ordinal == call.ordinal))
+                {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match)
+                return;
+            std::ostringstream out;
+            out << "[IOP] trace " << call.library << ':' << std::dec << call.ordinal << std::hex
+                << " pc=0x" << cpu.pc << " ra=0x" << cpu.gpr[31] << " a0=0x" << cpu.gpr[4]
+                << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6] << " a3=0x" << cpu.gpr[7]
+                << " cycle=" << std::dec << totalCycles;
+            if ((iequals(call.library, "ioman") || iequals(call.library, "iomanx")) && call.ordinal == 4u &&
+                cpu.gpr[4] != 0u && cpu.gpr[4] < IopMemory::RamSize)
+            {
+                std::string path;
+                for (uint32_t i = 0; i < 128u; ++i)
+                {
+                    const char c = static_cast<char>(read8(cpu.gpr[4] + i));
+                    if (c == '\0')
+                        break;
+                    path.push_back(c);
+                }
+                out << " path=\"" << path << '"';
+            }
+            log(LogLevel::Info, out.str());
+        }
+
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            traceImportCall(call, cpu);
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -438,11 +511,31 @@ namespace ps2x::iop::detail
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
+            if (iequals(call.library, "sifcmd") && call.ordinal == 22u) // sceSifRpcLoop(queue)
+            {
+                // PS2X(iop-rpc-thread): the calling thread becomes the queue's
+                // server and loops at kRpcLoopSentinel (stepRpcLoop), running
+                // each queued handler on its own stack.
+                IopThread *thread = kernel.currentThread();
+                if (thread != nullptr && &thread->cpu == &cpu)
+                {
+                    rpc.bindLoopThread(cpu.gpr[4], thread->id);
+                    rpcLoops[thread->id] = RpcLoopState{cpu.gpr[4], (cpu.gpr[29] - 0x40u) & ~15u, 0u};
+                    cpu.pc = kRpcLoopSentinel;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
+            }
             if (iequals(call.library, "sifcmd"))
             {
                 return rpc.dispatchSifCmdImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
+            }
+            if (iequals(call.library, "intrman") && call.ordinal == 23u) // QueryIntrContext
+            {
+                setV0(kernel.inInterrupt() ? 1u : 0u);
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
@@ -535,6 +628,47 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // One pass of sceSifRpcLoop on the server thread: send the reply of
+        // the handler that just returned, start the next queued handler, or
+        // sleep until a request wakes the thread (as OpenPS2BIOS and Play! do).
+        bool stepRpcLoop(CpuState &cpu)
+        {
+            ++totalInstructions;
+            ++totalCycles;
+            IopThread *thread = kernel.currentThread();
+            const auto loop = thread != nullptr && &thread->cpu == &cpu ? rpcLoops.find(thread->id) : rpcLoops.end();
+            if (loop == rpcLoops.end())
+            {
+                log(LogLevel::Error, "[IOP] RpcLoop reached outside its server thread");
+                cpu.stopped = true;
+                return false;
+            }
+            RpcLoopState &state = loop->second;
+            if (state.active != 0u)
+            {
+                rpc.finishRequest(state.active, cpu.gpr[2]);
+                state.active = 0u;
+            }
+            if (const auto next = rpc.takeNextRequest(state.queue))
+            {
+                state.active = next->token;
+                cpu.gpr[4] = next->rpcNumber;
+                cpu.gpr[5] = next->buffer;
+                cpu.gpr[6] = next->size;
+                cpu.gpr[28] = next->gp;
+                cpu.gpr[29] = state.stack;
+                cpu.gpr[31] = kRpcLoopSentinel;
+                cpu.pc = next->function;
+                cpu.branchPending = false;
+                return true;
+            }
+            if (thread->wakeupCount > 0)
+                --thread->wakeupCount;
+            else
+                (void)kernel.sleepCurrent(cpu, "RpcLoop");
+            return true;
+        }
+
         void recordBranch(uint32_t from, uint32_t to)
         {
             static const char *s_range = std::getenv("PS2X_IOP_TRACERANGE");
@@ -586,6 +720,8 @@ namespace ps2x::iop::detail
                 cpu.stopped = true;
                 return false;
             }
+            if (cpu.pc == kRpcLoopSentinel)
+                return stepRpcLoop(cpu);
             if (physicalAddress(cpu.pc) >= kRamSize)
             {
                 std::ostringstream out;
@@ -709,10 +845,18 @@ namespace ps2x::iop::detail
                 if (!step(cpu))
                     break;
                 advanceSpu2();
+                // A handler that readied a higher-priority thread preempts the
+                // running one when it returns, as on the IOP.
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                {
                     servicePendingDmaInterrupts();
+                    (void)kernel.preemptIfHigherPriority(cpu);
+                }
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                {
                     servicePendingGuestCallbacks();
+                    (void)kernel.preemptIfHigherPriority(cpu);
+                }
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -795,6 +939,34 @@ namespace ps2x::iop::detail
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
         }
 
+        // Marks interrupt context for the kernel while a handler runs.
+        struct InterruptContext
+        {
+            IopKernel &kernel;
+            explicit InterruptContext(IopKernel &k) : kernel(k) { kernel.enterInterrupt(); }
+            ~InterruptContext() { kernel.leaveInterrupt(); }
+            InterruptContext(const InterruptContext &) = delete;
+            InterruptContext &operator=(const InterruptContext &) = delete;
+        };
+
+        // Hardware timer handlers and thbase alarms, both in interrupt context.
+        void serviceTimersAndAlarms()
+        {
+            {
+                const InterruptContext interrupt{kernel};
+                timrman.serviceDue(totalCycles, *this);
+            }
+            while (const auto alarm = kernel.dueAlarm(totalCycles))
+            {
+                uint32_t again = 0u;
+                {
+                    const InterruptContext interrupt{kernel};
+                    again = callFunction(alarm->handler, alarm->argument, 0u, 0u, 0u, alarm->gp, 100000u);
+                }
+                kernel.finishAlarm(alarm->serial, again, totalCycles);
+            }
+        }
+
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
@@ -824,6 +996,7 @@ namespace ps2x::iop::detail
                         out << "[IOP] dma-irq fire cause=" << std::dec << irq << " cycles=" << totalCycles;
                         log(LogLevel::Info, out.str());
                     }
+                    const InterruptContext interrupt{kernel};
                     (void)intrman.dispatchInterrupt(irq, *this);
                 }
             }
@@ -886,22 +1059,51 @@ namespace ps2x::iop::detail
         void maybeDumpIdleThreads()
         {
             static const bool s_dump = std::getenv("PS2X_IOP_IDLE_DUMP") != nullptr;
-            if (!s_dump)
-                return;
-            if (totalCycles - lastIdleDumpCycle < 33000000ull)
-                return;
-            lastIdleDumpCycle = totalCycles;
+            static const bool s_signalDump = []
+            {
+                if (std::getenv("PS2X_IOP_SIGNAL_DUMP") == nullptr)
+                    return false;
+                std::signal(SIGUSR1, onSignalDump);
+                return true;
+            }();
+            bool signalled = false;
+            if (s_signalDump && s_signalDumpRequested.load(std::memory_order_relaxed))
+            {
+                s_signalDumpRequested.store(false, std::memory_order_relaxed);
+                signalled = true;
+            }
+            if (!signalled)
+            {
+                if (!s_dump)
+                    return;
+                if (totalCycles - lastIdleDumpCycle < 33000000ull)
+                    return;
+                lastIdleDumpCycle = totalCycles;
+            }
+            else
+            {
+                static unsigned signalDumpCount = 0u;
+                const std::string file = "iopram_signal" + std::to_string(signalDumpCount++) + ".bin";
+                std::ofstream ramOut(file, std::ios::binary);
+                const auto ram = memory.ram();
+                ramOut.write(reinterpret_cast<const char *>(ram.data()),
+                             static_cast<std::streamsize>(ram.size()));
+                log(LogLevel::Info, "[IOP] signal dump: ram -> " + file);
+            }
             std::ostringstream out;
             out << "[IOP] idle thread-dump cycles=" << std::dec << totalCycles;
             kernel.forEachThread([&](const IopThread &thread)
                                  {
+                                     // PS2X(iop-module-start-thread):
+                                     // suspended is a flag beside the state.
                                      static constexpr const char *kStates[] = {
                                          "Dormant", "Ready", "Running", "Sleep",
-                                         "Delay", "Semaphore", "EventFlag", "Suspended", "Dead",
+                                         "Delay", "Semaphore", "EventFlag", "Dead",
                                      };
                                      const auto stateIndex = static_cast<size_t>(thread.state);
                                      out << "\n  tid=" << thread.id
-                                         << " state=" << (stateIndex < 9u ? kStates[stateIndex] : "?")
+                                         << " state=" << (stateIndex < 8u ? kStates[stateIndex] : "?")
+                                         << (thread.suspended ? "+suspended" : "")
                                          << " prio=0x" << std::hex << thread.priority
                                          << " pc=0x" << thread.cpu.pc
                                          << " ra=0x" << thread.cpu.gpr[31]
@@ -986,7 +1188,7 @@ namespace ps2x::iop::detail
                     advanceSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
+                    serviceTimersAndAlarms();
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (next != nullptr &&
                         firstRunLogged.insert(next->id).second)
@@ -1007,6 +1209,7 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        nextWake = kernel.nextAlarmCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -1058,7 +1261,63 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            // PS2X(iop-module-start-thread): the start function runs on the
+            // loader thread (Play!'s module starter: priority 8, 0x4000 stack),
+            // so a WaitSema/WaitEventFlag/DelayThread inside it blocks and the
+            // other IOP threads run. The EE still calls loadModule
+            // synchronously: run the scheduler until the entry returns, with a
+            // bounded wait, as handleRpc does for an RPC.
+            uint32_t startResult = static_cast<uint32_t>(-1);
+            const int startThread = kernel.startModuleThread(module.entry, argumentSize, args, module.gp);
+            if (startThread == 0)
+                log(LogLevel::Error, "[IOP] could not create the module start thread");
+            else
+            {
+                constexpr uint64_t kStepCycles = 256u;
+                constexpr uint64_t kWaitLimitCycles = kIopClockHz / 2u;
+                const uint64_t start = totalCycles;
+                bool finished = false;
+                while (!finished)
+                {
+                    bool present = false;
+                    kernel.forEachThread([&](const IopThread &thread)
+                                         {
+                                             if (thread.id != startThread)
+                                                 return;
+                                             present = true;
+                                             if (thread.state == IopThreadState::Dormant ||
+                                                 thread.state == IopThreadState::Dead)
+                                             {
+                                                 finished = true;
+                                                 startResult = thread.cpu.gpr[2];
+                                             }
+                                         });
+                    if (finished)
+                        break;
+                    if (!present)
+                    {
+                        // ExitDeleteThread removes the thread before its slice
+                        // ends; its import leaves 0 in v0.
+                        startResult = 0u;
+                        break;
+                    }
+                    if (totalCycles - start > kWaitLimitCycles)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP] module start thread " << std::dec << startThread
+                            << " has not returned after " << (totalCycles - start)
+                            << " IOP cycles; continuing";
+                        log(LogLevel::Warning, out.str());
+                        break;
+                    }
+                    runCycles(kStepCycles);
+                }
+                // Free the loader thread's stack once the entry has returned
+                // (or been abandoned after the bounded wait).
+                IopCpuState cleanup{};
+                cleanup.gpr[4] = static_cast<uint32_t>(startThread);
+                (void)kernel.dispatchThreadImport(5, cleanup, totalCycles);
+            }
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
@@ -1129,6 +1388,13 @@ namespace ps2x::iop::detail
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
+        struct RpcLoopState
+        {
+            uint32_t queue = 0;
+            uint32_t stack = 0;
+            uint64_t active = 0; // token of the request whose handler is running
+        };
+        std::map<int, RpcLoopState> rpcLoops;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
@@ -1208,9 +1474,66 @@ namespace ps2x::iop::detail
             m_impl->runCycles(target - m_impl->totalCycles);
     }
 
+    void IopEmulator::setEeVblank(uint64_t eeCyclesToStart, uint64_t eeCyclesToEnd, uint64_t eePeriod) noexcept
+    {
+        // eeCyclesSeen advances in lock-step with the EE scheduler's cycle
+        // count (runEeCycles), so "D EE cycles from now" is an exact IOP time.
+        auto &impl = *m_impl;
+        impl.vblank.setEeVblank((impl.eeCyclesSeen + eeCyclesToStart) / 8u,
+                                (impl.eeCyclesSeen + eeCyclesToEnd) / 8u,
+                                eePeriod / 8u);
+    }
+
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
-        return m_impl->rpc.handleRpc(request, *m_impl);
+        auto &impl = *m_impl;
+        static const bool s_rpcTime = std::getenv("PS2X_IOP_TRACE_RPC") != nullptr;
+        if (s_rpcTime)
+            std::fprintf(stderr, "[iop-rpc-time] sid=0x%x cycle=%llu\n", request.sid,
+                         static_cast<unsigned long long>(impl.totalCycles));
+
+        // PS2X(iop-rpc-thread): queue the call for the server's thread and
+        // run the IOP until that thread has answered it.  The EE is charged
+        // the IOP time the call took (RpcResult::iopCycles).
+        const uint64_t token = impl.rpc.enqueueRequest(request);
+        if (token == 0u)
+            return impl.rpc.handleRpc(request, impl);
+        constexpr uint64_t kStepCycles = 256u;
+        constexpr uint64_t kWaitLimitCycles = kIopClockHz / 2u;
+        const uint64_t start = impl.totalCycles;
+        const auto hostStart = std::chrono::steady_clock::now();
+        while (!impl.rpc.takeDone(token))
+        {
+            if (impl.totalCycles - start > kWaitLimitCycles)
+            {
+                std::fprintf(stderr, "[iop-rpc] sid=0x%x fn=%u not answered after %llu IOP cycles; EE continues\n",
+                             request.sid, request.function,
+                             static_cast<unsigned long long>(impl.totalCycles - start));
+                break;
+            }
+            impl.runCycles(kStepCycles);
+        }
+
+        // Diagnostic: a long wait shows which call stalls the EE (and the host).
+        const auto hostUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - hostStart).count();
+        if (impl.totalCycles - start > kIopClockHz / 200u || hostUs > 5000)
+        {
+            std::fprintf(stderr, "[iop-rpc-wait] sid=0x%x fn=%u iop=%llu cycles (%.1f ms) host=%.1f ms\n",
+                         request.sid, request.function,
+                         static_cast<unsigned long long>(impl.totalCycles - start),
+                         static_cast<double>(impl.totalCycles - start) * 1000.0 / kIopClockHz,
+                         static_cast<double>(hostUs) / 1000.0);
+        }
+
+        RpcResult result{};
+        result.handled = true;
+        result.resultAddress = request.receive.address;
+        result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
+        result.signalNowaitCompletion = true;
+        result.signalCompletion = true;
+        result.iopCycles = impl.totalCycles - start;
+        return result;
     }
 
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept

@@ -110,6 +110,9 @@ namespace ps2x::iop
         uint32_t guestFunction = 0;
         uint32_t guestArguments[4]{};
         uint32_t guestDefaultResultAddress = 0;
+        // IOP cycles the call took (an RPC served by its server thread runs the
+        // IOP until the reply); the EE is charged eight EE cycles for each.
+        uint64_t iopCycles = 0;
     };
 
     enum class SifTransferKind : uint32_t

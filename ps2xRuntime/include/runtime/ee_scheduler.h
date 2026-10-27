@@ -407,6 +407,11 @@ private:
     void waitForEvent();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
+    // PS2X(jitter-seed): read PS2X_JITTER_SEED and initialise the per-run
+    // PRNG used by accountCycles().  Called from reset() so one run always
+    // starts from the same sequence.
+    void configureCycleJitter();
+    [[nodiscard]] uint64_t jitterCycles(uint64_t cycles) noexcept;
     void sampleHostPacing(uint64_t nowWallNs) noexcept;
     void beginTransfer(uint32_t reason) noexcept;
     void endTransfer() noexcept;
@@ -456,6 +461,13 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    // PS2X(jitter-seed): PS2X_DETERMINISTIC=1 plus PS2X_JITTER_SEED=<n>
+    // charges every accountCycles() call a seeded 75..125% of its guest
+    // cycles.  The EE clock and the IOP both advance by the jittered amount,
+    // so the IOP's progress relative to executed EE code varies per seed while
+    // the same seed reproduces the same sequence.  Off (identity) by default.
+    bool m_jitterEnabled = false;
+    uint64_t m_jitterState = 0u;
     // Emulated-time pacing.  EE time follows host wall time while the host
     // keeps up (audio and VBlank stay real-time) but must not count host-only
     // work (PNG encoding, VRAM dumps): that work blocks the guest, so charging

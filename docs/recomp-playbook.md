@@ -1,6 +1,3 @@
-<!-- Copy of suikoden-tactics-recomp docs/recomp-playbook.md, refreshed with each toolkit batch.
-     The Suikoden repo keeps the working copy; edit there and copy here. -->
-
 # PS2 static recomp playbook
 
 See also `docs/upstream-candidates.md`: fixes from this project that could go back to PS2Recomp.
@@ -214,6 +211,7 @@ check. **[guess]** not verified yet.
   overlay covers the frame. A real image ("Loading" screen) proved the game was progressing while
   the counters (`gsw=0`) and a not-yet-complete PCSX2 path both looked like "nothing drawn".
   **[confirmed]**
+- **2D usually has more than one renderer.** Here the full-screen pre-rendered backgrounds, title labels and HUD sprites go through one sprite-list API (`sub_001540A8`-`sub_001552B8`), while the UI panels and the dialogue box are built by the script/UI layer and reach the GS by another path. A single projection or sprite hook cannot fix "all 2D": catalogue each element by tracing the sprite entry *and* the UI draw path, and prove one element before promising a global 2D fix.  **[confirmed]**
 - **Mapping an address to a symbol.** Take the nearest `name@0xADDR` below the address in the
   analyzer TOML. **[confirmed]**
 - **`bindAddressHandler` and the pc convention.** Generated stub wrappers set `ctx->pc = $ra` before
@@ -550,7 +548,46 @@ it is a few days, not a rewrite (`docs/vu1-jit.md`, `third_party/pcsx2_vu/UPSTRE
   replay.  Do not reset microVU's saved pipeline state (`lpState`) when copying registers
   in: MSCNT continues from it.  Expect 1-15 ulp float differences and identical packet
   structure; anything structural is a real bug on one side.  Here it was ours: the
-  interpreter dropped the first of two back-to-back XGKICKs. **[confirmed]**
+  interpreter dropped the first of two back-to-back XGKICKs, a regression from our own VU1
+  patches (plain upstream was fine). **[confirmed]**
+
+## 7d. Function overrides must return like the original
+
+- **Set `ctx->pc` to `$ra` in every replacement that does not call the original** (and on every
+  early-return path of one that sometimes does).  Generated code checks `ctx->pc` against the
+  fall-through after each call and bails out to the dispatcher when it differs; a replacement
+  that leaves `ctx->pc` at its own entry address is re-dispatched forever.  It looks like a
+  hang whose sampled pc is the overridden function, and it may only bite on some call sites.
+  **[confirmed]**
+- **One generated function can own several entry points** (`register_functions.cpp` maps more
+  than one address to it, and the body switches on `ctx->pc`).  `replaceFunction()` replaces one
+  table slot only, so check the other entries before assuming what a replacement covers.
+  **[confirmed]**
+
+## 7e. Emulated kernels: copy a reference, then prove it
+
+- **Compare the emulated kernel with a working implementation, rule by rule.** Our IOP kernel had six
+  silent deviations (time slicing between equal priorities, no FIFO queues, alarms that never fired,
+  RPC handlers outside any thread, blocking calls inside interrupts, `StartThread` restarting running
+  threads). Each looked harmless and each could explain a rare freeze. Reading Play! and OpenPS2BIOS
+  side by side found them in hours, where timing patches had only moved the races around for days.
+  Where the references disagree, follow the more mature one (Play!). **[confirmed]**
+- **Make wrong behaviour loud before fixing it.** Counting every wait that could not block
+  (`[iop-wait]`) showed the bug in a normal run (6 skipped locks) when freezes were 1 in 24. **[confirmed]**
+- **A run that did not play is missing data, not a pass.** Three "clean" runs of an audio bisect had
+  crashed at startup (no desktop session); the bisect named the wrong patch. Every run summary needs a
+  validity check (modules loaded, audio lines, end vsync). **[confirmed]**
+- **HLE that does a whole batch of work in one guest call stalls the host.** The sceMpeg stub decoded
+  each ~2.4 s bitstream chunk inside `sceMpegAddBs`; the game thread stalled 30-130 ms every couple of
+  seconds and the audio device ran dry. Time each step (`PS2X_MPEG_COST`) instead of reading
+  time-averaged profiles, which hide periodic spikes; spread the work the way the hardware does
+  (decode per picture). **[confirmed]**
+- **Emulated time must track wall time on average, or audio drifts.** The sound device drains at a
+  fixed 48 kHz. Any pacing rule that drops time for good (here: OS descheduling during movies) runs
+  the SPU2 slow by that fraction; a drift trim clamped to ±0.5% hides up to that and no more, so the
+  queue drains into silences at a regular period. Regular hiccups = rate mismatch: look at the trim
+  ratio (pinned at its clamp) and at which excluded-time counter grows, before blaming stalls. Drop
+  only long one-off stalls; repay ordinary jitter. **[confirmed]**
 
 ## 8. Tooling and environment
 
@@ -564,6 +601,57 @@ it is a few days, not a rewrite (`docs/vu1-jit.md`, `third_party/pcsx2_vu/UPSTRE
 - **Never `pkill -f <script name>`.** A background shell that launched a task with a heredoc spec
   contains the whole spec text in its command line, so the pattern can match it and kill that shell.
   Its child keeps running, but completion notifications are lost. Kill by PID. **[confirmed]**
+
+- **Check DISPLAY against the library's own formula.** A picture that is slightly small, shifted
+  up and cut at the top looked like an emulator quirk for weeks; it was an HLE stub writing
+  `DISPLAYn` with the wrong start and magnification. Retail games link libgraph statically, so the
+  real `sceGsSetDefDispEnv` is in the ELF next to the stub: disassemble it and compare the register
+  values (NTSC: DX 636, DY 50/25, MAGH 2560/w - 1). Also: the EE passes arguments 5-8 in `t0`-`t3`;
+  never guess the stack because a register argument happens to be zero. **[confirmed]**
+
+- **A hang that logging hides: dump on a signal.** The opening freeze vanished whenever a periodic
+  IOP dump was on (0/8) and came back without it (4/10). Arm a dump that costs nothing until
+  `SIGUSR1` (`PS2X_IOP_SIGNAL_DUMP=1`), detect the stuck state from the streamed log, then signal
+  the process. Disassemble the IRX code at the dumped PCs (`cstool mips`), and read the module's
+  globals from the RAM image. **[confirmed]**
+
+- **An HLE RPC handler that cannot block breaks the game's locks.** Running IOP RPC server
+  functions as plain calls means `WaitSema` inside them returns at once; a mutex the game uses
+  between the RPC handler and its worker thread then protects nothing, and a command block is
+  overwritten while it is being read. Before each RPC, let ready IOP threads run to a block
+  point (what a concurrent IOP would have done), and trace frozen against healthy runs with a
+  narrow per-call trace rather than a flood. **[confirmed]**
+
+- **Two processors, one VBlank.** IOP modules poll EE-written command words once per VBlank
+  (SDSTR3's CD lock); if the IOP's VBlank is a separate clock, an EE frame without an IOP VBlank
+  merges two commands into one. Check any HLE that gives the IOP its own VBlank grid against the
+  EE's VBlank: same rate, and at least one IOP VBlank per EE frame. Pushing IOP time forward in
+  bursts to get there broke other modules, so the fix has to keep both clocks in step instead.
+  **[confirmed problem; fix open]**
+
+- **A scheduler change that is pick-for-pick exact can still change behaviour.** The IOP
+  next-thread speed-up matched the old picks over 10^9 calls, yet made the opening freeze several
+  times more often, because it changed how fast the IOP ran against the EE. Gate such changes on
+  freeze/scene runs (many exclusive New Game runs), not only on the differential verifier.
+  **[confirmed]**
+
+- **One game process at a time for measurements.** Overlapping runs make the host-pacing model
+  exclude descheduling and invalidate both runs' numbers; an afternoon of this task's title
+  conclusions came from overlapping runs and had to be thrown away. Use
+  `SUIKO_RUN_EXCLUSIVE=1`, run in the foreground, and check `pgrep -x suikoden` on the target
+  before every measurement. The only deliberate exception is the documented two-instance freeze
+  repro. **[confirmed]**
+
+- **Label the random title scene before comparing builds.** Suikoden Tactics picks one of several
+  3D flythroughs per boot and the same scene changes load along its camera path (fortress bridge
+  32 pictures/s, fortress overhead 57 pictures/s). A "60 -> 40 regression" that was really two
+  different scenes cost a false bisect; save `frame_<vsync>.png` with every run and compare per
+  scene/camera. **[confirmed]**
+
+- **Check the scripted New Game phase before trusting a battle window.** The opening book's
+  page-turn inputs shift every later scene by hundreds of vsyncs run to run, so the documented
+  `16501..18180` window is only the command menu when `frame_16800.png` shows Move/Attack/... .
+  Otherwise the same numbers are a 30/60 fps story scene. Reject the run or rerun it. **[confirmed]**
 
 ## 8b. Reference runs with real PCSX2
 
@@ -800,6 +888,16 @@ it is a few days, not a rewrite (`docs/vu1-jit.md`, `third_party/pcsx2_vu/UPSTRE
   `nextWakeCycle` calls in 70 s (one per ~64 IOP cycles, because `runEeCycles` feeds ~64 cycles at
   a time). One-pass selection plus a cached earliest Delay wake cycle removed the tree-increment
   hotspot from the menu and movie profiles. **[confirmed]**
+- **Keep the semantic container, index the hot query.** `beginNextReady` still walked the
+  id-ordered `std::map` on every one of those calls even when every thread was blocked: 27 % of
+  the battle-menu game thread (`std::_Rb_tree_increment` 19 %, `beginNextReady` 7.9 %). The map's
+  id order is part of the scheduling semantics and other scans depend on it, so keep it as storage
+  and add a ready index ordered by (priority, id), a delay index ordered by (wakeCycle, id) and a
+  dense id-to-thread table; selection is then a begin/lower_bound over ready threads and expired
+  delays are the ones that leave the delay index. Give the old algorithm a read-only per-call
+  verifier (`PS2X_IOP_SCHED_VERIFY=1`) that compares the chosen id, the promoted set and the cached
+  delay wake before the new path mutates anything: a ready-index change is only safe when the old
+  answer is proven equal in-process, not by a speed run. **[confirmed]**
 - **Measure the cost of the context-switch mechanism itself, by reason.** The EE scheduler used a
   C++ throw per guest block/yield; counters + a timestamp at the throw and the catch showed
   185 500 yields/s × ~2.3 µs on the intro movie, i.e. **43 % of the game thread** (the libgcc_s
@@ -924,4 +1022,14 @@ it is a few days, not a rewrite (`docs/vu1-jit.md`, `third_party/pcsx2_vu/UPSTRE
   `presents`, and `tools/frame_pace.py` turns the 60-vsync windows into per-wall-second rates
   (important under gamescope, whose 59.855 Hz mode makes a 60-vsync window 1.0024 s). Validate
   the plateau against `gifQw / qwords-per-picture`; do not gate on the raw drawn count.
+  **[confirmed]**
+- **Move the GS off the game thread when its present stalls become missed vsyncs.** With `GSvsync`
+  on the EE thread, a GPU wait inside the present is guest-visible: the VBlank callback runs late and
+  the game's limiter loses the next picture. A deeper Vulkan command-buffer queue (3 -> 5) can hide
+  the dip in a lucky steady window (59.76 pictures/s, worst second 58, vs 59.62/57 for 3 buffers on
+  the same 71 s window) but it does not remove the serialization, and it adds GPU-ahead latency.
+  The structural fix is PCSX2 MTGS: queue every GS operation (register writes, copied GIF packets,
+  the VBlank with its register snapshot) in order, run them on one GS thread, bound the queue to two
+  VBlanks, and fence (`waitGsIdle`) at every game-thread readback. Measure with
+  `SUIKO_FRAME_STATS=1` + `tools/frame_pace.py` under gamescope; diagnose with `SUIKO_VSYNC_TRACE`.
   **[confirmed]**

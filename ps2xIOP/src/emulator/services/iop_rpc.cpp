@@ -1,4 +1,5 @@
 #include "iop_rpc.h"
+#include <cstdio>
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_kernel.h"
@@ -23,6 +24,9 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_queues.clear();
+        m_inFlight.clear();
+        m_done.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
     }
@@ -241,7 +245,8 @@ namespace ps2x::iop::detail
         case 18:
             setV0(0);
             return true;
-        case 19: // SetRpcQueue
+        case 19: // SetRpcQueue(queue, threadId)
+            m_queues[IopMemory::physicalAddress(cpu.gpr[4])].threadId = static_cast<int>(cpu.gpr[5]);
             setV0(cpu.gpr[4]);
             return true;
         case 20:
@@ -249,7 +254,7 @@ namespace ps2x::iop::detail
             setV0(0);
             return true;
         case 22: // RpcLoop
-            m_kernel.sleepCurrent(cpu);
+            (void)m_kernel.sleepCurrent(cpu, "RpcLoop");
             setV0(0);
             return true;
         case 23:
@@ -300,6 +305,37 @@ namespace ps2x::iop::detail
             }
         }
 
+        // PS2X_IOP_TRACE_RPC=<handler address>[,...]: logs those servers'
+        // calls (function number, first words of the buffer before/after,
+        // reply word) to follow a command protocol without the full trace.
+        static const std::vector<uint32_t> s_traceHandlers = []
+        {
+            std::vector<uint32_t> handlers;
+            if (const char *env = std::getenv("PS2X_IOP_TRACE_RPC"))
+            {
+                const char *p = env;
+                while (*p != '\0')
+                {
+                    char *end = nullptr;
+                    const unsigned long value = std::strtoul(p, &end, 0);
+                    if (end == p)
+                        break;
+                    handlers.push_back(static_cast<uint32_t>(value));
+                    p = (*end == ',') ? end + 1 : end;
+                }
+            }
+            return handlers;
+        }();
+        const bool trace = std::find(s_traceHandlers.begin(), s_traceHandlers.end(),
+                                     IopMemory::physicalAddress(server.function)) != s_traceHandlers.end();
+        const auto bufferWord = [&](uint32_t offset)
+        {
+            uint32_t value = 0u;
+            (void)m_memory.readRam(server.buffer + offset, &value, sizeof(value));
+            return value;
+        };
+        const uint32_t before0 = trace ? bufferWord(0u) : 0u;
+
         uint32_t returnPointer = executor.executeGuestFunction(server.function,
                                                                request.function,
                                                                server.buffer,
@@ -308,6 +344,13 @@ namespace ps2x::iop::detail
                                                                server.gp);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
+        if (trace)
+        {
+            uint32_t reply = 0u;
+            (void)m_memory.readRam(IopMemory::physicalAddress(returnPointer), &reply, sizeof(reply));
+            std::fprintf(stderr, "[iop-rpc] fn=%u send=%u buf0 in=0x%x out=0x%x reply=0x%x\n",
+                         request.function, request.send.size, before0, bufferWord(0u), reply);
+        }
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
         {
             const uint32_t physical = IopMemory::physicalAddress(returnPointer);
@@ -326,6 +369,109 @@ namespace ps2x::iop::detail
         result.signalNowaitCompletion = true;
         result.signalCompletion = true;
         return result;
+    }
+
+    uint64_t IopRpcBridge::enqueueRequest(const RpcRequest &request)
+    {
+        const auto serverIt = m_servers.find(request.sid);
+        if (serverIt == m_servers.end() || serverIt->second.function == 0u || serverIt->second.queue == 0u)
+            return 0u;
+        const auto queueIt = m_queues.find(IopMemory::physicalAddress(serverIt->second.queue));
+        if (queueIt == m_queues.end() || queueIt->second.threadId <= 0)
+            return 0u;
+
+        // The request's SIF DMA lands in the server buffer before the server
+        // thread wakes.  SIF DMA moves whole quadwords, so round up like it.
+        const RpcServer &server = serverIt->second;
+        if (request.send.size != 0u && server.buffer != 0u)
+        {
+            const uint32_t limit = IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize);
+            uint32_t copySize = std::min<uint32_t>((request.send.size + 15u) & ~15u, limit);
+            std::vector<uint8_t> payload(copySize);
+            if (!m_host.readGuest(request.send.address, payload.data(), payload.size()))
+            {
+                copySize = std::min<uint32_t>(request.send.size, limit);
+                payload.resize(copySize);
+                if (!m_host.readGuest(request.send.address, payload.data(), payload.size()))
+                    payload.clear();
+            }
+            if (!payload.empty())
+                (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
+        }
+
+        PendingRequest pending;
+        pending.token = ++m_nextToken;
+        pending.sid = request.sid;
+        pending.rpcNumber = request.function;
+        pending.sendSize = request.send.size;
+        pending.receive = request.receive;
+        queueIt->second.requests.push_back(pending);
+        m_kernel.wakeupThread(queueIt->second.threadId);
+        return pending.token;
+    }
+
+    void IopRpcBridge::bindLoopThread(uint32_t queue, int threadId)
+    {
+        RpcQueue &rpcQueue = m_queues[IopMemory::physicalAddress(queue)];
+        if (rpcQueue.threadId <= 0)
+            rpcQueue.threadId = threadId;
+    }
+
+    std::optional<IopRpcBridge::Dispatch> IopRpcBridge::takeNextRequest(uint32_t queue)
+    {
+        const auto queueIt = m_queues.find(IopMemory::physicalAddress(queue));
+        if (queueIt == m_queues.end())
+            return std::nullopt;
+        while (!queueIt->second.requests.empty())
+        {
+            const PendingRequest pending = queueIt->second.requests.front();
+            queueIt->second.requests.pop_front();
+            const auto server = m_servers.find(pending.sid);
+            if (server == m_servers.end() || server->second.function == 0u)
+            {
+                // The server went away: answer with nothing rather than hang the EE.
+                m_done.insert(pending.token);
+                continue;
+            }
+            m_inFlight[pending.token] = pending;
+            Dispatch dispatch;
+            dispatch.token = pending.token;
+            dispatch.function = server->second.function;
+            dispatch.rpcNumber = pending.rpcNumber;
+            dispatch.buffer = server->second.buffer;
+            dispatch.size = pending.sendSize;
+            dispatch.gp = server->second.gp;
+            return dispatch;
+        }
+        return std::nullopt;
+    }
+
+    void IopRpcBridge::finishRequest(uint64_t token, uint32_t returnPointer)
+    {
+        const auto it = m_inFlight.find(token);
+        if (it == m_inFlight.end())
+            return;
+        const PendingRequest pending = it->second;
+        m_inFlight.erase(it);
+        m_done.insert(token);
+
+        const auto server = m_servers.find(pending.sid);
+        if (returnPointer == 0u && server != m_servers.end())
+            returnPointer = server->second.buffer;
+        if (pending.receive.address == 0u || pending.receive.size == 0u || returnPointer == 0u)
+            return;
+        const uint32_t physical = IopMemory::physicalAddress(returnPointer);
+        if (physical >= IopMemory::RamSize)
+            return;
+        const uint32_t copySize = std::min<uint32_t>(pending.receive.size, IopMemory::RamSize - physical);
+        (void)m_host.writeGuest(pending.receive.address, m_memory.ram().data() + physical, copySize);
+        if (copySize < pending.receive.size)
+            (void)m_host.zeroGuest(pending.receive.address + copySize, pending.receive.size - copySize);
+    }
+
+    bool IopRpcBridge::takeDone(uint64_t token)
+    {
+        return m_done.erase(token) != 0u;
     }
 
     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
