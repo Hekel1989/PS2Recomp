@@ -1093,13 +1093,16 @@ namespace ps2x::iop::detail
             out << "[IOP] idle thread-dump cycles=" << std::dec << totalCycles;
             kernel.forEachThread([&](const IopThread &thread)
                                  {
+                                     // PS2X(iop-module-start-thread):
+                                     // suspended is a flag beside the state.
                                      static constexpr const char *kStates[] = {
                                          "Dormant", "Ready", "Running", "Sleep",
-                                         "Delay", "Semaphore", "EventFlag", "Suspended", "Dead",
+                                         "Delay", "Semaphore", "EventFlag", "Dead",
                                      };
                                      const auto stateIndex = static_cast<size_t>(thread.state);
                                      out << "\n  tid=" << thread.id
-                                         << " state=" << (stateIndex < 9u ? kStates[stateIndex] : "?")
+                                         << " state=" << (stateIndex < 8u ? kStates[stateIndex] : "?")
+                                         << (thread.suspended ? "+suspended" : "")
                                          << " prio=0x" << std::hex << thread.priority
                                          << " pc=0x" << thread.cpu.pc
                                          << " ra=0x" << thread.cpu.gpr[31]
@@ -1257,7 +1260,63 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            // PS2X(iop-module-start-thread): the start function runs on the
+            // loader thread (Play!'s module starter: priority 8, 0x4000 stack),
+            // so a WaitSema/WaitEventFlag/DelayThread inside it blocks and the
+            // other IOP threads run. The EE still calls loadModule
+            // synchronously: run the scheduler until the entry returns, with a
+            // bounded wait, as handleRpc does for an RPC.
+            uint32_t startResult = static_cast<uint32_t>(-1);
+            const int startThread = kernel.startModuleThread(module.entry, argumentSize, args, module.gp);
+            if (startThread == 0)
+                log(LogLevel::Error, "[IOP] could not create the module start thread");
+            else
+            {
+                constexpr uint64_t kStepCycles = 256u;
+                constexpr uint64_t kWaitLimitCycles = kIopClockHz / 2u;
+                const uint64_t start = totalCycles;
+                bool finished = false;
+                while (!finished)
+                {
+                    bool present = false;
+                    kernel.forEachThread([&](const IopThread &thread)
+                                         {
+                                             if (thread.id != startThread)
+                                                 return;
+                                             present = true;
+                                             if (thread.state == IopThreadState::Dormant ||
+                                                 thread.state == IopThreadState::Dead)
+                                             {
+                                                 finished = true;
+                                                 startResult = thread.cpu.gpr[2];
+                                             }
+                                         });
+                    if (finished)
+                        break;
+                    if (!present)
+                    {
+                        // ExitDeleteThread removes the thread before its slice
+                        // ends; its import leaves 0 in v0.
+                        startResult = 0u;
+                        break;
+                    }
+                    if (totalCycles - start > kWaitLimitCycles)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP] module start thread " << std::dec << startThread
+                            << " has not returned after " << (totalCycles - start)
+                            << " IOP cycles; continuing";
+                        log(LogLevel::Warning, out.str());
+                        break;
+                    }
+                    runCycles(kStepCycles);
+                }
+                // Free the loader thread's stack once the entry has returned
+                // (or been abandoned after the bounded wait).
+                IopCpuState cleanup{};
+                cleanup.gpr[4] = static_cast<uint32_t>(startThread);
+                (void)kernel.dispatchThreadImport(5, cleanup, totalCycles);
+            }
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;

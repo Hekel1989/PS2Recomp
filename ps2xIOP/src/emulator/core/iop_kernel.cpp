@@ -42,6 +42,12 @@ namespace ps2x::iop::detail
         constexpr uint32_t WEF_OR = 0x1u;
         constexpr uint32_t WEF_CLEAR = 0x10u;
 
+        // PS2X(iop-module-start-thread): the module starter thread's priority
+        // and stack, from Play! Source/iop/IopBios.h (MODULE_INIT_PRIORITY = 8,
+        // DEFAULT_STACKSIZE = 0x4000) and IopBios.cpp RequestModuleStart.
+        constexpr uint32_t kModuleStartPriority = 8u;
+        constexpr uint32_t kModuleStartStackSize = 0x4000u;
+
         bool isWaiting(IopThreadState state)
         {
             return state == IopThreadState::Sleep || state == IopThreadState::Delay ||
@@ -338,22 +344,34 @@ namespace ps2x::iop::detail
         case 29:
         case 30: // SuspendThread / iSuspendThread
         {
-            const int id = static_cast<int>(cpu.gpr[4]);
+            // PS2X(iop-module-start-thread): OpenPS2BIOS src/common/sched.c
+            // ob_thread_suspend keeps a suspended flag beside the wait state
+            // and does not suspend the calling thread. Both calls return the
+            // thread id.
+            int id = static_cast<int>(cpu.gpr[4]);
+            if (id == 0 && m_currentThread != nullptr)
+                id = m_currentThread->id;
             const auto it = m_threads.find(id);
             if (it == m_threads.end())
             {
                 setV0(-1);
                 return true;
             }
-            it->second.state = IopThreadState::Suspended;
-            if (m_currentThread == &it->second)
-                cpu.yielded = true;
-            setV0(0);
+            if (it->second.state == IopThreadState::Dormant)
+            {
+                setV0(KE_DORMANT);
+                return true;
+            }
+            if (m_currentThread != &it->second)
+                it->second.suspended = true;
+            setV0(id);
             return true;
         }
         case 31:
         case 32: // ResumeThread / iResumeThread
         {
+            // OpenPS2BIOS ob_thread_resume clears the flag and, for a ready
+            // thread, sends it to the back of its priority.
             const int id = static_cast<int>(cpu.gpr[4]);
             const auto it = m_threads.find(id);
             if (it == m_threads.end())
@@ -361,9 +379,13 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            if (it->second.state == IopThreadState::Suspended)
-                makeReady(it->second, 0);
-            setV0(0);
+            if (it->second.suspended)
+            {
+                it->second.suspended = false;
+                if (it->second.state == IopThreadState::Ready)
+                    it->second.order = ++m_order;
+            }
+            setV0(id);
             return true;
         }
         case 33: // DelayThread
@@ -426,6 +448,33 @@ namespace ps2x::iop::detail
             ++it->second.wakeupCount;
     }
 
+    int IopKernel::startModuleThread(uint32_t entry, uint32_t a0, uint32_t a1, uint32_t gp)
+    {
+        // PS2X(iop-module-start-thread): Play!'s module starter is an
+        // ordinary thread (IopBios.cpp
+        // RequestModuleStart / TriggerCallback); ProcessModuleStart patches
+        // that thread's context to run the module entry, so its waits block.
+        IopThread thread;
+        thread.id = static_cast<int>(m_nextThreadId++);
+        thread.entry = entry;
+        thread.stackSize = kModuleStartStackSize;
+        thread.priority = kModuleStartPriority;
+        thread.initialPriority = kModuleStartPriority;
+        thread.stackBase = m_memory.allocate(thread.stackSize + kStackGuardBytes, 16u);
+        if (thread.stackBase == 0u)
+            return 0;
+        thread.cpu.pc = entry;
+        thread.cpu.gpr[4] = a0;
+        thread.cpu.gpr[5] = a1;
+        thread.cpu.gpr[28] = gp;
+        thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+        thread.cpu.gpr[31] = kThreadReturnSentinel;
+        const int id = thread.id;
+        const auto inserted = m_threads.emplace(id, std::move(thread));
+        makeReady(inserted.first->second, 0);
+        return id;
+    }
+
     bool IopKernel::referThreadStatus(int id, uint32_t outputAddress)
     {
         if (id == 0 && m_currentThread != nullptr)
@@ -442,16 +491,15 @@ namespace ps2x::iop::detail
             status = 0x01u;
             break;
         case IopThreadState::Ready:
-            status = 0x02u;
+            // PS2X(iop-module-start-thread): OpenPS2BIOS ob_thread_status:
+            // suspended ready = 8, suspended waiting = 12.
+            status = thread.suspended ? 0x08u : 0x02u;
             break;
         case IopThreadState::Sleep:
         case IopThreadState::Delay:
         case IopThreadState::Semaphore:
         case IopThreadState::EventFlag:
-            status = 0x04u;
-            break;
-        case IopThreadState::Suspended:
-            status = 0x08u;
+            status = thread.suspended ? 0x0Cu : 0x04u;
             break;
         default:
             status = 0x10u;
@@ -857,7 +905,9 @@ namespace ps2x::iop::detail
                 else
                     nextDelay = std::min(nextDelay, thread.wakeCycle);
             }
-            if (thread.state != IopThreadState::Ready)
+            // PS2X(iop-module-start-thread): a suspended ready thread is not
+            // scheduled (OpenPS2BIOS ob_sched_finish skips t->suspended).
+            if (thread.state != IopThreadState::Ready || thread.suspended)
                 continue;
             if (best == nullptr || thread.priority < best->priority ||
                 (thread.priority == best->priority && thread.order < best->order))
@@ -882,7 +932,7 @@ namespace ps2x::iop::detail
             return false;
         for (const auto &[id, thread] : m_threads)
         {
-            if (thread.state == IopThreadState::Ready &&
+            if (thread.state == IopThreadState::Ready && !thread.suspended &&
                 thread.priority < m_currentThread->priority)
             {
                 cpu.yielded = true;

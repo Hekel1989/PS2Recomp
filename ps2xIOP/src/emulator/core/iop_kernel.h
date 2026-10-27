@@ -12,6 +12,8 @@ namespace ps2x::iop::detail
 {
     class IopMemory;
 
+    // PS2X(iop-module-start-thread): suspension is IopThread::suspended, not
+    // a state, so a suspended waiter keeps its wait state (R9).
     enum class IopThreadState : uint8_t
     {
         Dormant,
@@ -21,7 +23,6 @@ namespace ps2x::iop::detail
         Delay,
         Semaphore,
         EventFlag,
-        Suspended,
         Dead,
     };
 
@@ -37,6 +38,11 @@ namespace ps2x::iop::detail
         uint32_t initialPriority = 0x40;
         uint32_t option = 0;
         uint32_t attr = 0;
+        // PS2X(iop-module-start-thread): suspended is kept apart from the wait
+        // state, as in OpenPS2BIOS sched.c. A suspended waiter keeps waiting;
+        // when the wait ends the thread becomes ready but is not scheduled
+        // until ResumeThread.
+        bool suspended = false;
         uint64_t wakeCycle = 0;
         // Queue position: set when the thread becomes ready or starts to wait.
         // The ready queue and FIFO wait queues are ordered by it, so a thread
@@ -93,6 +99,13 @@ namespace ps2x::iop::detail
         // WakeupThread: a sleeping thread becomes ready, any other one (not
         // dormant) gets a pending wakeup for its next SleepThread.
         void wakeupThread(int id);
+
+        // PS2X(iop-module-start-thread): creates and starts the loader thread
+        // that runs a module's start function, so waits inside it block like
+        // any thread's. Priority 8 and a 0x4000 stack, as Play!'s module
+        // starter thread (IopBios.h MODULE_INIT_PRIORITY, DEFAULT_STACKSIZE).
+        // Returns the thread id, or 0 if its stack could not be allocated.
+        [[nodiscard]] int startModuleThread(uint32_t entry, uint32_t a0, uint32_t a1, uint32_t gp);
 
         // Interrupt context (interrupt, timer and alarm handlers): blocking
         // calls fail with KE_ILLEGAL_CONTEXT instead of blocking the thread
