@@ -250,7 +250,7 @@ namespace ps2x::iop::detail
             setV0(0);
             return true;
         case 22: // RpcLoop
-            m_kernel.sleepCurrent(cpu, "RpcLoop");
+            (void)m_kernel.sleepCurrent(cpu, "RpcLoop");
             setV0(0);
             return true;
         case 23:

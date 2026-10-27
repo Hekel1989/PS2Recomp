@@ -515,6 +515,11 @@ namespace ps2x::iop::detail
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
+            if (iequals(call.library, "intrman") && call.ordinal == 23u) // QueryIntrContext
+            {
+                setV0(kernel.inInterrupt() ? 1u : 0u);
+                return ImportDisposition::Handled;
+            }
             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
             if (iequals(call.library, "secrman"))
@@ -780,10 +785,18 @@ namespace ps2x::iop::detail
                 if (!step(cpu))
                     break;
                 advanceSpu2();
+                // A handler that readied a higher-priority thread preempts the
+                // running one when it returns, as on the IOP.
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                {
                     servicePendingDmaInterrupts();
+                    (void)kernel.preemptIfHigherPriority(cpu);
+                }
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                {
                     servicePendingGuestCallbacks();
+                    (void)kernel.preemptIfHigherPriority(cpu);
+                }
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -866,6 +879,34 @@ namespace ps2x::iop::detail
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
         }
 
+        // Marks interrupt context for the kernel while a handler runs.
+        struct InterruptContext
+        {
+            IopKernel &kernel;
+            explicit InterruptContext(IopKernel &k) : kernel(k) { kernel.enterInterrupt(); }
+            ~InterruptContext() { kernel.leaveInterrupt(); }
+            InterruptContext(const InterruptContext &) = delete;
+            InterruptContext &operator=(const InterruptContext &) = delete;
+        };
+
+        // Hardware timer handlers and thbase alarms, both in interrupt context.
+        void serviceTimersAndAlarms()
+        {
+            {
+                const InterruptContext interrupt{kernel};
+                timrman.serviceDue(totalCycles, *this);
+            }
+            while (const auto alarm = kernel.dueAlarm(totalCycles))
+            {
+                uint32_t again = 0u;
+                {
+                    const InterruptContext interrupt{kernel};
+                    again = callFunction(alarm->handler, alarm->argument, 0u, 0u, 0u, alarm->gp, 100000u);
+                }
+                kernel.finishAlarm(alarm->serial, again, totalCycles);
+            }
+        }
+
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
@@ -895,6 +936,7 @@ namespace ps2x::iop::detail
                         out << "[IOP] dma-irq fire cause=" << std::dec << irq << " cycles=" << totalCycles;
                         log(LogLevel::Info, out.str());
                     }
+                    const InterruptContext interrupt{kernel};
                     (void)intrman.dispatchInterrupt(irq, *this);
                 }
             }
@@ -1083,7 +1125,7 @@ namespace ps2x::iop::detail
                     advanceSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
+                    serviceTimersAndAlarms();
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (next != nullptr &&
                         firstRunLogged.insert(next->id).second)
@@ -1104,6 +1146,7 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        nextWake = kernel.nextAlarmCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -1142,7 +1185,7 @@ namespace ps2x::iop::detail
                 {
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
+                    serviceTimersAndAlarms();
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (next == nullptr)
                         break;

@@ -38,7 +38,11 @@ namespace ps2x::iop::detail
             // exactly there; the grid stays for runs without an EE.
             if (m_eeSync)
                 wakeCycle = nextEeEdge(waitForEnd ? m_nextEnd : m_nextStart, currentCycle);
-            m_kernel.delayCurrentUntil(wakeCycle, cpu, "WaitVblank");
+            if (!m_kernel.delayCurrentUntil(wakeCycle, cpu, "WaitVblank"))
+            {
+                cpu.gpr[2] = static_cast<uint32_t>(-100); // KE_ILLEGAL_CONTEXT
+                return true;
+            }
             m_kernel.markCurrentVblankWait(waitForEnd ? 2u : 1u);
             cpu.gpr[2] = 0u;
             return true;

@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -36,6 +38,10 @@ namespace ps2x::iop::detail
         uint32_t option = 0;
         uint32_t attr = 0;
         uint64_t wakeCycle = 0;
+        // Queue position: set when the thread becomes ready or starts to wait.
+        // The ready queue and FIFO wait queues are ordered by it, so a thread
+        // that keeps running (or is preempted) keeps its place, as on the IOP.
+        uint64_t order = 0;
         // Non-zero while the Delay comes from WaitVblank*: 1 = waiting for a
         // VBlank start, 2 = for a VBlank end (see retargetVblankWaiters).
         uint8_t vblankWait = 0;
@@ -44,6 +50,17 @@ namespace ps2x::iop::detail
         uint32_t waitMode = 0;
         uint32_t waitResultAddress = 0;
         int wakeupCount = 0;
+    };
+
+    // thbase alarm (SetAlarm/iSetAlarm): the handler runs in interrupt context
+    // at `target`; a non-zero return re-arms it that many clocks later.
+    struct IopAlarm
+    {
+        uint64_t serial = 0;
+        uint32_t handler = 0;
+        uint32_t argument = 0;
+        uint32_t gp = 0;
+        uint64_t target = 0;
     };
 
     class IopKernel
@@ -60,8 +77,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
 
-        void sleepCurrent(IopCpuState &cpu, const char *call = "SleepThread");
-        void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu, const char *call = "DelayThread");
+        // Both return false when the call was refused (interrupt context); the
+        // import then returns KE_ILLEGAL_CONTEXT.
+        [[nodiscard]] bool sleepCurrent(IopCpuState &cpu, const char *call = "SleepThread");
+        [[nodiscard]] bool delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu, const char *call = "DelayThread");
         void markCurrentVblankWait(uint8_t kind) noexcept
         {
             if (m_currentThread != nullptr)
@@ -71,16 +90,29 @@ namespace ps2x::iop::detail
         // (the EE re-anchored its VBlank chain).
         void retargetVblankWaiters(uint8_t kind, uint64_t wakeCycle);
 
+        // Interrupt context (interrupt, timer and alarm handlers): blocking
+        // calls fail with KE_ILLEGAL_CONTEXT instead of blocking the thread
+        // the interrupt arrived on.
+        void enterInterrupt() noexcept { ++m_interruptDepth; }
+        void leaveInterrupt() noexcept { --m_interruptDepth; }
+        [[nodiscard]] bool inInterrupt() const noexcept { return m_interruptDepth != 0u; }
+
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
-        // PS2 threads are priority-preemptive and round-robin within a
-        // priority. Returns true when a wake-up import readied a thread that
-        // should run before the caller; the caller must then yield.
+        // PS2 threads are priority-preemptive and, within a priority, run
+        // until they block (no time slicing). Returns true when a thread of
+        // higher priority than the caller is ready; the caller then yields.
         [[nodiscard]] bool preemptIfHigherPriority(IopCpuState &cpu);
         [[nodiscard]] IopThread *currentThread() noexcept { return m_currentThread; }
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
         void terminateThreadsInRange(uint32_t base, uint32_t size);
+
+        // The earliest alarm due at `now`, still registered; the caller runs
+        // it in interrupt context and passes its return value to finishAlarm.
+        [[nodiscard]] std::optional<IopAlarm> dueAlarm(uint64_t now) const;
+        void finishAlarm(uint64_t serial, uint32_t again, uint64_t now);
+        [[nodiscard]] uint64_t nextAlarmCycle(uint64_t fallback) const;
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
 
@@ -109,24 +141,33 @@ namespace ps2x::iop::detail
             uint32_t option = 0;
         };
 
-        // A wait that has to block, made where no thread can block: with no
-        // current thread (an RPC handler or module start run as a plain call)
-        // or from a callback's temporary CPU.  Logged and counted only; the
-        // caller keeps its existing behaviour (docs/iop-kernel-rules.md).
-        void noteWaitContext(const IopCpuState &cpu, const char *call, int id);
+        // Checks where a wait that has to block was made.  Returns false in
+        // interrupt context, where the call must fail with KE_ILLEGAL_CONTEXT.
+        // With no current thread (an RPC handler or module start run as a
+        // plain call) the wait cannot block either; that case is logged and
+        // counted (docs/iop-kernel-rules.md, R2) and the caller carries on.
+        [[nodiscard]] bool checkWaitContext(const IopCpuState &cpu, const char *call, int id);
         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
-        void wakeOneSemaphore(int id);
+        void makeReady(IopThread &thread, int32_t result);
+        void markWaiting(IopThread &thread, IopThreadState state, int waitId);
+        [[nodiscard]] IopThread *firstWaiter(IopThreadState state, int waitId, bool byPriority);
+        void releaseWaiters(IopThreadState state, int waitId, int32_t result);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
         void wakeEventWaiters(EventFlag &event);
+        [[nodiscard]] int setAlarm(uint32_t clockAddress, uint32_t handler, uint32_t argument, uint32_t gp,
+                                   uint64_t now);
+        [[nodiscard]] int cancelAlarm(uint32_t handler, uint32_t argument);
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
+        std::vector<IopAlarm> m_alarms;
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
-        uint32_t m_lastScheduledId = 0;
+        uint64_t m_order = 0;
+        uint64_t m_alarmSerial = 0;
         // Earliest wake cycle among Delay threads.  A lower bound that is only
         // refreshed when it comes due, so the per-slice scheduler does not
         // rescan every thread to find that no delay expired.
@@ -134,6 +175,7 @@ namespace ps2x::iop::detail
         // Number of threads in the Dead state; cleanupDeadThreads() is a full
         // scan and runs after every time slice, so skip it when nothing died.
         uint32_t m_deadThreadCount = 0;
+        uint32_t m_interruptDepth = 0;
         uint64_t m_unblockableWaits = 0;
         IopThread *m_currentThread = nullptr;
     };

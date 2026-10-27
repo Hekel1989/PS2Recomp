@@ -6,6 +6,11 @@
 #include <algorithm>
 #include <cstdio>
 
+// PS2X(iop-kernel-rules): thread, semaphore, event-flag and alarm semantics
+// follow the real IOP kernel; the rules, their sources (OpenPS2BIOS's
+// src/common/iopk.c, PS2SDK) and how ours used to differ are in
+// docs/iop-kernel-rules.md of the Suikoden Tactics recomp.
+
 namespace ps2x::iop::detail
 {
     namespace
@@ -16,6 +21,31 @@ namespace ps2x::iop::detail
                 return value;
             const uint32_t mask = alignment - 1u;
             return (value + mask) & ~mask;
+        }
+
+        constexpr int32_t KE_ILLEGAL_CONTEXT = -100;
+        constexpr int32_t KE_FOUND_HANDLER = -104;
+        constexpr int32_t KE_NOTFOUND_HANDLER = -105;
+        constexpr int32_t KE_ILLEGAL_ENTRY = -402;
+        constexpr int32_t KE_DORMANT = -413;
+        constexpr int32_t KE_NOT_WAIT = -416;
+        constexpr int32_t KE_RELEASE_WAIT = -418;
+        constexpr int32_t KE_SEMA_ZERO = -419;
+        constexpr int32_t KE_SEMA_OVF = -420;
+        constexpr int32_t KE_EVF_COND = -421;
+        constexpr int32_t KE_EVF_MULTI = -422;
+        constexpr int32_t KE_EVF_ILPAT = -423;
+        constexpr int32_t KE_WAIT_DELETE = -425;
+
+        constexpr uint32_t SA_THPRI = 0x1u;
+        constexpr uint32_t EA_MULTI = 0x2u;
+        constexpr uint32_t WEF_OR = 0x1u;
+        constexpr uint32_t WEF_CLEAR = 0x10u;
+
+        bool isWaiting(IopThreadState state)
+        {
+            return state == IopThreadState::Sleep || state == IopThreadState::Delay ||
+                   state == IopThreadState::Semaphore || state == IopThreadState::EventFlag;
         }
     }
 
@@ -29,13 +59,58 @@ namespace ps2x::iop::detail
         m_threads.clear();
         m_semaphores.clear();
         m_eventFlags.clear();
+        m_alarms.clear();
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
-        m_lastScheduledId = 0;
+        m_order = 0;
+        m_alarmSerial = 0;
         m_nextDelayWakeCycle = UINT64_MAX;
         m_deadThreadCount = 0;
+        m_interruptDepth = 0;
         m_currentThread = nullptr;
+    }
+
+    void IopKernel::makeReady(IopThread &thread, int32_t result)
+    {
+        thread.state = IopThreadState::Ready;
+        thread.order = ++m_order;
+        thread.waitId = 0;
+        thread.waitBits = 0;
+        thread.waitMode = 0;
+        thread.waitResultAddress = 0;
+        thread.vblankWait = 0;
+        thread.cpu.gpr[2] = static_cast<uint32_t>(result);
+    }
+
+    void IopKernel::markWaiting(IopThread &thread, IopThreadState state, int waitId)
+    {
+        thread.state = state;
+        thread.waitId = waitId;
+        thread.order = ++m_order;
+    }
+
+    IopThread *IopKernel::firstWaiter(IopThreadState state, int waitId, bool byPriority)
+    {
+        IopThread *best = nullptr;
+        for (auto &[threadId, thread] : m_threads)
+        {
+            if (thread.state != state || thread.waitId != waitId)
+                continue;
+            if (best == nullptr ||
+                (byPriority && thread.priority < best->priority) ||
+                ((!byPriority || thread.priority == best->priority) && thread.order < best->order))
+            {
+                best = &thread;
+            }
+        }
+        return best;
+    }
+
+    void IopKernel::releaseWaiters(IopThreadState state, int waitId, int32_t result)
+    {
+        while (IopThread *waiter = firstWaiter(state, waitId, false))
+            makeReady(*waiter, result);
     }
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
@@ -102,7 +177,7 @@ namespace ps2x::iop::detail
             thread.cpu.gpr[28] = cpu.gpr[28];
             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
             thread.cpu.gpr[31] = kThreadReturnSentinel;
-            thread.state = IopThreadState::Ready;
+            makeReady(thread, 0);
             setV0(0);
             return true;
         }
@@ -136,8 +211,8 @@ namespace ps2x::iop::detail
         case 13:
             setV0(0);
             return true;
-        case 14:
-        case 15:
+        case 14: // ChangeThreadPriority
+        case 15: // iChangeThreadPriority
         {
             int id = static_cast<int>(cpu.gpr[4]);
             if (id == 0 && m_currentThread != nullptr)
@@ -148,17 +223,46 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            it->second.priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
+            IopThread &thread = it->second;
+            thread.priority = cpu.gpr[5] == 0u ? thread.initialPriority
+                                               : std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
+            // A ready thread goes to the back of its new priority; a running
+            // caller that lowered itself is preempted after the import.
+            if (thread.state == IopThreadState::Ready)
+                thread.order = ++m_order;
             setV0(0);
             return true;
         }
-        case 16:
-        case 17:
+        case 16: // RotateThreadReadyQueue
+        case 17: // iRotateThreadReadyQueue
+        {
+            uint32_t priority = cpu.gpr[4];
+            if (priority == 0u && m_currentThread != nullptr)
+                priority = m_currentThread->priority;
+            if (m_currentThread != nullptr && m_currentThread->priority == priority)
+            {
+                // The running thread goes to the back of its priority.
+                m_currentThread->order = ++m_order;
+                if (&m_currentThread->cpu == &cpu)
+                    cpu.yielded = true;
+            }
+            else
+            {
+                IopThread *first = nullptr;
+                for (auto &[threadId, thread] : m_threads)
+                {
+                    if (thread.state == IopThreadState::Ready && thread.priority == priority &&
+                        (first == nullptr || thread.order < first->order))
+                        first = &thread;
+                }
+                if (first != nullptr)
+                    first->order = ++m_order;
+            }
             setV0(0);
-            cpu.yielded = true;
             return true;
-        case 18:
-        case 19:
+        }
+        case 18: // ReleaseWaitThread
+        case 19: // iReleaseWaitThread
         {
             const int id = static_cast<int>(cpu.gpr[4]);
             const auto it = m_threads.find(id);
@@ -167,13 +271,12 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            if (it->second.state == IopThreadState::Sleep ||
-                it->second.state == IopThreadState::Delay ||
-                it->second.state == IopThreadState::Semaphore ||
-                it->second.state == IopThreadState::EventFlag)
+            if (!isWaiting(it->second.state))
             {
-                it->second.state = IopThreadState::Ready;
+                setV0(KE_NOT_WAIT);
+                return true;
             }
+            makeReady(it->second, KE_RELEASE_WAIT);
             setV0(0);
             return true;
         }
@@ -188,19 +291,16 @@ namespace ps2x::iop::detail
             setV0(referThreadStatus(static_cast<int>(cpu.gpr[4]), cpu.gpr[5]) ? 0 : -1);
             return true;
         case 24: // SleepThread
-            if (m_currentThread == nullptr)
-                noteWaitContext(cpu, "SleepThread", 0);
-            else
+            if (m_currentThread != nullptr && m_currentThread->wakeupCount > 0 && !inInterrupt())
             {
-                if (m_currentThread->wakeupCount > 0)
-                    --m_currentThread->wakeupCount;
-                else
-                    sleepCurrent(cpu);
+                --m_currentThread->wakeupCount;
+                setV0(0);
             }
-            setV0(0);
+            else
+                setV0(sleepCurrent(cpu) ? 0 : KE_ILLEGAL_CONTEXT);
             return true;
-        case 25:
-        case 26:
+        case 25: // WakeupThread
+        case 26: // iWakeupThread
         {
             const int id = static_cast<int>(cpu.gpr[4]);
             const auto it = m_threads.find(id);
@@ -209,17 +309,24 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
+            if (it->second.state == IopThreadState::Dormant)
+            {
+                setV0(KE_DORMANT);
+                return true;
+            }
             if (it->second.state == IopThreadState::Sleep)
-                it->second.state = IopThreadState::Ready;
+                makeReady(it->second, 0);
             else
                 ++it->second.wakeupCount;
             setV0(0);
             return true;
         }
-        case 27:
-        case 28:
+        case 27: // CancelWakeupThread
+        case 28: // iCancelWakeupThread
         {
-            const int id = static_cast<int>(cpu.gpr[4]);
+            int id = static_cast<int>(cpu.gpr[4]);
+            if (id == 0 && m_currentThread != nullptr)
+                id = m_currentThread->id;
             const auto it = m_threads.find(id);
             if (it == m_threads.end())
             {
@@ -258,28 +365,31 @@ namespace ps2x::iop::detail
                 return true;
             }
             if (it->second.state == IopThreadState::Suspended)
-                it->second.state = IopThreadState::Ready;
+                makeReady(it->second, 0);
             setV0(0);
             return true;
         }
         case 33: // DelayThread
-            if (m_currentThread != nullptr)
-            {
-                const uint64_t delayCycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz + 999'999ull) / 1'000'000ull;
-                delayCurrentUntil(currentCycle + std::max<uint64_t>(delayCycles, 1u), cpu);
-            }
-            setV0(0);
+        {
+            const uint64_t delayCycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz + 999'999ull) / 1'000'000ull;
+            const bool waited = delayCurrentUntil(currentCycle + std::max<uint64_t>(delayCycles, 1u), cpu);
+            setV0(waited ? 0 : KE_ILLEGAL_CONTEXT);
             return true;
+        }
         case 34: // GetSystemTime
             m_memory.write32(cpu.gpr[4], static_cast<uint32_t>(currentCycle));
             m_memory.write32(cpu.gpr[4] + 4u, static_cast<uint32_t>(currentCycle >> 32u));
             setV0(0);
             return true;
-        case 35:
-        case 36:
-        case 37:
-        case 38:
-            setV0(0);
+        case 35: // SetAlarm
+        case 36: // iSetAlarm
+            setV0(ordinal == 35 && inInterrupt()
+                      ? KE_ILLEGAL_CONTEXT
+                      : setAlarm(cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[28], currentCycle));
+            return true;
+        case 37: // CancelAlarm
+        case 38: // iCancelAlarm
+            setV0(ordinal == 37 && inInterrupt() ? KE_ILLEGAL_CONTEXT : cancelAlarm(cpu.gpr[4], cpu.gpr[5]));
             return true;
         case 39: // USec2SysClock
         {
@@ -380,11 +490,20 @@ namespace ps2x::iop::detail
             setV0(semaphore.id);
             return true;
         }
-        case 5:
-            setV0(m_semaphores.erase(static_cast<int>(cpu.gpr[4])) != 0u ? 0 : -1);
+        case 5: // DeleteSema
+        {
+            const int id = static_cast<int>(cpu.gpr[4]);
+            if (m_semaphores.erase(id) == 0u)
+            {
+                setV0(-1);
+                return true;
+            }
+            releaseWaiters(IopThreadState::Semaphore, id, KE_WAIT_DELETE);
+            setV0(0);
             return true;
-        case 6:
-        case 7:
+        }
+        case 6: // SignalSema
+        case 7: // iSignalSema
         {
             const int id = static_cast<int>(cpu.gpr[4]);
             const auto it = m_semaphores.find(id);
@@ -393,14 +512,22 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            if (it->second.current < it->second.maximum)
+            // The count goes straight to the first waiter: FIFO, or priority
+            // order with SA_THPRI.
+            if (IopThread *waiter = firstWaiter(IopThreadState::Semaphore, id, (it->second.attr & SA_THPRI) != 0u))
+                makeReady(*waiter, 0);
+            else if (it->second.current < it->second.maximum)
                 ++it->second.current;
-            wakeOneSemaphore(id);
+            else
+            {
+                setV0(KE_SEMA_OVF);
+                return true;
+            }
             setV0(0);
             return true;
         }
-        case 8:
-        case 9:
+        case 8: // WaitSema
+        case 9: // PollSema
         {
             const int id = static_cast<int>(cpu.gpr[4]);
             const auto it = m_semaphores.find(id);
@@ -415,11 +542,12 @@ namespace ps2x::iop::detail
                 setV0(0);
             }
             else if (ordinal == 9)
-                setV0(-419);
-            else if ((noteWaitContext(cpu, "WaitSema", id), m_currentThread != nullptr))
+                setV0(KE_SEMA_ZERO);
+            else if (!checkWaitContext(cpu, "WaitSema", id))
+                setV0(KE_ILLEGAL_CONTEXT);
+            else if (m_currentThread != nullptr)
             {
-                m_currentThread->state = IopThreadState::Semaphore;
-                m_currentThread->waitId = id;
+                markWaiting(*m_currentThread, IopThreadState::Semaphore, id);
                 cpu.yielded = true;
                 setV0(0);
             }
@@ -459,54 +587,35 @@ namespace ps2x::iop::detail
         }
     }
 
-    void IopKernel::wakeOneSemaphore(int id)
-    {
-        IopThread *best = nullptr;
-        for (auto &[threadId, thread] : m_threads)
-        {
-            if (thread.state != IopThreadState::Semaphore || thread.waitId != id)
-                continue;
-            if (best == nullptr || thread.priority < best->priority)
-                best = &thread;
-        }
-
-        const auto semaphore = m_semaphores.find(id);
-        if (best != nullptr && semaphore != m_semaphores.end() && semaphore->second.current > 0)
-        {
-            --semaphore->second.current;
-            best->state = IopThreadState::Ready;
-            best->waitId = 0;
-        }
-    }
-
     bool IopKernel::eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode)
     {
         if (bits == 0u)
             return false;
-        return (mode & 1u) != 0u ? (event.bits & bits) != 0u : (event.bits & bits) == bits;
+        return (mode & WEF_OR) != 0u ? (event.bits & bits) != 0u : (event.bits & bits) == bits;
     }
 
     void IopKernel::wakeEventWaiters(EventFlag &event)
     {
-        for (auto &[threadId, thread] : m_threads)
+        // Satisfied waiters wake in queue order; a clearing waiter can leave
+        // nothing for the rest.
+        for (;;)
         {
-            if (thread.state != IopThreadState::EventFlag || thread.waitId != event.id)
-                continue;
-            if (!eventSatisfied(event, thread.waitBits, thread.waitMode))
-                continue;
-
-            if (thread.waitResultAddress != 0u)
-                m_memory.write32(thread.waitResultAddress, event.bits);
-            thread.cpu.gpr[2] = 0u;
-            if ((thread.waitMode & 0x10u) != 0u)
-                event.bits = 0u;
-            thread.state = IopThreadState::Ready;
-            thread.waitId = 0;
-            thread.waitBits = 0;
-            thread.waitMode = 0;
-            thread.waitResultAddress = 0;
-            if (event.bits == 0u)
+            IopThread *best = nullptr;
+            for (auto &[threadId, thread] : m_threads)
+            {
+                if (thread.state != IopThreadState::EventFlag || thread.waitId != event.id ||
+                    !eventSatisfied(event, thread.waitBits, thread.waitMode))
+                    continue;
+                if (best == nullptr || thread.order < best->order)
+                    best = &thread;
+            }
+            if (best == nullptr)
                 break;
+            if (best->waitResultAddress != 0u)
+                m_memory.write32(best->waitResultAddress, event.bits);
+            if ((best->waitMode & WEF_CLEAR) != 0u)
+                event.bits = 0u;
+            makeReady(*best, 0);
         }
     }
 
@@ -549,7 +658,7 @@ namespace ps2x::iop::detail
                                           m_memory.read32(descriptor + 8u)));
             return true;
         }
-        case 5:
+        case 5: // DeleteEventFlag
         {
             const int id = static_cast<int>(cpu.gpr[4]);
             if (m_eventFlags.erase(id) == 0u)
@@ -557,15 +666,7 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            for (auto &[threadId, thread] : m_threads)
-            {
-                if (thread.state == IopThreadState::EventFlag && thread.waitId == id)
-                {
-                    thread.state = IopThreadState::Ready;
-                    thread.waitId = 0;
-                    thread.cpu.gpr[2] = static_cast<uint32_t>(-1);
-                }
-            }
+            releaseWaiters(IopThreadState::EventFlag, id, KE_WAIT_DELETE);
             setV0(0);
             return true;
         }
@@ -605,20 +706,32 @@ namespace ps2x::iop::detail
             }
             const uint32_t bits = cpu.gpr[5];
             const uint32_t mode = cpu.gpr[6];
+            if (bits == 0u)
+            {
+                setV0(KE_EVF_ILPAT);
+                return true;
+            }
+            if ((event->second.attr & EA_MULTI) == 0u &&
+                firstWaiter(IopThreadState::EventFlag, event->second.id, false) != nullptr)
+            {
+                setV0(KE_EVF_MULTI);
+                return true;
+            }
             if (eventSatisfied(event->second, bits, mode))
             {
                 if (cpu.gpr[7] != 0u)
                     m_memory.write32(cpu.gpr[7], event->second.bits);
-                if ((mode & 0x10u) != 0u)
+                if ((mode & WEF_CLEAR) != 0u)
                     event->second.bits = 0u;
                 setV0(0);
             }
             else if (ordinal == 11)
-                setV0(-418);
-            else if ((noteWaitContext(cpu, "WaitEventFlag", event->second.id), m_currentThread != nullptr))
+                setV0(KE_EVF_COND);
+            else if (!checkWaitContext(cpu, "WaitEventFlag", event->second.id))
+                setV0(KE_ILLEGAL_CONTEXT);
+            else if (m_currentThread != nullptr)
             {
-                m_currentThread->state = IopThreadState::EventFlag;
-                m_currentThread->waitId = event->second.id;
+                markWaiting(*m_currentThread, IopThreadState::EventFlag, event->second.id);
                 m_currentThread->waitBits = bits;
                 m_currentThread->waitMode = mode;
                 m_currentThread->waitResultAddress = cpu.gpr[7];
@@ -626,7 +739,7 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
             }
             else
-                setV0(-418);
+                setV0(KE_RELEASE_WAIT);
             return true;
         }
         case 13:
@@ -660,13 +773,14 @@ namespace ps2x::iop::detail
         }
     }
 
-    void IopKernel::noteWaitContext(const IopCpuState &cpu, const char *call, int id)
+    bool IopKernel::checkWaitContext(const IopCpuState &cpu, const char *call, int id)
     {
-        const char *context = m_currentThread == nullptr        ? "no-thread"
-                              : &m_currentThread->cpu != &cpu ? "callback"
-                                                              : nullptr;
+        const char *context = inInterrupt()                                         ? "interrupt"
+                              : m_currentThread == nullptr                          ? "no-thread"
+                              : &m_currentThread->cpu != &cpu                       ? "callback"
+                                                                                    : nullptr;
         if (context == nullptr)
-            return;
+            return true;
         ++m_unblockableWaits;
         if (m_unblockableWaits <= 64u || m_unblockableWaits % 1000u == 0u)
         {
@@ -675,15 +789,18 @@ namespace ps2x::iop::detail
                          m_currentThread != nullptr ? m_currentThread->id : -1,
                          static_cast<unsigned long long>(m_unblockableWaits));
         }
+        return m_currentThread == nullptr && !inInterrupt();
     }
 
-    void IopKernel::sleepCurrent(IopCpuState &cpu, const char *call)
+    bool IopKernel::sleepCurrent(IopCpuState &cpu, const char *call)
     {
-        noteWaitContext(cpu, call, 0);
+        if (!checkWaitContext(cpu, call, 0))
+            return false;
         if (m_currentThread == nullptr)
-            return;
-        m_currentThread->state = IopThreadState::Sleep;
+            return true;
+        markWaiting(*m_currentThread, IopThreadState::Sleep, 0);
         cpu.yielded = true;
+        return true;
     }
 
     void IopKernel::retargetVblankWaiters(uint8_t kind, uint64_t wakeCycle)
@@ -699,63 +816,56 @@ namespace ps2x::iop::detail
         }
     }
 
-    void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu, const char *call)
+    bool IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu, const char *call)
     {
-        noteWaitContext(cpu, call, 0);
+        if (!checkWaitContext(cpu, call, 0))
+            return false;
         if (m_currentThread == nullptr)
-            return;
+            return true;
         m_currentThread->vblankWait = 0;
         m_currentThread->wakeCycle = wakeCycle;
-        m_currentThread->state = IopThreadState::Delay;
+        markWaiting(*m_currentThread, IopThreadState::Delay, 0);
         m_nextDelayWakeCycle = std::min(m_nextDelayWakeCycle, wakeCycle);
         cpu.yielded = true;
+        return true;
     }
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
-        // Promote expired delays and pick the next thread in one pass.  The
-        // map is ordered by thread id, so this preserves the original
-        // priority-then-round-robin order while avoiding two extra full scans
-        // per IOP time slice (called tens of millions of times per second).
+        // Promote expired delays and pick the next thread in one pass: the
+        // highest priority, and within it the one that has been ready longest
+        // (order).  A thread whose time slice ended without blocking kept its
+        // order, so it runs on: the IOP has no time slicing, and threads of
+        // equal priority never interrupt each other.
         const bool checkDelays = currentCycle >= m_nextDelayWakeCycle;
         uint64_t nextDelay = UINT64_MAX;
-        IopThread *bestPriority = nullptr;
-        IopThread *bestAfterLast = nullptr;
+        IopThread *best = nullptr;
         for (auto &[id, thread] : m_threads)
         {
             if (thread.state == IopThreadState::Delay)
             {
                 if (checkDelays && thread.wakeCycle <= currentCycle)
-                    thread.state = IopThreadState::Ready;
+                    makeReady(thread, 0);
                 else
                     nextDelay = std::min(nextDelay, thread.wakeCycle);
             }
             if (thread.state != IopThreadState::Ready)
                 continue;
-            if (bestPriority == nullptr || thread.priority < bestPriority->priority)
-            {
-                bestPriority = &thread;
-                bestAfterLast = (thread.id > m_lastScheduledId) ? &thread : nullptr;
-            }
-            else if (thread.priority == bestPriority->priority &&
-                     bestAfterLast == nullptr && thread.id > m_lastScheduledId)
-            {
-                bestAfterLast = &thread;
-            }
+            if (best == nullptr || thread.priority < best->priority ||
+                (thread.priority == best->priority && thread.order < best->order))
+                best = &thread;
         }
         if (checkDelays)
             m_nextDelayWakeCycle = nextDelay;
 
-        if (bestPriority == nullptr)
+        if (best == nullptr)
             return nullptr;
 
-        IopThread *next = bestAfterLast != nullptr ? bestAfterLast : bestPriority;
-        m_lastScheduledId = static_cast<uint32_t>(next->id);
-        m_currentThread = next;
-        next->state = IopThreadState::Running;
-        next->cpu.stopped = false;
-        next->cpu.yielded = false;
-        return next;
+        m_currentThread = best;
+        best->state = IopThreadState::Running;
+        best->cpu.stopped = false;
+        best->cpu.yielded = false;
+        return best;
     }
 
     bool IopKernel::preemptIfHigherPriority(IopCpuState &cpu)
@@ -784,7 +894,7 @@ namespace ps2x::iop::detail
         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
             thread.state = IopThreadState::Dormant;
         else if (thread.state == IopThreadState::Running)
-            thread.state = IopThreadState::Ready;
+            thread.state = IopThreadState::Ready; // keeps its order: front of its priority
         m_currentThread = nullptr;
         cleanupDeadThreads();
     }
@@ -820,5 +930,67 @@ namespace ps2x::iop::detail
                 ++m_deadThreadCount;
             }
         }
+    }
+
+    int IopKernel::setAlarm(uint32_t clockAddress, uint32_t handler, uint32_t argument, uint32_t gp, uint64_t now)
+    {
+        if (clockAddress == 0u || handler == 0u)
+            return KE_ILLEGAL_ENTRY;
+        for (const IopAlarm &alarm : m_alarms)
+        {
+            if (alarm.handler == handler && alarm.argument == argument)
+                return KE_FOUND_HANDLER;
+        }
+        const uint64_t delay = static_cast<uint64_t>(m_memory.read32(clockAddress)) |
+                               (static_cast<uint64_t>(m_memory.read32(clockAddress + 4u)) << 32u);
+        m_alarms.push_back(IopAlarm{++m_alarmSerial, handler, argument, gp, now + std::max<uint64_t>(delay, 1u)});
+        return 0;
+    }
+
+    int IopKernel::cancelAlarm(uint32_t handler, uint32_t argument)
+    {
+        const auto it = std::find_if(m_alarms.begin(), m_alarms.end(), [&](const IopAlarm &alarm)
+                                     { return alarm.handler == handler && alarm.argument == argument; });
+        if (it == m_alarms.end())
+            return KE_NOTFOUND_HANDLER;
+        m_alarms.erase(it);
+        return 0;
+    }
+
+    std::optional<IopAlarm> IopKernel::dueAlarm(uint64_t now) const
+    {
+        const IopAlarm *due = nullptr;
+        for (const IopAlarm &alarm : m_alarms)
+        {
+            if (alarm.target <= now && (due == nullptr || alarm.target < due->target))
+                due = &alarm;
+        }
+        if (due == nullptr)
+            return std::nullopt;
+        return *due;
+    }
+
+    void IopKernel::finishAlarm(uint64_t serial, uint32_t again, uint64_t now)
+    {
+        // A handler that cancelled its own alarm left nothing to re-arm.
+        const auto it = std::find_if(m_alarms.begin(), m_alarms.end(), [&](const IopAlarm &alarm)
+                                     { return alarm.serial == serial; });
+        if (it == m_alarms.end())
+            return;
+        if (again == 0u)
+        {
+            m_alarms.erase(it);
+            return;
+        }
+        it->target += again;
+        if (it->target <= now)
+            it->target = now + again;
+    }
+
+    uint64_t IopKernel::nextAlarmCycle(uint64_t fallback) const
+    {
+        for (const IopAlarm &alarm : m_alarms)
+            fallback = std::min(fallback, alarm.target);
+        return fallback;
     }
 }
