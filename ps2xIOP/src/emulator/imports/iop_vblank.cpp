@@ -33,9 +33,10 @@ namespace ps2x::iop::detail
             // and the next one written early in the following frame could both
             // land between two IOP polls.  SDSTR3's CD-lock thread then lost an
             // unlock (the book freeze) and IOPMAIN read its sound table before
-            // SDSTR3 had filled it (the black screen after the book;
-            // docs/bringup.md).  With the EE announcing its VBlank edges, wake
-            // exactly there; the grid stays for runs without an EE.
+            // SDSTR3 had filled it (the black screen after the book; the
+            // Suikoden Tactics recomp's docs/bringup.md).  With the EE
+            // announcing its VBlank edges, wake exactly there; the grid stays
+            // for runs without an EE.
             if (m_eeSync)
                 wakeCycle = nextEeEdge(waitForEnd ? m_nextEnd : m_nextStart, currentCycle);
             if (!m_kernel.delayCurrentUntil(wakeCycle, cpu, "WaitVblank"))

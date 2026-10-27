@@ -10,7 +10,7 @@
 // PS2X(iop-kernel-rules): thread, semaphore, event-flag and alarm semantics
 // follow the real IOP kernel; the rules, their sources (OpenPS2BIOS's
 // src/common/iopk.c, PS2SDK) and how ours used to differ are in
-// docs/iop-kernel-rules.md of the Suikoden Tactics recomp.
+// docs/iop-kernel-rules.md.
 
 namespace ps2x::iop::detail
 {
