@@ -18,6 +18,7 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <csignal>
@@ -1500,6 +1501,7 @@ namespace ps2x::iop::detail
         constexpr uint64_t kStepCycles = 256u;
         constexpr uint64_t kWaitLimitCycles = kIopClockHz / 2u;
         const uint64_t start = impl.totalCycles;
+        const auto hostStart = std::chrono::steady_clock::now();
         while (!impl.rpc.takeDone(token))
         {
             if (impl.totalCycles - start > kWaitLimitCycles)
@@ -1510,6 +1512,18 @@ namespace ps2x::iop::detail
                 break;
             }
             impl.runCycles(kStepCycles);
+        }
+
+        // Diagnostic: a long wait shows which call stalls the EE (and the host).
+        const auto hostUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - hostStart).count();
+        if (impl.totalCycles - start > kIopClockHz / 200u || hostUs > 5000)
+        {
+            std::fprintf(stderr, "[iop-rpc-wait] sid=0x%x fn=%u iop=%llu cycles (%.1f ms) host=%.1f ms\n",
+                         request.sid, request.function,
+                         static_cast<unsigned long long>(impl.totalCycles - start),
+                         static_cast<double>(impl.totalCycles - start) * 1000.0 / kIopClockHz,
+                         static_cast<double>(hostUs) / 1000.0);
         }
 
         RpcResult result{};
