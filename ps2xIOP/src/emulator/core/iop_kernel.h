@@ -36,6 +36,9 @@ namespace ps2x::iop::detail
         uint32_t option = 0;
         uint32_t attr = 0;
         uint64_t wakeCycle = 0;
+        // Non-zero while the Delay comes from WaitVblank*: 1 = waiting for a
+        // VBlank start, 2 = for a VBlank end (see retargetVblankWaiters).
+        uint8_t vblankWait = 0;
         int waitId = 0;
         uint32_t waitBits = 0;
         uint32_t waitMode = 0;
@@ -59,6 +62,14 @@ namespace ps2x::iop::detail
 
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+        void markCurrentVblankWait(uint8_t kind) noexcept
+        {
+            if (m_currentThread != nullptr)
+                m_currentThread->vblankWait = kind;
+        }
+        // Moves every thread waiting for this kind of VBlank edge to wakeCycle
+        // (the EE re-anchored its VBlank chain).
+        void retargetVblankWaiters(uint8_t kind, uint64_t wakeCycle);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
         // PS2 threads are priority-preemptive and round-robin within a

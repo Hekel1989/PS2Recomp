@@ -171,6 +171,11 @@ namespace ps2x::iop
         m_impl->emulator.runEeCycles(eeCycles);
     }
 
+    void IopSubsystem::setEeVblank(uint64_t eeCyclesToStart, uint64_t eeCyclesToEnd, uint64_t eePeriod) noexcept
+    {
+        m_impl->emulator.setEeVblank(eeCyclesToStart, eeCyclesToEnd, eePeriod);
+    }
+
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
     {
         for (const auto &service : m_impl->coreServices)

@@ -665,10 +665,24 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
+    void IopKernel::retargetVblankWaiters(uint8_t kind, uint64_t wakeCycle)
+    {
+        for (auto &[id, thread] : m_threads)
+        {
+            if (thread.state != IopThreadState::Delay || thread.vblankWait != kind)
+                continue;
+            thread.wakeCycle = wakeCycle;
+            // m_nextDelayWakeCycle is a lower bound: an earlier wake must lower
+            // it, a later one is picked up by the next scan.
+            m_nextDelayWakeCycle = std::min(m_nextDelayWakeCycle, wakeCycle);
+        }
+    }
+
     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
     {
         if (m_currentThread == nullptr)
             return;
+        m_currentThread->vblankWait = 0;
         m_currentThread->wakeCycle = wakeCycle;
         m_currentThread->state = IopThreadState::Delay;
         m_nextDelayWakeCycle = std::min(m_nextDelayWakeCycle, wakeCycle);

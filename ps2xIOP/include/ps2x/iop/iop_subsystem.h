@@ -28,6 +28,10 @@ namespace ps2x::iop
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        // At each EE VBlank start: the EE cycles from now to its next VBlank
+        // start and end, and its VBlank period.  IOP WaitVblank* then wakes at
+        // the EE's VBlank instead of on a grid of its own.
+        void setEeVblank(uint64_t eeCyclesToStart, uint64_t eeCyclesToEnd, uint64_t eePeriod) noexcept;
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;

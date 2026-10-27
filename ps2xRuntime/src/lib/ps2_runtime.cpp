@@ -678,6 +678,11 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
+void PS2Runtime::announceIopVblank(uint64_t eeCyclesToStart, uint64_t eeCyclesToEnd, uint64_t eePeriod) noexcept
+{
+    m_iopSubsystem->setEeVblank(eeCyclesToStart, eeCyclesToEnd, eePeriod);
+}
+
 void PS2Runtime::resetIop()
 {
     m_iopSubsystem->reset();

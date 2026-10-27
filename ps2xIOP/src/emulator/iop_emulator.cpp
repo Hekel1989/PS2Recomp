@@ -380,8 +380,72 @@ namespace ps2x::iop::detail
             Missing,
         };
 
+        // PS2X_IOP_TRACE_IMPORTS="lib[,lib:ordinal]...": logs only the listed
+        // imports (pc, ra, a0-a3, the string at a0 for ioman/iomanx open), so a
+        // rare call can be followed without PS2X_IOP_IMPORT_TRACE's flood.
+        void traceImportCall(const IopImportCall &call, const CpuState &cpu)
+        {
+            static const std::vector<std::pair<std::string, int>> s_filter = []
+            {
+                std::vector<std::pair<std::string, int>> filter;
+                const char *env = std::getenv("PS2X_IOP_TRACE_IMPORTS");
+                if (env == nullptr)
+                    return filter;
+                std::string spec(env);
+                size_t start = 0;
+                while (start <= spec.size())
+                {
+                    const size_t end = std::min(spec.find(',', start), spec.size());
+                    std::string item = spec.substr(start, end - start);
+                    if (!item.empty())
+                    {
+                        const size_t colon = item.find(':');
+                        if (colon == std::string::npos)
+                            filter.emplace_back(item, -1);
+                        else
+                            filter.emplace_back(item.substr(0, colon), std::atoi(item.c_str() + colon + 1));
+                    }
+                    start = end + 1;
+                }
+                return filter;
+            }();
+            if (s_filter.empty())
+                return;
+            bool match = false;
+            for (const auto &[library, ordinal] : s_filter)
+            {
+                if (iequals(call.library, library) && (ordinal < 0 || ordinal == call.ordinal))
+                {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match)
+                return;
+            std::ostringstream out;
+            out << "[IOP] trace " << call.library << ':' << std::dec << call.ordinal << std::hex
+                << " pc=0x" << cpu.pc << " ra=0x" << cpu.gpr[31] << " a0=0x" << cpu.gpr[4]
+                << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6] << " a3=0x" << cpu.gpr[7]
+                << " cycle=" << std::dec << totalCycles;
+            if ((iequals(call.library, "ioman") || iequals(call.library, "iomanx")) && call.ordinal == 4u &&
+                cpu.gpr[4] != 0u && cpu.gpr[4] < IopMemory::RamSize)
+            {
+                std::string path;
+                for (uint32_t i = 0; i < 128u; ++i)
+                {
+                    const char c = static_cast<char>(read8(cpu.gpr[4] + i));
+                    if (c == '\0')
+                        break;
+                    path.push_back(c);
+                }
+                out << " path=\"" << path << '"';
+            }
+            log(LogLevel::Info, out.str());
+        }
+
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            traceImportCall(call, cpu);
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -1056,6 +1120,44 @@ namespace ps2x::iop::detail
             }
         }
 
+        // Runs the threads that are ready at the current IOP time until all of
+        // them block, without moving time on to the next wake.  On hardware the
+        // IOP is a separate CPU: a thread woken by a VBlank finishes its few
+        // microseconds of work long before the EE's next RPC arrives, and an
+        // RPC server that needs a lock the thread holds waits for it.  Here an
+        // RPC handler runs as a plain call that cannot block, so WaitSema on a
+        // held semaphore returned at once: IOPMAIN's command handler then
+        // overwrote the command block its command thread was still reading,
+        // and a lost boot command left the sound table empty (the black screen
+        // after the book, docs/bringup.md).  Draining first gives the woken
+        // thread the time it would have had.
+        void drainReadyThreads(uint64_t budget) noexcept
+        {
+            if (callDepth != 0u || activeCpu != nullptr)
+                return;
+            try
+            {
+                const uint64_t limit = totalCycles + budget;
+                while (totalCycles < limit)
+                {
+                    servicePendingDmaInterrupts();
+                    servicePendingGuestCallbacks();
+                    timrman.serviceDue(totalCycles, *this);
+                    IopThread *next = kernel.beginNextReady(totalCycles);
+                    if (next == nullptr)
+                        break;
+                    const uint64_t before = totalCycles;
+                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, limit - totalCycles)));
+                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+                    if (totalCycles == before)
+                        ++totalCycles;
+                }
+            }
+            catch (...)
+            {
+            }
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -1241,8 +1343,25 @@ namespace ps2x::iop::detail
             m_impl->runCycles(target - m_impl->totalCycles);
     }
 
+    void IopEmulator::setEeVblank(uint64_t eeCyclesToStart, uint64_t eeCyclesToEnd, uint64_t eePeriod) noexcept
+    {
+        // eeCyclesSeen advances in lock-step with the EE scheduler's cycle
+        // count (runEeCycles), so "D EE cycles from now" is an exact IOP time.
+        auto &impl = *m_impl;
+        impl.vblank.setEeVblank((impl.eeCyclesSeen + eeCyclesToStart) / 8u,
+                                (impl.eeCyclesSeen + eeCyclesToEnd) / 8u,
+                                eePeriod / 8u);
+    }
+
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        // PS2X(iop-rpc-drain): see drainReadyThreads.
+        constexpr uint64_t kRpcDrainCycles = 20000u;
+        m_impl->drainReadyThreads(kRpcDrainCycles);
+        static const bool s_rpcTime = std::getenv("PS2X_IOP_TRACE_RPC") != nullptr;
+        if (s_rpcTime)
+            std::fprintf(stderr, "[iop-rpc-time] sid=0x%x cycle=%llu\n", request.sid,
+                         static_cast<unsigned long long>(m_impl->totalCycles));
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 

@@ -2954,6 +2954,11 @@ void EeScheduler::processDueDeadlines()
                 }
                 scheduleEvent(startCycle, startHostDeadline,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
+                // PS2X(iop-vblank-phase): the IOP's WaitVblank* wakes at these
+                // same EE cycles, so both processors see one VBlank.
+                m_runtime.announceIopVblank(startCycle > m_eeCycle ? startCycle - m_eeCycle : 0u,
+                                            endCycle > m_eeCycle ? endCycle - m_eeCycle : 0u,
+                                            kVBlankPeriodCycles);
             }
             processEvent(scheduled.event);
         }

@@ -1,4 +1,5 @@
 #include "iop_rpc.h"
+#include <cstdio>
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_kernel.h"
@@ -300,6 +301,37 @@ namespace ps2x::iop::detail
             }
         }
 
+        // PS2X_IOP_TRACE_RPC=<handler address>[,...]: logs those servers'
+        // calls (function number, first words of the buffer before/after,
+        // reply word) to follow a command protocol without the full trace.
+        static const std::vector<uint32_t> s_traceHandlers = []
+        {
+            std::vector<uint32_t> handlers;
+            if (const char *env = std::getenv("PS2X_IOP_TRACE_RPC"))
+            {
+                const char *p = env;
+                while (*p != '\0')
+                {
+                    char *end = nullptr;
+                    const unsigned long value = std::strtoul(p, &end, 0);
+                    if (end == p)
+                        break;
+                    handlers.push_back(static_cast<uint32_t>(value));
+                    p = (*end == ',') ? end + 1 : end;
+                }
+            }
+            return handlers;
+        }();
+        const bool trace = std::find(s_traceHandlers.begin(), s_traceHandlers.end(),
+                                     IopMemory::physicalAddress(server.function)) != s_traceHandlers.end();
+        const auto bufferWord = [&](uint32_t offset)
+        {
+            uint32_t value = 0u;
+            (void)m_memory.readRam(server.buffer + offset, &value, sizeof(value));
+            return value;
+        };
+        const uint32_t before0 = trace ? bufferWord(0u) : 0u;
+
         uint32_t returnPointer = executor.executeGuestFunction(server.function,
                                                                request.function,
                                                                server.buffer,
@@ -308,6 +340,13 @@ namespace ps2x::iop::detail
                                                                server.gp);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
+        if (trace)
+        {
+            uint32_t reply = 0u;
+            (void)m_memory.readRam(IopMemory::physicalAddress(returnPointer), &reply, sizeof(reply));
+            std::fprintf(stderr, "[iop-rpc] fn=%u send=%u buf0 in=0x%x out=0x%x reply=0x%x\n",
+                         request.function, request.send.size, before0, bufferWord(0u), reply);
+        }
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
         {
             const uint32_t physical = IopMemory::physicalAddress(returnPointer);
