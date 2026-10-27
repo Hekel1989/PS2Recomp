@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <mutex>
 #include <set>
@@ -118,6 +120,23 @@ namespace
             return parsed;
         }();
         return config;
+    }
+
+    // Diagnostic: PS2X_EE_SIGNAL_DUMP=1 makes SIGUSR2 request the same dump
+    // (with PS2X_EE_RAM_DUMP, also the RAM file) at the next scheduler pass,
+    // for a hang whose vsync is not known in advance.  SIGUSR1 is the IOP's.
+    std::atomic<bool> s_eeSignalDumpRequested{false};
+    void onEeSignalDump(int) { s_eeSignalDumpRequested.store(true, std::memory_order_relaxed); }
+
+    bool eeSignalDumpEnabled()
+    {
+        static const bool enabled = [] {
+            if (std::getenv("PS2X_EE_SIGNAL_DUMP") == nullptr)
+                return false;
+            std::signal(SIGUSR2, onEeSignalDump);
+            return true;
+        }();
+        return enabled;
     }
 
     constexpr int KE_OK = 0;
@@ -483,9 +502,13 @@ void EeScheduler::run()
         {
             static size_t dumpNext = 0;
             const EeThreadDumpConfig &dump = eeThreadDumpConfig();
-            while (dumpNext < dump.count && m_vsyncTick >= dump.at[dumpNext])
+            const bool signalled = eeSignalDumpEnabled() &&
+                                   s_eeSignalDumpRequested.exchange(false, std::memory_order_relaxed);
+            for (bool pending = signalled;
+                 pending || (dumpNext < dump.count && m_vsyncTick >= dump.at[dumpNext]);
+                 pending = false)
             {
-                const uint64_t requested = dump.at[dumpNext++];
+                const uint64_t requested = pending ? m_vsyncTick : dump.at[dumpNext++];
                 std::cerr << "[ee-threads] vsync=" << m_vsyncTick << " requested=" << requested
                           << " running=" << m_currentThreadId << std::endl;
                 for (const auto &[id, item] : m_threads)
@@ -523,7 +546,7 @@ void EeScheduler::run()
                 // With PS2X_EE_RAM_DUMP=<prefix>, the last requested dump also
                 // writes EE RAM to <prefix>v<vsync>.bin.
                 const char *ramPrefix = std::getenv("PS2X_EE_RAM_DUMP");
-                if (ramPrefix != nullptr && dumpNext == dump.count && m_rdram != nullptr)
+                if (ramPrefix != nullptr && (pending || dumpNext == dump.count) && m_rdram != nullptr)
                 {
                     const std::string file = std::string(ramPrefix) + "v" + std::to_string(m_vsyncTick) + ".bin";
                     if (FILE *out = std::fopen(file.c_str(), "wb"))

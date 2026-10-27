@@ -60,8 +60,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
 
-        void sleepCurrent(IopCpuState &cpu);
-        void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+        void sleepCurrent(IopCpuState &cpu, const char *call = "SleepThread");
+        void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu, const char *call = "DelayThread");
         void markCurrentVblankWait(uint8_t kind) noexcept
         {
             if (m_currentThread != nullptr)
@@ -109,6 +109,11 @@ namespace ps2x::iop::detail
             uint32_t option = 0;
         };
 
+        // A wait that has to block, made where no thread can block: with no
+        // current thread (an RPC handler or module start run as a plain call)
+        // or from a callback's temporary CPU.  Logged and counted only; the
+        // caller keeps its existing behaviour (docs/iop-kernel-rules.md).
+        void noteWaitContext(const IopCpuState &cpu, const char *call, int id);
         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
         void wakeOneSemaphore(int id);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
@@ -129,6 +134,7 @@ namespace ps2x::iop::detail
         // Number of threads in the Dead state; cleanupDeadThreads() is a full
         // scan and runs after every time slice, so skip it when nothing died.
         uint32_t m_deadThreadCount = 0;
+        uint64_t m_unblockableWaits = 0;
         IopThread *m_currentThread = nullptr;
     };
 }

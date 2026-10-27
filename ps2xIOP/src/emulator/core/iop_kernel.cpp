@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace ps2x::iop::detail
 {
@@ -187,7 +188,9 @@ namespace ps2x::iop::detail
             setV0(referThreadStatus(static_cast<int>(cpu.gpr[4]), cpu.gpr[5]) ? 0 : -1);
             return true;
         case 24: // SleepThread
-            if (m_currentThread != nullptr)
+            if (m_currentThread == nullptr)
+                noteWaitContext(cpu, "SleepThread", 0);
+            else
             {
                 if (m_currentThread->wakeupCount > 0)
                     --m_currentThread->wakeupCount;
@@ -413,7 +416,7 @@ namespace ps2x::iop::detail
             }
             else if (ordinal == 9)
                 setV0(-419);
-            else if (m_currentThread != nullptr)
+            else if ((noteWaitContext(cpu, "WaitSema", id), m_currentThread != nullptr))
             {
                 m_currentThread->state = IopThreadState::Semaphore;
                 m_currentThread->waitId = id;
@@ -612,7 +615,7 @@ namespace ps2x::iop::detail
             }
             else if (ordinal == 11)
                 setV0(-418);
-            else if (m_currentThread != nullptr)
+            else if ((noteWaitContext(cpu, "WaitEventFlag", event->second.id), m_currentThread != nullptr))
             {
                 m_currentThread->state = IopThreadState::EventFlag;
                 m_currentThread->waitId = event->second.id;
@@ -657,8 +660,26 @@ namespace ps2x::iop::detail
         }
     }
 
-    void IopKernel::sleepCurrent(IopCpuState &cpu)
+    void IopKernel::noteWaitContext(const IopCpuState &cpu, const char *call, int id)
     {
+        const char *context = m_currentThread == nullptr        ? "no-thread"
+                              : &m_currentThread->cpu != &cpu ? "callback"
+                                                              : nullptr;
+        if (context == nullptr)
+            return;
+        ++m_unblockableWaits;
+        if (m_unblockableWaits <= 64u || m_unblockableWaits % 1000u == 0u)
+        {
+            std::fprintf(stderr, "[iop-wait] %s %s id=%d pc=0x%x ra=0x%x thread=%d total=%llu\n",
+                         context, call, id, cpu.pc, cpu.gpr[31],
+                         m_currentThread != nullptr ? m_currentThread->id : -1,
+                         static_cast<unsigned long long>(m_unblockableWaits));
+        }
+    }
+
+    void IopKernel::sleepCurrent(IopCpuState &cpu, const char *call)
+    {
+        noteWaitContext(cpu, call, 0);
         if (m_currentThread == nullptr)
             return;
         m_currentThread->state = IopThreadState::Sleep;
@@ -678,8 +699,9 @@ namespace ps2x::iop::detail
         }
     }
 
-    void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
+    void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu, const char *call)
     {
+        noteWaitContext(cpu, call, 0);
         if (m_currentThread == nullptr)
             return;
         m_currentThread->vblankWait = 0;
