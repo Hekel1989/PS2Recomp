@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <csignal>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +38,11 @@ namespace ps2x::iop::detail
 {
     namespace
     {
+        // PS2X_IOP_SIGNAL_DUMP=1: SIGUSR1 requests one thread dump plus an IOP
+        // RAM image at the next idle point.  Nothing else changes until the
+        // signal arrives, so a timing-sensitive hang keeps its timing.
+        std::atomic<bool> s_signalDumpRequested{false};
+        void onSignalDump(int) { s_signalDumpRequested.store(true, std::memory_order_relaxed); }
         constexpr uint32_t kRamSize = IopMemory::RamSize;
         constexpr uint32_t kKernelHeapBase = IopMemory::HeapBase;
         constexpr uint32_t kKernelHeapLimit = IopMemory::HeapLimit;
@@ -886,11 +893,37 @@ namespace ps2x::iop::detail
         void maybeDumpIdleThreads()
         {
             static const bool s_dump = std::getenv("PS2X_IOP_IDLE_DUMP") != nullptr;
-            if (!s_dump)
-                return;
-            if (totalCycles - lastIdleDumpCycle < 33000000ull)
-                return;
-            lastIdleDumpCycle = totalCycles;
+            static const bool s_signalDump = []
+            {
+                if (std::getenv("PS2X_IOP_SIGNAL_DUMP") == nullptr)
+                    return false;
+                std::signal(SIGUSR1, onSignalDump);
+                return true;
+            }();
+            bool signalled = false;
+            if (s_signalDump && s_signalDumpRequested.load(std::memory_order_relaxed))
+            {
+                s_signalDumpRequested.store(false, std::memory_order_relaxed);
+                signalled = true;
+            }
+            if (!signalled)
+            {
+                if (!s_dump)
+                    return;
+                if (totalCycles - lastIdleDumpCycle < 33000000ull)
+                    return;
+                lastIdleDumpCycle = totalCycles;
+            }
+            else
+            {
+                static unsigned signalDumpCount = 0u;
+                const std::string file = "iopram_signal" + std::to_string(signalDumpCount++) + ".bin";
+                std::ofstream ramOut(file, std::ios::binary);
+                const auto ram = memory.ram();
+                ramOut.write(reinterpret_cast<const char *>(ram.data()),
+                             static_cast<std::streamsize>(ram.size()));
+                log(LogLevel::Info, "[IOP] signal dump: ram -> " + file);
+            }
             std::ostringstream out;
             out << "[IOP] idle thread-dump cycles=" << std::dec << totalCycles;
             kernel.forEachThread([&](const IopThread &thread)
