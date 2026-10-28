@@ -454,6 +454,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
     configureCycleJitter();
+    configureIdlePoll();
     m_hostAnchorCycle = m_eeCycle;
     m_paceLastWallNs = m_paceLastCpuNs = m_paceLastStallNs = m_paceLastWaitNs = 0u;
     m_paceAdvanceNs = 0u;
@@ -927,6 +928,24 @@ void EeScheduler::sampleHostPacing(uint64_t nowWallNs) noexcept
     m_paceAdvanceNs += step.advanceNs;
 }
 
+void EeScheduler::configureIdlePoll()
+{
+    // PS2X(ee-idle-poll): developer A/B switch, read once per reset.  The
+    // default is one 100 us poll; 0 keeps the pre-idlePoll spin.
+    m_idlePollNs = 100000u;
+    if (const char *value = std::getenv("PS2X_EE_IDLE_POLL_NS"); value != nullptr && value[0] != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end != value && *end == '\0')
+        {
+            // One second is already far beyond a useful poll and keeps the
+            // deadline arithmetic below well inside chrono's range.
+            m_idlePollNs = std::min<uint64_t>(parsed, 1000000000ull);
+        }
+    }
+}
+
 void EeScheduler::beginTransfer(uint32_t reason) noexcept
 {
     if (!eeSwitchStatsEnabled())
@@ -1328,6 +1347,80 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
             std::cerr << std::endl;
         }
     }
+}
+
+uint64_t EeScheduler::idlePoll()
+{
+    assertExecutor();
+    // Deterministic runs must stay bit-identical: no host sleep and no
+    // wall-clock floor, exactly like accountCycles() there.
+    if (ps2x::time::deterministicMode() || m_idlePollNs == 0u)
+    {
+        return 0u;
+    }
+
+    // A fresh sample keeps the floor target current; sampleHostPacing() is
+    // cheap (two clock reads) and was measured acceptable at this rate.
+    // Catch EE time up to wall time first: in a spin it is almost always a
+    // few microseconds behind, and returning there would never sleep.
+    sampleHostPacing(steadyNowNs());
+    accountCycles(1u);
+    const uint64_t floorTarget = m_hostAnchorCycle +
+        hostDurationToEeCycles(std::chrono::nanoseconds(m_paceAdvanceNs));
+    const uint64_t pollCycles = hostDurationToEeCycles(std::chrono::nanoseconds(m_idlePollNs));
+    if (m_eeCycle + pollCycles < floorTarget)
+    {
+        // Still behind by more than a poll period after the capped catch-up
+        // (a host stall): let the guest loop re-check at once.
+        return 0u;
+    }
+
+    auto sleepDeadline = std::chrono::steady_clock::now() +
+        std::chrono::nanoseconds(m_idlePollNs);
+    uint64_t sleptNs = 0u;
+    {
+        std::unique_lock lock(m_eventMutex);
+        bool eventDue = false;
+        const auto now = std::chrono::steady_clock::now();
+        for (const ScheduledEvent &item : m_deadlines)
+        {
+            if (item.deadlineCycle <= m_eeCycle && item.hostDeadline <= now)
+            {
+                eventDue = true; // fires at the loop's next checkpoint
+            }
+            else if (item.hostDeadline > now && item.hostDeadline < sleepDeadline)
+            {
+                // Wake at the poll cap, or earlier if a future host deadline
+                // arrives first.  Deadlines already past do not shorten it.
+                sleepDeadline = item.hostDeadline;
+            }
+        }
+        if (!eventDue && m_events.empty() && !m_stopRequested.load(std::memory_order_acquire))
+        {
+            const auto waitStart = std::chrono::steady_clock::now();
+            m_eventCv.wait_until(lock, sleepDeadline, [this]()
+                                 { return !m_events.empty() ||
+                                          m_stopRequested.load(std::memory_order_acquire); });
+            sleptNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - waitStart)
+                    .count());
+            // The sleep is guest wait time, not executor descheduling: pacing
+            // must advance EE time across it.
+            t_guestWaitNs += sleptNs;
+        }
+    }
+
+    // Charge the slept wall time now so EE timers and the IOP move with it;
+    // the loop's next checkpoint processes any events that became due.
+    sampleHostPacing(steadyNowNs());
+    accountCycles(1u);
+    return sleptNs;
+}
+
+EeScheduler::EePacingCounters EeScheduler::pacingCounters() const noexcept
+{
+    return EePacingCounters{m_paceWaitNs, m_paceDescheduledNs, m_paceAdvanceNs};
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept

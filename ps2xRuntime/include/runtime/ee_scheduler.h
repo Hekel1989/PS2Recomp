@@ -351,6 +351,26 @@ public:
     // and should set the guest return value.
     [[noreturn]] void delayCurrentThread(uint64_t eeCycles, std::function<void(R5900Context &)> completion = {});
 
+    // PS2X(ee-idle-poll): replace "park until the next event" for a known
+    // guest busy-wait with a short real sleep that keeps EE time (and so the
+    // IOP) moving with wall time.  Deterministic mode returns at once.  When
+    // EE time is behind the wall-clock floor this charges the catch-up and
+    // returns without sleeping; otherwise it sleeps for at most the poll
+    // period (PS2X_EE_IDLE_POLL_NS, default 100 us, 0 = never sleep), ending
+    // early on a posted event or a stop request.  The thread stays Running.
+    // Returns the nanoseconds actually slept (0 when it only charged cycles).
+    uint64_t idlePoll();
+
+    // PS2X(ee-idle-poll): cumulative pacing components, for tests and
+    // diagnostics.  Executor-thread state; read it from a guest callback.
+    struct EePacingCounters
+    {
+        uint64_t guestWaitNs = 0u;
+        uint64_t descheduledNs = 0u;
+        uint64_t advanceNs = 0u;
+    };
+    [[nodiscard]] EePacingCounters pacingCounters() const noexcept;
+
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
     [[nodiscard]] EeSemaphore *semaphore(int id);
@@ -413,6 +433,8 @@ private:
     void configureCycleJitter();
     [[nodiscard]] uint64_t jitterCycles(uint64_t cycles) noexcept;
     void sampleHostPacing(uint64_t nowWallNs) noexcept;
+    // PS2X(ee-idle-poll): read PS2X_EE_IDLE_POLL_NS once per reset.
+    void configureIdlePoll();
     void beginTransfer(uint32_t reason) noexcept;
     void endTransfer() noexcept;
     void dispatchOnFiber(PS2Runtime::RecompiledFunction function, R5900Context &context);
@@ -494,6 +516,9 @@ private:
     uint64_t m_paceShortDeschedNs = 0u;
     uint64_t m_paceMovieNs = 0u;
     bool m_paceInitialized = false;
+    // PS2X(ee-idle-poll): maximum host sleep per idlePoll() call.  0 keeps the
+    // original spin (used by SUIKO_WAIT_LOOP_IDLE=0 A/B runs and the switch).
+    uint64_t m_idlePollNs = 100000u;
     // Diagnostic: PS2X_EE_SWITCH_STATS=1 counts EeDispatcherTransfer throws by
     // reason and measures the throw-to-catch host time.  Inert when unset.
     uint64_t m_transferStartNs = 0u;
