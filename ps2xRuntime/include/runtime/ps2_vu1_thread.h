@@ -233,6 +233,12 @@ namespace ps2x
         uint64_t m_nextSequence = 1u;
         std::vector<Work *> m_freeWork;
 
+        // PS2X(vu1-short-spin): time-bounded spin budgets, read once from
+        // PS2X_VU1_WORKER_SPIN_NS / PS2X_VU1_WAIT_SPIN_NS at construction.
+        // (PCSX2 WorkSema::WaitForWorkWithSpin bounds its spin by time too.)
+        uint64_t m_workerSpinNs = 5000u;
+        uint64_t m_waitSpinNs = 5000u;
+
         // Shared with the worker.
         std::mutex m_queueMutex;
         std::condition_variable m_queueCv;
@@ -242,6 +248,10 @@ namespace ps2x
         std::atomic<uint64_t> m_pushed{0u};
         uint64_t m_taken = 0u; // worker only
         std::atomic<uint64_t> m_completed{0u};
+        // PS2X(vu1-short-spin): condition-variable waits per stats interval,
+        // written by both threads (worker sleeps here, game thread in waitFor).
+        std::atomic<uint64_t> m_workerSleeps{0u};
+        std::atomic<uint64_t> m_eeSleeps{0u};
         std::mutex m_doneMutex;
         std::condition_variable m_doneCv;
         std::atomic<bool> m_eeWaiting{false};

@@ -24,9 +24,33 @@ namespace ps2x
         thread_local void *t_work = nullptr;
 
         // Spin before sleeping: a VIF1 kick arrives every ~50-100 us during a
-        // 3D frame, so a short spin avoids a futex wake per kick.
-        constexpr int kWorkerSpins = 4000;
-        constexpr int kWaitSpins = 4000;
+        // 3D frame, so a short spin avoids a futex wake per kick.  The spin is
+        // bounded by time, not by an iteration count, because a pause loop's
+        // duration depends on the host CPU: 4000 pauses were ~50 us here and
+        // nearly all kicks arrived within them, so the worker almost never
+        // slept and ~23% of a core spun in battle.  PCSX2's
+        // Threading::WorkSema::WaitForWorkWithSpin() bounds its spin by time
+        // for the same reason.  (PS2X(vu1-short-spin): on the Legion's 15 W
+        // APU that core is power the GPU needs.)
+        constexpr uint64_t kWorkerSpinNs = 5000u;
+        constexpr uint64_t kWaitSpinNs = 5000u;
+        // Reading steady_clock costs ~20-30 ns; every 64 pauses is enough to
+        // land within a small fraction of the budget.
+        constexpr int kSpinClockInterval = 64;
+
+        // PS2X_VU1_WORKER_SPIN_NS / PS2X_VU1_WAIT_SPIN_NS: override the spin
+        // budget; 0 sleeps immediately.  Read once, at construction.
+        uint64_t spinNsFromEnvironment(const char *name, uint64_t fallback)
+        {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == '\0')
+                return fallback;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (end == value || *end != '\0')
+                return fallback;
+            return static_cast<uint64_t>(parsed);
+        }
 
         inline void cpuRelax()
         {
@@ -135,7 +159,9 @@ namespace ps2x
     }
 
     Vu1Thread::Vu1Thread(PS2Memory &memory, VU1Interpreter &vu1, GS &gs, Mode mode, FbrstProvider fbrst)
-        : m_memory(memory), m_vu1(vu1), m_gs(gs), m_mode(mode), m_fbrst(std::move(fbrst))
+        : m_memory(memory), m_vu1(vu1), m_gs(gs), m_mode(mode), m_fbrst(std::move(fbrst)),
+          m_workerSpinNs(spinNsFromEnvironment("PS2X_VU1_WORKER_SPIN_NS", kWorkerSpinNs)),
+          m_waitSpinNs(spinNsFromEnvironment("PS2X_VU1_WAIT_SPIN_NS", kWaitSpinNs))
     {
         m_statsEnabled = envSet("PS2X_VU1_THREAD_STATS");
         m_predictor = std::make_unique<PS2Memory>();
@@ -237,14 +263,25 @@ namespace ps2x
         {
             Work *work = nullptr;
             // Spin on the push counter, not the mutex: a contended glibc mutex
-            // puts the game thread to sleep instead of spinning.
-            for (int spin = 0; spin < kWorkerSpins && m_pushed.load(std::memory_order_acquire) == m_taken; ++spin)
-                cpuRelax();
+            // puts the game thread to sleep instead of spinning.  The spin is
+            // time-bounded (PS2X_VU1_WORKER_SPIN_NS); the clock is sampled
+            // every kSpinClockInterval pauses, not on every one.
+            if (m_workerSpinNs != 0u)
+            {
+                const uint64_t spinStart = nowNs();
+                for (int spin = 0; m_pushed.load(std::memory_order_acquire) == m_taken; ++spin)
+                {
+                    if ((spin & (kSpinClockInterval - 1)) == 0 && nowNs() - spinStart >= m_workerSpinNs)
+                        break;
+                    cpuRelax();
+                }
+            }
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 if (m_queue.empty() && !m_stop)
                 {
                     m_workerSleeping.store(true);
+                    m_workerSleeps.fetch_add(1u, std::memory_order_relaxed);
                     m_queueCv.wait(lock, [this] { return m_stop || !m_queue.empty(); });
                     m_workerSleeping.store(false);
                 }
@@ -563,20 +600,24 @@ namespace ps2x
     void Vu1Thread::waitFor(Work &work, Vu1SyncReason reason)
     {
         const uint64_t start = nowNs();
-        bool done = false;
-        for (int spin = 0; spin < kWaitSpins; ++spin)
+        bool done = work.done.load();
+        // Time-bounded spin (PS2X_VU1_WAIT_SPIN_NS, default 5 us); the clock
+        // is sampled every kSpinClockInterval pauses.  A zero budget skips
+        // straight to the sleep path below.
+        if (!done && m_waitSpinNs != 0u)
         {
-            if (work.done.load())
+            for (int spin = 0; !(done = work.done.load()); ++spin)
             {
-                done = true;
-                break;
+                if ((spin & (kSpinClockInterval - 1)) == 0 && nowNs() - start >= m_waitSpinNs)
+                    break;
+                cpuRelax();
             }
-            cpuRelax();
         }
         if (!done)
         {
             std::unique_lock<std::mutex> lock(m_doneMutex);
             m_eeWaiting.store(true);
+            m_eeSleeps.fetch_add(1u, std::memory_order_relaxed);
             m_doneCv.wait(lock, [&work] { return work.done.load(); });
             m_eeWaiting.store(false);
         }
@@ -788,12 +829,16 @@ namespace ps2x
         if (!m_statsEnabled || vsyncTick < m_statsLastVsync + 60u)
             return;
         m_statsLastVsync = vsyncTick;
+        // PS2X(vu1-short-spin): how often each side actually blocked, so a
+        // stats run can show whether the shorter spin reaches the sleep path.
+        const uint64_t workerSleeps = m_workerSleeps.exchange(0u, std::memory_order_relaxed);
+        const uint64_t eeSleeps = m_eeSleeps.exchange(0u, std::memory_order_relaxed);
         std::fprintf(stderr,
                      "[vu1-thread] vsync=%" PRIu64 " kicks=%" PRIu64 " kb=%" PRIu64 " ops=%" PRIu64
                      " deferred-ee=%" PRIu64 " max-log=%" PRIu64 " deferred-presents=%" PRIu64
-                     " late-presents=%" PRIu64,
+                     " late-presents=%" PRIu64 " worker-sleeps=%" PRIu64 " ee-sleeps=%" PRIu64,
                      vsyncTick, m_stats.kicks, m_stats.bytes / 1024u, m_stats.ops, m_stats.deferredEeOps,
-                     m_stats.maxLog, m_stats.deferredPresents, m_stats.latePresents);
+                     m_stats.maxLog, m_stats.deferredPresents, m_stats.latePresents, workerSleeps, eeSleeps);
         for (size_t i = 0; i < static_cast<size_t>(Vu1SyncReason::Count); ++i)
         {
             if (m_stats.fences[i] == 0u)
