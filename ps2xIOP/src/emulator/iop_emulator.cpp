@@ -1178,13 +1178,84 @@ namespace ps2x::iop::detail
             }
         }
 
+        // PS2X(iop-quiet-skip): the EE charges the IOP in steps of 1-4 IOP
+        // cycles (one per guest dispatch or checkpoint), and almost every step
+        // finds the IOP idle.  The full pass below then only moves the clock,
+        // but it still walks every thread, timer and alarm.  After an idle
+        // pass, quietUntil is the first cycle at which any of its checks could
+        // fire (delay wake, DMA completion, callback, timer, alarm, SPU2 tick).
+        // While nothing else touches the IOP, a step whose target is at or
+        // before quietUntil has a known result: one idle pass that sets the
+        // clock to the target.  Any other pass, and every IopEmulator entry
+        // point other than runEeCycles, forgets it (0).  PS2X_IOP_QUIET_VERIFY=1
+        // runs the full pass anyway and checks the prediction.
+        bool quietStep(uint64_t target) noexcept
+        {
+            if (target > quietUntil)
+                return false;
+            if (quietVerify())
+            {
+                verifyQuietStep(target);
+                return true;
+            }
+            maybeDumpIdleThreads();
+            totalCycles = target;
+            return true;
+        }
+
+        static bool quietVerify() noexcept
+        {
+            static const bool s_verify = std::getenv("PS2X_IOP_QUIET_VERIFY") != nullptr;
+            return s_verify;
+        }
+
+        void verifyQuietStep(uint64_t target) noexcept
+        {
+            const uint64_t predicted = quietUntil;
+            const uint64_t passes = runPasses;
+            const uint64_t idlePasses = runIdlePasses;
+            const uint64_t instructions = totalInstructions;
+            const uint64_t start = totalCycles;
+            runCyclesFull(target - totalCycles);
+            ++quietVerifyChecks;
+            const bool same = totalCycles == target && runPasses == passes + 1u &&
+                              runIdlePasses == idlePasses + 1u && totalInstructions == instructions;
+            if (!same)
+            {
+                ++quietVerifyMismatches;
+                if (quietVerifyMismatches <= 20u)
+                    std::fprintf(stderr,
+                                 "[iop-quiet-verify] mismatch start=%llu target=%llu quietUntil=%llu end=%llu "
+                                 "passes=%llu idle=%llu instructions=%llu\n",
+                                 static_cast<unsigned long long>(start), static_cast<unsigned long long>(target),
+                                 static_cast<unsigned long long>(predicted),
+                                 static_cast<unsigned long long>(totalCycles),
+                                 static_cast<unsigned long long>(runPasses - passes),
+                                 static_cast<unsigned long long>(runIdlePasses - idlePasses),
+                                 static_cast<unsigned long long>(totalInstructions - instructions));
+            }
+            if ((quietVerifyChecks & ((uint64_t{1} << 26) - 1u)) == 0u)
+                std::fprintf(stderr, "[iop-quiet-verify] checks=%llu mismatch=%llu\n",
+                             static_cast<unsigned long long>(quietVerifyChecks),
+                             static_cast<unsigned long long>(quietVerifyMismatches));
+        }
+
         void runCycles(uint64_t cycles) noexcept
+        {
+            if (quietStep(totalCycles + cycles))
+                return;
+            runCyclesFull(cycles);
+        }
+
+        void runCyclesFull(uint64_t cycles) noexcept
         {
             try
             {
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    quietUntil = 0u;
+                    ++runPasses;
                     advanceSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
@@ -1203,7 +1274,8 @@ namespace ps2x::iop::detail
                     if (!next)
                     {
                         maybeDumpIdleThreads();
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        ++runIdlePasses;
+                        uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
@@ -1211,6 +1283,10 @@ namespace ps2x::iop::detail
                         nextWake = timrman.nextEventCycle(nextWake);
                         nextWake = kernel.nextAlarmCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        // Only a top-level pass with no service in progress
+                        // saw every due check run (see quietStep).
+                        if (callDepth == 0u && !servicingDmaInterrupts && !servicingGuestCallbacks)
+                            quietUntil = spu2Host != nullptr ? std::min(nextWake, nextSpu2Cycle) : nextWake;
                         continue;
                     }
                     const uint64_t before = totalCycles;
@@ -1415,6 +1491,12 @@ namespace ps2x::iop::detail
         std::set<int> firstRunLogged;
         uint32_t nextModuleId = 1;
         uint64_t totalCycles = 0;
+        // PS2X(iop-quiet-skip): see quietStep.  0 = unknown.
+        uint64_t quietUntil = 0;
+        uint64_t runPasses = 0;
+        uint64_t runIdlePasses = 0;
+        uint64_t quietVerifyChecks = 0;
+        uint64_t quietVerifyMismatches = 0;
         uint64_t lastIdleDumpCycle = 0;
         uint64_t totalInstructions = 0;
         // EE cycles reported to the IOP so far.  The IOP clock is derived from
@@ -1432,6 +1514,21 @@ namespace ps2x::iop::detail
         GuestCallback checkKelfPathCallback;
     };
 
+    // PS2X(iop-quiet-skip): every entry point that can change IOP state
+    // (threads, timers, DMA, callbacks, SPU2) forgets the quiet window on entry
+    // and on exit, so only runEeCycles steps can reuse it.
+    namespace
+    {
+        struct QuietReset
+        {
+            uint64_t &until;
+            explicit QuietReset(uint64_t &value) noexcept : until(value) { until = 0u; }
+            ~QuietReset() { until = 0u; }
+            QuietReset(const QuietReset &) = delete;
+            QuietReset &operator=(const QuietReset &) = delete;
+        };
+    }
+
     IopEmulator::IopEmulator(IopHost &host)
         : m_impl(std::make_unique<Impl>(host))
     {
@@ -1441,21 +1538,25 @@ namespace ps2x::iop::detail
 
     void IopEmulator::reset()
     {
+        const QuietReset quiet{m_impl->quietUntil};
         m_impl->reset();
     }
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return m_impl->stopModule(moduleId, result);
     }
 
@@ -1476,6 +1577,7 @@ namespace ps2x::iop::detail
 
     void IopEmulator::setEeVblank(uint64_t eeCyclesToStart, uint64_t eeCyclesToEnd, uint64_t eePeriod) noexcept
     {
+        const QuietReset quiet{m_impl->quietUntil};
         // eeCyclesSeen advances in lock-step with the EE scheduler's cycle
         // count (runEeCycles), so "D EE cycles from now" is an exact IOP time.
         auto &impl = *m_impl;
@@ -1486,6 +1588,7 @@ namespace ps2x::iop::detail
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         auto &impl = *m_impl;
         static const bool s_rpcTime = std::getenv("PS2X_IOP_TRACE_RPC") != nullptr;
         if (s_rpcTime)
@@ -1543,11 +1646,13 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         m_impl->rpc.onSifTransfer(transfer);
     }
 
     void IopEmulator::setSpu2Host(IopSpu2Host *host) noexcept
     {
+        const QuietReset quiet{m_impl->quietUntil};
         m_impl->spu2Host = host;
         m_impl->nextSpu2Cycle = 0u;
         m_impl->memory.setSpu2Host(host);
@@ -1557,11 +1662,13 @@ namespace ps2x::iop::detail
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return m_impl->memory.allocate(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return m_impl->memory.freeAllocation(address);
     }
 
@@ -1573,12 +1680,14 @@ namespace ps2x::iop::detail
 
     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return isMemoryRange(address, size) &&
                m_impl->memory.writeRam(address, source, size);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
+        const QuietReset quiet{m_impl->quietUntil};
         return isMemoryRange(address, size) &&
                m_impl->memory.zeroRam(address, size);
     }
