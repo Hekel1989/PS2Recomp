@@ -539,6 +539,16 @@ PS2Runtime::PS2Runtime()
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 
+    // PS2X(rpc-wait-pace): a blocking EE->IOP RPC runs the server thread
+    // synchronously here, so pace the wait to the EE wall-clock floor.  On
+    // hardware the calling EE thread sleeps while the IOP serves the call;
+    // the IOP runs at 1/8 of the EE clock, hence the x8 conversion.
+    m_iopSubsystem->setRpcWaitPacer([this](uint64_t iopCyclesInCall)
+                                    {
+                                        if (m_eeScheduler)
+                                            m_eeScheduler->paceRpcWait(iopCyclesInCall * 8u);
+                                    });
+
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
     m_cpuContext = R5900Context{};

@@ -361,6 +361,20 @@ public:
     // Returns the nanoseconds actually slept (0 when it only charged cycles).
     uint64_t idlePoll();
 
+    // PS2X(rpc-wait-pace): keep a blocking EE->IOP RPC on the wall-clock floor.
+    // On hardware the calling EE thread sleeps while the IOP serves the call in
+    // real time; here the IOP runs the server thread synchronously and the EE
+    // is charged its cycles afterwards (RPC.cpp), so without this the quiet
+    // skip lets milliseconds of IOP time pass in microseconds of host time.
+    // `eeCyclesInCall` is the charge RPC.cpp will apply, so candidate =
+    // m_eeCycle + eeCyclesInCall is where EE time will land.  Sleeps (at most
+    // 1 ms per step) until candidate is within one VBlank of the pacing floor -
+    // the granularity of PCSX2's frame limiter, which throttles the CPU thread
+    // at each VSync when emulation is ahead of wall time.  Deterministic mode
+    // and PS2X_RPC_WAIT_PACE=0 return at once.  The sleep is guest wait, not
+    // descheduling, and is reported as rpcPaceMs by PS2X_EE_TIME_TRACE.
+    void paceRpcWait(uint64_t eeCyclesInCall);
+
     // PS2X(ee-idle-poll): cumulative pacing components, for tests and
     // diagnostics.  Executor-thread state; read it from a guest callback.
     struct EePacingCounters
@@ -435,6 +449,8 @@ private:
     void sampleHostPacing(uint64_t nowWallNs) noexcept;
     // PS2X(ee-idle-poll): read PS2X_EE_IDLE_POLL_NS once per reset.
     void configureIdlePoll();
+    // PS2X(rpc-wait-pace): read PS2X_RPC_WAIT_PACE once per reset.
+    void configureRpcWaitPace();
     void beginTransfer(uint32_t reason) noexcept;
     void endTransfer() noexcept;
     void dispatchOnFiber(PS2Runtime::RecompiledFunction function, R5900Context &context);
@@ -516,6 +532,10 @@ private:
     uint64_t m_paceShortDeschedNs = 0u;
     uint64_t m_paceMovieNs = 0u;
     bool m_paceInitialized = false;
+    // PS2X(rpc-wait-pace): host time slept inside blocking RPC waits, and the
+    // developer switch (0 = off) read once per reset.
+    uint64_t m_rpcPaceNs = 0u;
+    bool m_rpcWaitPaceEnabled = true;
     // PS2X(ee-idle-poll): maximum host sleep per idlePoll() call.  0 keeps the
     // original spin (used by SUIKO_WAIT_LOOP_IDLE=0 A/B runs and the switch).
     uint64_t m_idlePollNs = 100000u;

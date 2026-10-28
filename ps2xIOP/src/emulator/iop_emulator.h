@@ -5,6 +5,7 @@
 #include "ps2x/iop/iop_types.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -34,6 +35,13 @@ namespace ps2x::iop::detail
         // PS2X: attach the real SPU2. Passing nullptr restores the original
         // register-store / fake DMA behaviour.
         void setSpu2Host(IopSpu2Host *host) noexcept;
+
+        // PS2X(rpc-wait-pace): optional host pacer for a blocking EE->IOP RPC.
+        // Called once per wait-loop step with the IOP cycles the call has taken
+        // so far; it must only let host time pass, never touch IOP state.  On
+        // hardware the calling EE thread sleeps while the IOP serves the call
+        // in real time, which is what the runtime's pacer reproduces.
+        void setRpcWaitPacer(std::function<void(uint64_t iopCyclesInCall)> pacer);
 
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
         [[nodiscard]] bool freeMemory(uint32_t address);

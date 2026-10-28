@@ -4,6 +4,7 @@
 #include "ps2x/iop/iop_spu2_host.h"
 #include "ps2x/iop/iop_types.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -50,6 +51,10 @@ namespace ps2x::iop
 
         // PS2X: attach/detach the real SPU2 (see iop_spu2_host.h).
         void setSpu2Host(IopSpu2Host *host) noexcept;
+
+        // PS2X(rpc-wait-pace): host pacer for a blocking emulated RPC wait
+        // (see IopEmulator::setRpcWaitPacer).  It may only sleep.
+        void setRpcWaitPacer(std::function<void(uint64_t iopCyclesInCall)> pacer);
 
     private:
         class Impl;

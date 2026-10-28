@@ -455,6 +455,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_eeCycle = 0u;
     configureCycleJitter();
     configureIdlePoll();
+    configureRpcWaitPace();
     m_hostAnchorCycle = m_eeCycle;
     m_paceLastWallNs = m_paceLastCpuNs = m_paceLastStallNs = m_paceLastWaitNs = 0u;
     m_paceAdvanceNs = 0u;
@@ -465,6 +466,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_paceGuestCpuNs = m_paceWaitNs = m_paceStalledNs = m_paceDescheduledNs = 0u;
     m_paceShortDeschedNs = m_paceMovieNs = 0u;
     m_paceInitialized = false;
+    m_rpcPaceNs = 0u;
     m_transferStartNs = 0u;
     m_transferReason = 0u;
     m_transferActive = false;
@@ -946,6 +948,20 @@ void EeScheduler::configureIdlePoll()
     }
 }
 
+void EeScheduler::configureRpcWaitPace()
+{
+    // PS2X(rpc-wait-pace): developer A/B switch, read once per reset.  The
+    // default paces a blocking RPC to wall time; 0 keeps the pre-0139
+    // behaviour (the IOP runs as fast as the host can interpret it).
+    m_rpcWaitPaceEnabled = true;
+    if (const char *value = std::getenv("PS2X_RPC_WAIT_PACE"); value != nullptr &&
+                                                               value[0] != '\0' &&
+                                                               std::strcmp(value, "0") == 0)
+    {
+        m_rpcWaitPaceEnabled = false;
+    }
+}
+
 void EeScheduler::beginTransfer(uint32_t reason) noexcept
 {
     if (!eeSwitchStatsEnabled())
@@ -1296,6 +1312,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
                       << " deschedMs=" << (m_paceDescheduledNs / 1000000ull)
                       << " shortMs=" << (m_paceShortDeschedNs / 1000000ull)
                       << " movieMs=" << (m_paceMovieNs / 1000000ull)
+                      << " rpcPaceMs=" << (m_rpcPaceNs / 1000000ull)
                       << " pc=0x" << std::hex
                       << (running != nullptr ? running->activeContext().pc : 0u)
                       << std::dec << std::endl;
@@ -1416,6 +1433,48 @@ uint64_t EeScheduler::idlePoll()
     sampleHostPacing(steadyNowNs());
     accountCycles(1u);
     return sleptNs;
+}
+
+void EeScheduler::paceRpcWait(uint64_t eeCyclesInCall)
+{
+    assertExecutor();
+    // PS2X(rpc-wait-pace): deterministic runs and the developer switch keep
+    // the pre-pacing behaviour, bit-identically.
+    if (ps2x::time::deterministicMode() || !m_rpcWaitPaceEnabled)
+        return;
+
+    // EE time is frozen at the call's start while the IOP runs; RPC.cpp charges
+    // this many EE cycles when the call returns, so this is where EE time will
+    // land.  PCSX2's frame limiter is the model for the slack: it throttles the
+    // CPU thread at each VSync when emulation is ahead of wall time.
+    const uint64_t candidate = m_eeCycle + eeCyclesInCall;
+    constexpr uint64_t kMaxSleepNs = 1000000ull; // 1 ms
+    uint64_t nowWall = steadyNowNs();
+    if (!m_paceInitialized || nowWall - m_paceLastWallNs >= kPaceSamplePeriodNs)
+        sampleHostPacing(nowWall);
+
+    for (;;)
+    {
+        const uint64_t target = m_hostAnchorCycle +
+            hostDurationToEeCycles(std::chrono::nanoseconds(m_paceAdvanceNs));
+        if (candidate <= target + kVBlankPeriodCycles)
+            break;
+        if (m_stopRequested.load(std::memory_order_acquire))
+            break;
+
+        const uint64_t excessCycles = candidate - (target + kVBlankPeriodCycles);
+        const auto sleepFor = std::min(std::chrono::nanoseconds(kMaxSleepNs),
+                                       eeCyclesToHostDuration(excessCycles));
+        const uint64_t sleepStart = steadyNowNs();
+        std::this_thread::sleep_for(sleepFor);
+        nowWall = steadyNowNs();
+        const uint64_t sleptNs = nowWall - sleepStart;
+        // A paced RPC wait is guest wait time, not executor descheduling: the
+        // EE thread sleeps on hardware while the IOP serves the call.
+        t_guestWaitNs += sleptNs;
+        m_rpcPaceNs += sleptNs;
+        sampleHostPacing(nowWall);
+    }
 }
 
 EeScheduler::EePacingCounters EeScheduler::pacingCounters() const noexcept

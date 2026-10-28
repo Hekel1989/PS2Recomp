@@ -261,6 +261,11 @@ namespace ps2x::iop
         m_impl->emulator.setSpu2Host(host);
     }
 
+    void IopSubsystem::setRpcWaitPacer(std::function<void(uint64_t)> pacer)
+    {
+        m_impl->emulator.setRpcWaitPacer(std::move(pacer));
+    }
+
     DebugSnapshot IopSubsystem::debugSnapshot() const
     {
         DebugSnapshot snapshot;

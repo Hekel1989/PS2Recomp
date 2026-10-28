@@ -1476,6 +1476,9 @@ namespace ps2x::iop::detail
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         IopSpu2Host *spu2Host = nullptr;
         uint64_t nextSpu2Cycle = 0;
+        // PS2X(rpc-wait-pace): host-side pacing for a blocking RPC wait.  It
+        // only sleeps, so the quiet window and all IOP state stay untouched.
+        std::function<void(uint64_t)> rpcWaitPacer;
 
         // Ring buffer of taken branches (delay-slot pc -> target), dumped when
         // execution leaves RAM so the path into the bad jump is visible.
@@ -1614,6 +1617,12 @@ namespace ps2x::iop::detail
                              static_cast<unsigned long long>(impl.totalCycles - start));
                 break;
             }
+            // PS2X(rpc-wait-pace): let the host pacer keep the EE's wall-clock
+            // floor while the server thread serves this call.  On hardware the
+            // EE thread sleeps here; the pacer only sleeps and never touches
+            // IOP state.
+            if (impl.rpcWaitPacer)
+                impl.rpcWaitPacer(impl.totalCycles - start);
             impl.runCycles(kStepCycles);
         }
 
@@ -1658,6 +1667,12 @@ namespace ps2x::iop::detail
         m_impl->memory.setSpu2Host(host);
         if (host != nullptr)
             host->setIopRam(m_impl->memory.ramData(), IopMemory::RamSize);
+    }
+
+    void IopEmulator::setRpcWaitPacer(std::function<void(uint64_t)> pacer)
+    {
+        // Host-only: the pacer is called from handleRpc and may only sleep.
+        m_impl->rpcWaitPacer = std::move(pacer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
